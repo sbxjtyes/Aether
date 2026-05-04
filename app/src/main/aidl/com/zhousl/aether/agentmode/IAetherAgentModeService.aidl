@@ -1,5 +1,6 @@
 package com.zhousl.aether.agentmode;
 
+import android.os.ParcelFileDescriptor;
 import android.view.Surface;
 
 interface IAetherAgentModeService {
@@ -13,5 +14,6 @@ interface IAetherAgentModeService {
     void key(int displayId, String keyCode);
     void text(int displayId, String text);
     byte[] capturePng(int displayId);
+    ParcelFileDescriptor capturePngPipe(int displayId);
     String listDisplaysJson();
 }

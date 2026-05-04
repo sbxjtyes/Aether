@@ -7,9 +7,12 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Point
 import android.hardware.display.DisplayManager
-import android.view.Display
+import android.os.DeadObjectException
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
 import android.util.Base64
+import android.view.Display
+import android.util.Log
 import androidx.core.content.getSystemService
 import com.rosan.app_process.AppProcess
 import com.zhousl.aether.agentmode.AetherAgentModeShizukuService
@@ -34,6 +37,8 @@ private const val FallbackAgentDisplayDensityDpi = 320
 private const val AgentDisplayName = "aether-agent-mode"
 private const val ShizukuPermissionRequestCode = 4201
 private const val RootAuthorizationProbeTimeoutMillis = 2_000L
+private const val TAG = "AetherAgentMode"
+private const val RootAgentModeServiceUid = "1000"
 
 private val ShizukuManagerPackages = listOf(
     "moe.shizuku.privileged.api",
@@ -437,7 +442,38 @@ class AgentModeController(
 
     private suspend fun capturePngBytes(settings: AppSettings): ByteArray {
         val displayId = shizukuDisplayId ?: error("Agent Mode display is not running.")
-        return requireAgentModeService(settings).capturePng(displayId)
+        val service = requireAgentModeService(settings)
+        return try {
+            service.capturePngPipe(displayId).use { descriptor ->
+                ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
+                    input.readBytes()
+                }
+            }
+        } catch (deadObject: DeadObjectException) {
+            clearDeadAgentModeService(settings)
+            throw deadObject
+        }
+    }
+
+    private fun clearDeadAgentModeService(settings: AppSettings) {
+        when (settings.agentModeAuthorizationMethod) {
+            AgentModeAuthorizationMethod.Shizuku -> {
+                shizukuService = null
+                unbindShizukuUserService()
+            }
+            AgentModeAuthorizationMethod.Root -> {
+                rootService = null
+                runCatching { rootProcess?.close() }
+                rootProcess = null
+            }
+        }
+        shizukuDisplayId = null
+        _displayState.value = AgentModeDisplayState(
+            isActive = false,
+            displays = currentDisplaysLocal(null),
+            status = "Agent Mode service disconnected",
+            lastUpdatedMillis = System.currentTimeMillis(),
+        )
     }
 
     private suspend fun statusResult(settings: AppSettings): String {
@@ -576,7 +612,7 @@ class AgentModeController(
             error("No su binary was detected on this device.")
         }
         val process = object : AppProcess.Terminal() {
-            override fun newTerminal(): List<String?> = listOf(suPath)
+            override fun newTerminal(): List<String?> = listOf(suPath, RootAgentModeServiceUid)
         }
         if (!process.init(context)) {
             _authorizationState.value = AgentModeAuthorizationState(

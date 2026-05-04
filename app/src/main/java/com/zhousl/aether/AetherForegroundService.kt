@@ -12,13 +12,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.launch
 
 class AetherForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var hasEnteredForeground = false
+    private var lastForegroundUpdateMillis = 0L
+    private var lastForegroundSignature = ""
 
     override fun onCreate() {
         super.onCreate()
@@ -37,18 +40,29 @@ class AetherForegroundService : Service() {
                 runtime.settingsRepository.settings,
             ) { chatState, executionStates, settings ->
                 Triple(chatState.sessions, executionStates, settings)
-            }.collectLatest { (sessions, executionStates, settings) ->
+            }.conflate().collect { (sessions, executionStates, settings) ->
                 val activeCount = executionStates.values.count { it.isRunning }
                 if (activeCount == 0 || !settings.keepTasksRunningInBackground) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 } else {
-                    enterForeground(
-                        runtime.notificationController.buildForegroundNotification(
-                            sessions = sessions,
-                            executionStates = executionStates,
-                        ),
-                    )
+                    val signature = foregroundNotificationSignature(sessions, executionStates)
+                    val now = System.currentTimeMillis()
+                    if (
+                        signature != lastForegroundSignature ||
+                        now - lastForegroundUpdateMillis >= ForegroundNotificationMinIntervalMillis
+                    ) {
+                        enterForeground(
+                            runtime.notificationController.buildForegroundNotification(
+                                sessions = sessions,
+                                executionStates = executionStates,
+                            ),
+                        )
+                        lastForegroundSignature = signature
+                        lastForegroundUpdateMillis = now
+                    } else {
+                        delay(ForegroundNotificationMinIntervalMillis - (now - lastForegroundUpdateMillis))
+                    }
                 }
             }
         }
@@ -90,7 +104,23 @@ class AetherForegroundService : Service() {
         hasEnteredForeground = true
     }
 
+    private fun foregroundNotificationSignature(
+        sessions: List<com.zhousl.aether.ui.ChatSession>,
+        executionStates: Map<String, com.zhousl.aether.data.SessionExecutionState>,
+    ): String {
+        val activeIds = executionStates
+            .filterValues { it.isRunning }
+            .keys
+            .sorted()
+        val activeTitles = activeIds.joinToString(separator = "|") { sessionId ->
+            sessions.firstOrNull { it.id == sessionId }?.title.orEmpty()
+        }
+        return "${activeIds.size}:$activeTitles"
+    }
+
     companion object {
+        private const val ForegroundNotificationMinIntervalMillis = 1_500L
+
         private val startRequested = AtomicBoolean(false)
 
         fun ensureRunning(context: Context) {

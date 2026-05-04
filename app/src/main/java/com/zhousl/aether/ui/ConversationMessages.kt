@@ -938,10 +938,16 @@ private fun AgentModeReplayPanel(
         selectedIndex = (frames.size - 1).coerceAtLeast(0)
     }
     val frame = frames[selectedIndex]
-    val bitmap = remember(frame.previewPath, frame.completedAtUptimeMillis) {
-        frame.previewPath
-            .takeIf { it.isNotBlank() && File(it).exists() }
-            ?.let { BitmapFactory.decodeFile(it) }
+    val bitmap by produceState<android.graphics.Bitmap?>(
+        initialValue = null,
+        frame.previewPath,
+        frame.completedAtUptimeMillis,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            frame.previewPath
+                .takeIf { it.isNotBlank() && File(it).exists() }
+                ?.let { BitmapFactory.decodeFile(it) }
+        }
     }
 
     Column(
@@ -962,9 +968,10 @@ private fun AgentModeReplayPanel(
                 .background(agentModeReplayBackdropBrush()),
             contentAlignment = Alignment.Center,
         ) {
-            if (bitmap != null) {
+            val previewBitmap = bitmap
+            if (previewBitmap != null) {
                 Image(
-                    bitmap = bitmap.asImageBitmap(),
+                    bitmap = previewBitmap.asImageBitmap(),
                     contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "Agent 模式回放帧" else "Agent Mode replay frame",
                     modifier = Modifier
                         .fillMaxSize()

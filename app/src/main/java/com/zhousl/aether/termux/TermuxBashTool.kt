@@ -104,10 +104,9 @@ class TermuxBashTool(
             return@withContext buildInvalidArgumentsResult("Arguments were not valid JSON.")
         }
 
-        val command = arguments.optString("command").trim()
+        val command = arguments.cleanOptionalString("command")
         val workingDirectory = normalizeTermuxPath(
-            arguments.optString("working_directory").trim()
-                .ifBlank { arguments.optString("workingDirectory").trim() }
+            arguments.stringValue("working_directory", "workingDirectory")
                 .ifBlank { TermuxContract.HomeDirectory }
         )
 
@@ -478,6 +477,20 @@ class TermuxBashTool(
             context,
             TermuxContract.RunCommandPermission,
         ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    private fun JSONObject.stringValue(primaryKey: String, aliasKey: String? = null): String {
+        val primary = cleanOptionalString(primaryKey)
+        if (primary.isNotBlank()) return primary
+        return aliasKey?.let { cleanOptionalString(it) }.orEmpty()
+    }
+
+    private fun JSONObject.cleanOptionalString(key: String): String {
+        if (!has(key) || isNull(key)) return ""
+        val value = optString(key).trim()
+        return value.takeUnless {
+            it.equals("null", ignoreCase = true) || it.equals("undefined", ignoreCase = true)
+        }.orEmpty()
+    }
 
     private fun resolveTailBytes(arguments: JSONObject): Int {
         val requested = arguments.takeIf { it.has("tail_bytes") }?.optInt("tail_bytes")

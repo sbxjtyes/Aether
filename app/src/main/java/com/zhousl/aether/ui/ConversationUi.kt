@@ -80,6 +80,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -125,6 +126,8 @@ import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AgentModeDisplayState
@@ -1932,10 +1935,16 @@ private fun AgentModePreviewPanel(
     toolInvocation: ChatToolInvocation?,
 ) {
     val strings = rememberAetherStrings()
-    val bitmap = remember(displayState.latestPreviewPath, displayState.lastUpdatedMillis) {
-        displayState.latestPreviewPath
-            .takeIf { it.isNotBlank() }
-            ?.let { BitmapFactory.decodeFile(it) }
+    val bitmap by produceState<android.graphics.Bitmap?>(
+        initialValue = null,
+        displayState.latestPreviewPath,
+        displayState.lastUpdatedMillis,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            displayState.latestPreviewPath
+                .takeIf { it.isNotBlank() }
+                ?.let { BitmapFactory.decodeFile(it) }
+        }
     }
     Column(
         modifier = Modifier
@@ -1951,7 +1960,8 @@ private fun AgentModePreviewPanel(
         } else {
             AgentModePreviewHeader(displayState = displayState)
         }
-        if (bitmap != null) {
+        val previewBitmap = bitmap
+        if (previewBitmap != null) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1961,7 +1971,7 @@ private fun AgentModePreviewPanel(
                 contentAlignment = Alignment.Center,
             ) {
                 Image(
-                    bitmap = bitmap.asImageBitmap(),
+                    bitmap = previewBitmap.asImageBitmap(),
                     contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "Agent 模式虚拟显示" else "Agent Mode virtual display",
                     modifier = Modifier
                         .fillMaxSize()

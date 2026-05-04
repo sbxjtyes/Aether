@@ -1124,9 +1124,8 @@ class AetherAgent(
                 put("errmsg", "Arguments were not valid JSON.")
             }.toString()
 
-        val path = arguments.optString("path").trim()
-        val workingDirectory = arguments.optString("working_directory").trim()
-            .ifBlank { arguments.optString("workingDirectory").trim() }
+        val path = arguments.cleanOptionalString("path")
+        val workingDirectory = arguments.stringValue("working_directory", "workingDirectory")
         val prompt = arguments.optString("prompt").trim().ifBlank {
             "Describe the image and answer any relevant details needed for the task."
         }

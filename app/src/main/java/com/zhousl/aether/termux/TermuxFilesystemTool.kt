@@ -17,11 +17,7 @@ class TermuxFilesystemTool(
         val limit = arguments.takeIf { it.has("limit") }?.optInt("limit")
         val showLineNumbers = arguments.optBoolean("showLineNumbers", false) ||
             arguments.optBoolean("show_line_numbers", false)
-        val workingDirectory = normalizeTermuxPath(
-            arguments.optString("workingDirectory").trim()
-                .ifBlank { arguments.optString("working_directory").trim() }
-                .ifBlank { TermuxContract.HomeDirectory }
-        )
+        val workingDirectory = arguments.workingDirectoryValue()
         val resolvedPath = normalizeTermuxPath(path)
 
         if (path.isBlank()) return invalidArguments("Missing required 'path' argument.")
@@ -80,11 +76,7 @@ class TermuxFilesystemTool(
         val arguments = parseArguments(argumentsJson) ?: return invalidArguments("Arguments were not valid JSON.")
         val path = arguments.optString("path").trim()
         val content = arguments.optString("content")
-        val workingDirectory = normalizeTermuxPath(
-            arguments.optString("workingDirectory").trim()
-                .ifBlank { arguments.optString("working_directory").trim() }
-                .ifBlank { TermuxContract.HomeDirectory }
-        )
+        val workingDirectory = arguments.workingDirectoryValue()
         val resolvedPath = normalizeTermuxPath(path)
 
         if (path.isBlank()) return invalidArguments("Missing required 'path' argument.")
@@ -126,11 +118,7 @@ class TermuxFilesystemTool(
     suspend fun executeEdit(argumentsJson: String): String {
         val arguments = parseArguments(argumentsJson) ?: return invalidArguments("Arguments were not valid JSON.")
         val path = arguments.optString("path").trim()
-        val workingDirectory = normalizeTermuxPath(
-            arguments.optString("workingDirectory").trim()
-                .ifBlank { arguments.optString("working_directory").trim() }
-                .ifBlank { TermuxContract.HomeDirectory }
-        )
+        val workingDirectory = arguments.workingDirectoryValue()
         val resolvedPath = normalizeTermuxPath(path)
 
         if (path.isBlank()) return invalidArguments("Missing required 'path' argument.")
@@ -195,11 +183,7 @@ class TermuxFilesystemTool(
         val isRegex = arguments.optBoolean("isRegex", false)
         val caseSensitive = arguments.optBoolean("caseSensitive", true)
         val maxResults = arguments.optInt("maxResults", DefaultSearchResultLimit)
-        val workingDirectory = normalizeTermuxPath(
-            arguments.optString("workingDirectory").trim()
-                .ifBlank { arguments.optString("working_directory").trim() }
-                .ifBlank { TermuxContract.HomeDirectory }
-        )
+        val workingDirectory = arguments.workingDirectoryValue()
         val resolvedPath = normalizeTermuxPath(path)
 
         if (path.isBlank()) return invalidArguments("Missing required 'path' argument.")
@@ -251,11 +235,7 @@ class TermuxFilesystemTool(
         val caseSensitive = arguments.optBoolean("caseSensitive", true)
         val maxDepth = arguments.takeIf { it.has("maxDepth") }?.optInt("maxDepth")
         val maxResults = arguments.optInt("maxResults", DefaultSearchResultLimit)
-        val workingDirectory = normalizeTermuxPath(
-            arguments.optString("workingDirectory").trim()
-                .ifBlank { arguments.optString("working_directory").trim() }
-                .ifBlank { TermuxContract.HomeDirectory }
-        )
+        val workingDirectory = arguments.workingDirectoryValue()
         val resolvedPath = normalizeTermuxPath(path)
 
         if (path.isBlank()) return invalidArguments("Missing required 'path' argument.")
@@ -316,11 +296,7 @@ class TermuxFilesystemTool(
         val includeHidden = arguments.optBoolean("includeHidden", false)
         val maxDepth = arguments.takeIf { it.has("maxDepth") }?.optInt("maxDepth")
         val maxEntries = arguments.optInt("maxEntries", DefaultLsEntryLimit)
-        val workingDirectory = normalizeTermuxPath(
-            arguments.optString("workingDirectory").trim()
-                .ifBlank { arguments.optString("working_directory").trim() }
-                .ifBlank { TermuxContract.HomeDirectory }
-        )
+        val workingDirectory = arguments.workingDirectoryValue()
         val resolvedPath = normalizeTermuxPath(path)
 
         if (path.isBlank()) return invalidArguments("Missing required 'path' argument.")
@@ -939,6 +915,25 @@ class TermuxFilesystemTool(
 
     private fun quoteSummary(value: String): String =
         "\"" + value.replace("\"", "\\\"") + "\""
+
+    private fun JSONObject.workingDirectoryValue(): String = normalizeTermuxPath(
+        stringValue("workingDirectory", "working_directory")
+            .ifBlank { TermuxContract.HomeDirectory }
+    )
+
+    private fun JSONObject.stringValue(primaryKey: String, aliasKey: String? = null): String {
+        val primary = cleanOptionalString(primaryKey)
+        if (primary.isNotBlank()) return primary
+        return aliasKey?.let { cleanOptionalString(it) }.orEmpty()
+    }
+
+    private fun JSONObject.cleanOptionalString(key: String): String {
+        if (!has(key) || isNull(key)) return ""
+        val value = optString(key).trim()
+        return value.takeUnless {
+            it.equals("null", ignoreCase = true) || it.equals("undefined", ignoreCase = true)
+        }.orEmpty()
+    }
 
     private fun normalizeTermuxPath(path: String): String = when {
         path == "~" -> TermuxContract.HomeDirectory

@@ -33,6 +33,7 @@ import org.json.JSONObject
 
 private const val ReasoningInitialSummaryTokenThreshold = 100
 private const val ReasoningTimedSummaryIntervalMillis = 5_000L
+private const val ForegroundServiceEnsureMinIntervalMillis = 1_000L
 private const val ReasoningSummaryMaxInputChars = 8_000
 private const val ReasoningSummaryTitleMaxChars = 120
 private const val ReasoningSummaryDetailMaxChars = 520
@@ -120,6 +121,7 @@ class SessionExecutionManager(
     private val _turnEvents = MutableSharedFlow<SessionTurnEvent>(extraBufferCapacity = 8)
     private val executionHandles = ConcurrentHashMap<String, SessionExecutionHandle>()
     private val queuedTurnRequestBuilder = QueuedTurnRequestBuilder(chatStateStore)
+    private var lastForegroundEnsureMillis = 0L
 
     val executionStates: StateFlow<Map<String, SessionExecutionState>> = _executionStates.asStateFlow()
     val turnEvents = _turnEvents.asSharedFlow()
@@ -990,12 +992,18 @@ class SessionExecutionManager(
                 put(sessionId, transform(current))
             }
         }
+        maybeEnsureForegroundService()
+    }
+
+    private fun maybeEnsureForegroundService() {
         if (
-            currentSettings.value.keepTasksRunningInBackground &&
-            _executionStates.value.values.any { it.isRunning }
-        ) {
-            AetherForegroundService.ensureRunning(application)
-        }
+            !currentSettings.value.keepTasksRunningInBackground ||
+            !_executionStates.value.values.any { it.isRunning }
+        ) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastForegroundEnsureMillis < ForegroundServiceEnsureMinIntervalMillis) return
+        lastForegroundEnsureMillis = now
+        AetherForegroundService.ensureRunning(application)
     }
 
     private fun validateSettings(settings: AppSettings): String? = when {
