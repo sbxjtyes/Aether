@@ -692,6 +692,8 @@ private fun AetherAppContent(
                     onRemoveSkill = viewModel::removeSkill,
                     onSaveHttpMcpServer = viewModel::saveStreamableHttpMcpServer,
                     onSaveStdIoMcpServer = viewModel::saveStdIoMcpServer,
+                    onValidateHttpMcpServer = viewModel::validateStreamableHttpMcpServer,
+                    onValidateStdIoMcpServer = viewModel::validateStdIoMcpServer,
                     onToggleMcpServerEnabled = viewModel::setMcpServerEnabled,
                     onRemoveMcpServer = viewModel::removeMcpServer,
                     onRequestTermuxPermission = { requestTermuxPermission("settings_termux_permission") },

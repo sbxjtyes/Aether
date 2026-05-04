@@ -297,6 +297,8 @@ fun SettingsScreen(
     onRemoveSkill: (String) -> Unit,
     onSaveHttpMcpServer: (String?, String, String, String) -> Unit,
     onSaveStdIoMcpServer: (String?, String, String, String, String) -> Unit,
+    onValidateHttpMcpServer: (String?, String, String, String, (Boolean, String) -> Unit) -> Unit,
+    onValidateStdIoMcpServer: (String?, String, String, String, String, (Boolean, String) -> Unit) -> Unit,
     onToggleMcpServerEnabled: (String, Boolean) -> Unit,
     onRemoveMcpServer: (String) -> Unit,
     onRequestTermuxPermission: () -> Unit,
@@ -744,6 +746,8 @@ fun SettingsScreen(
                     onSaveStdIoMcpServer(serverId, name, cmd, wd, env)
                     currentPage = SettingsPage.McpServers.name
                 },
+                onValidateHttpMcpServer = onValidateHttpMcpServer,
+                onValidateStdIoMcpServer = onValidateStdIoMcpServer,
                 onBack = { currentPage = SettingsPage.McpServers.name },
             )
 
@@ -758,6 +762,8 @@ fun SettingsScreen(
                     onSaveStdIoMcpServer(serverId, name, cmd, wd, env)
                     currentPage = SettingsPage.McpServers.name
                 },
+                onValidateHttpMcpServer = onValidateHttpMcpServer,
+                onValidateStdIoMcpServer = onValidateStdIoMcpServer,
                 onBack = { currentPage = SettingsPage.McpServers.name },
             )
 
@@ -2152,6 +2158,8 @@ private fun AddMcpServerPage(
     existingServer: com.zhousl.aether.data.McpServerConfig?,
     onSaveHttpMcpServer: (String?, String, String, String) -> Unit,
     onSaveStdIoMcpServer: (String?, String, String, String, String) -> Unit,
+    onValidateHttpMcpServer: (String?, String, String, String, (Boolean, String) -> Unit) -> Unit,
+    onValidateStdIoMcpServer: (String?, String, String, String, String, (Boolean, String) -> Unit) -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
@@ -2197,7 +2205,24 @@ private fun AddMcpServerPage(
         )
     }
 
+    var isValidating by rememberSaveable(existingServer?.id) { mutableStateOf(false) }
+    var validationMessage by rememberSaveable(existingServer?.id) { mutableStateOf("") }
+    var validationSucceeded by rememberSaveable(existingServer?.id) { mutableStateOf<Boolean?>(null) }
     val tabOptions = listOf("HTTP", tr(strings, "Stdio", "标准输入输出"))
+
+    fun resetValidation() {
+        validationMessage = ""
+        validationSucceeded = null
+    }
+
+    fun finishValidation(
+        success: Boolean,
+        message: String,
+    ) {
+        isValidating = false
+        validationSucceeded = success
+        validationMessage = message
+    }
 
     SubPageScaffold(title = title, onBack = onBack) {
         Text(
@@ -2218,7 +2243,10 @@ private fun AddMcpServerPage(
             tabOptions.forEachIndexed { index, label ->
                 SegmentedButton(
                     shape = SegmentedButtonDefaults.itemShape(index = index, count = tabOptions.size),
-                    onClick = { selectedTab = index },
+                    onClick = {
+                        selectedTab = index
+                        resetValidation()
+                    },
                     selected = selectedTab == index,
                     colors = SegmentedButtonDefaults.colors(
                         activeContainerColor = AetherPrimary,
@@ -2238,22 +2266,56 @@ private fun AddMcpServerPage(
             0 -> {
                 // HTTP server
                 SettingsCardGroup {
-                    ChatGptTextField(tr(strings, "Server name", "Server name"), httpServerNameValue) { httpServerNameValue = it }
+                    ChatGptTextField(tr(strings, "Server name", "服务器名称"), httpServerNameValue) {
+                        httpServerNameValue = it
+                        resetValidation()
+                    }
                     CardDivider()
-                    ChatGptTextField(tr(strings, "Server URL", "服务器 URL"), httpServerUrlValue) { httpServerUrlValue = it }
+                    ChatGptTextField(tr(strings, "Server URL", "服务器 URL"), httpServerUrlValue) {
+                        httpServerUrlValue = it
+                        resetValidation()
+                    }
                     CardDivider()
-                    ChatGptTextField(tr(strings, "Headers", "Headers"), httpHeadersValue, minLines = 2) { httpHeadersValue = it }
+                    ChatGptTextField(tr(strings, "Headers", "请求头"), httpHeadersValue, minLines = 2) {
+                        httpHeadersValue = it
+                        resetValidation()
+                    }
                 }
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    tr(strings, "Optional headers, one KEY=VALUE per line.", "Optional headers, one KEY=VALUE per line."),
+                    tr(strings, "Optional headers, one KEY=VALUE per line.", "可选请求头，每行一个 KEY=VALUE。"),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 4.dp),
                 )
+                McpValidationStatus(
+                    isValidating = isValidating,
+                    message = validationMessage,
+                    succeeded = validationSucceeded,
+                )
                 Spacer(Modifier.height(16.dp))
+                SettingsSubtleActionButton(
+                    label = if (isValidating) tr(strings, "Checking MCP config...", "正在检测 MCP 配置...") else tr(strings, "Validate configuration", "检测配置有效性"),
+                    onClick = {
+                        if (!isValidating) {
+                            isValidating = true
+                            validationMessage = ""
+                            validationSucceeded = null
+                            onValidateHttpMcpServer(
+                                existingServer?.id,
+                                httpServerNameValue.text,
+                                httpServerUrlValue.text,
+                                httpHeadersValue.text,
+                                ::finishValidation,
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isValidating,
+                )
+                Spacer(Modifier.height(10.dp))
                 SettingsActionButton(
-                    label = if (isEditing) tr(strings, "Save HTTP Server", "Save HTTP Server") else tr(strings, "Add HTTP Server", "Add HTTP Server"),
+                    label = if (isEditing) tr(strings, "Save HTTP Server", "保存 HTTP 服务器") else tr(strings, "Add HTTP Server", "添加 HTTP 服务器"),
                     onClick = {
                         if (httpServerNameValue.text.isNotBlank() && httpServerUrlValue.text.isNotBlank()) {
                             onSaveHttpMcpServer(
@@ -2271,24 +2333,62 @@ private fun AddMcpServerPage(
             1 -> {
                 // Stdio server
                 SettingsCardGroup {
-                    ChatGptTextField(tr(strings, "Server name", "Server name"), stdioServerNameValue) { stdioServerNameValue = it }
+                    ChatGptTextField(tr(strings, "Server name", "服务器名称"), stdioServerNameValue) {
+                        stdioServerNameValue = it
+                        resetValidation()
+                    }
                     CardDivider()
-                    ChatGptTextField(tr(strings, "Command", "命令"), stdioCommandValue, minLines = 2) { stdioCommandValue = it }
+                    ChatGptTextField(tr(strings, "Command", "命令"), stdioCommandValue, minLines = 2) {
+                        stdioCommandValue = it
+                        resetValidation()
+                    }
                     CardDivider()
-                    ChatGptTextField(tr(strings, "Working directory", "工作目录"), stdioWorkingDirectoryValue) { stdioWorkingDirectoryValue = it }
+                    ChatGptTextField(tr(strings, "Working directory", "工作目录"), stdioWorkingDirectoryValue) {
+                        stdioWorkingDirectoryValue = it
+                        resetValidation()
+                    }
                     CardDivider()
-                    ChatGptTextField(tr(strings, "Environment", "环境变量"), stdioEnvValue, minLines = 2) { stdioEnvValue = it }
+                    ChatGptTextField(tr(strings, "Environment", "环境变量"), stdioEnvValue, minLines = 2) {
+                        stdioEnvValue = it
+                        resetValidation()
+                    }
                 }
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    tr(strings, "Optional environment variables, one KEY=VALUE per line.", "Optional environment variables, one KEY=VALUE per line."),
+                    tr(strings, "Optional environment variables, one KEY=VALUE per line.", "可选环境变量，每行一个 KEY=VALUE。"),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 4.dp),
                 )
+                McpValidationStatus(
+                    isValidating = isValidating,
+                    message = validationMessage,
+                    succeeded = validationSucceeded,
+                )
                 Spacer(Modifier.height(16.dp))
+                SettingsSubtleActionButton(
+                    label = if (isValidating) tr(strings, "Checking MCP config...", "正在检测 MCP 配置...") else tr(strings, "Validate configuration", "检测配置有效性"),
+                    onClick = {
+                        if (!isValidating) {
+                            isValidating = true
+                            validationMessage = ""
+                            validationSucceeded = null
+                            onValidateStdIoMcpServer(
+                                existingServer?.id,
+                                stdioServerNameValue.text,
+                                stdioCommandValue.text,
+                                stdioWorkingDirectoryValue.text,
+                                stdioEnvValue.text,
+                                ::finishValidation,
+                            )
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isValidating,
+                )
+                Spacer(Modifier.height(10.dp))
                 SettingsActionButton(
-                    label = if (isEditing) tr(strings, "Save Stdio Server", "Save Stdio Server") else tr(strings, "Add Stdio Server", "Add Stdio Server"),
+                    label = if (isEditing) tr(strings, "Save Stdio Server", "保存 Stdio 服务器") else tr(strings, "Add Stdio Server", "添加 Stdio 服务器"),
                     onClick = {
                         if (stdioServerNameValue.text.isNotBlank() && stdioCommandValue.text.isNotBlank()) {
                             onSaveStdIoMcpServer(
@@ -2303,6 +2403,55 @@ private fun AddMcpServerPage(
                     modifier = Modifier.fillMaxWidth(),
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun McpValidationStatus(
+    isValidating: Boolean,
+    message: String,
+    succeeded: Boolean?,
+) {
+    AnimatedVisibility(visible = isValidating || message.isNotBlank()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(
+                    when (succeeded) {
+                        true -> Color(0xFF2E7D32).copy(alpha = 0.12f)
+                        false -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.72f)
+                        null -> AetherSurfaceHigh
+                    }
+                )
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (isValidating) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = AetherPrimary,
+                )
+            } else {
+                Icon(
+                    imageVector = if (succeeded == true) Icons.Rounded.Check else Icons.Rounded.Info,
+                    contentDescription = null,
+                    tint = if (succeeded == true) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Text(
+                text = if (isValidating) "正在解析并连接 MCP 服务..." else message,
+                style = MaterialTheme.typography.bodySmall,
+                color = when (succeeded) {
+                    true -> Color(0xFF2E7D32)
+                    false -> MaterialTheme.colorScheme.error
+                    null -> AetherOnSurfaceVariant
+                },
+            )
         }
     }
 }

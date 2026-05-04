@@ -8,19 +8,21 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import okio.BufferedSource
 import org.json.JSONArray
 import org.json.JSONObject
 
 private const val DefaultMcpProtocolVersion = "2025-11-25"
 private const val McpRequestPollIntervalMillis = 150L
 private const val McpDefaultRequestTimeoutMillis = 60_000L
+private const val McpValidationTimeoutMillis = 20_000L
 private const val McpLogTag = "AetherMcp"
 private const val EnableMcpLogging = false
 
@@ -30,6 +32,13 @@ enum class McpConnectionStatus {
     Ready,
     Error,
 }
+
+data class McpValidationSummary(
+    val serverInfo: String = "",
+    val toolCount: Int = 0,
+    val resourceCount: Int = 0,
+    val promptCount: Int = 0,
+)
 
 data class McpToolBinding(
     val serverId: String,
@@ -155,23 +164,9 @@ class McpClientManager(
                 val existing = sessions[server.id]
                 if (existing == null || existing.config != server || existing.workspaceDirectory != workspaceDirectory) {
                     disconnect(server.id)
-                    val transport = when (val transportConfig = server.transport) {
-                        is McpTransportConfig.StdIo -> StdIoMcpTransport(
-                            serverId = server.id,
-                            config = transportConfig,
-                            workspaceDirectory = workspaceDirectory,
-                            bashTool = bashTool,
-                        )
-
-                        is McpTransportConfig.StreamableHttp -> StreamableHttpMcpTransport(
-                            config = transportConfig,
-                            protocolVersion = DefaultMcpProtocolVersion,
-                            httpClient = httpClient,
-                        )
-                    }
                     val session = McpServerSession(
                         config = server,
-                        transport = transport,
+                        transport = createTransport(server, workspaceDirectory),
                         workspaceDirectory = workspaceDirectory,
                         callbacks = callbacks,
                     )
@@ -183,6 +178,40 @@ class McpClientManager(
 
     suspend fun disconnect(serverId: String) = withContext(Dispatchers.IO) {
         sessions.remove(serverId)?.close()
+    }
+
+    suspend fun validateServer(
+        server: McpServerConfig,
+        workspaceDirectory: String,
+    ): Result<McpValidationSummary> = withContext(Dispatchers.IO) {
+        runCatching {
+            validateMcpServerConfig(server)
+            val session = McpServerSession(
+                config = server,
+                transport = createTransport(server, workspaceDirectory),
+                workspaceDirectory = workspaceDirectory,
+                callbacks = callbacks,
+            )
+            try {
+                withTimeout(server.connectTimeoutMillis.coerceAtLeast(1_000L).coerceAtMost(McpValidationTimeoutMillis)) {
+                    session.connectAndRefresh()
+                }
+                val snapshot = session.snapshot
+                if (snapshot.status != McpConnectionStatus.Ready) {
+                    error(snapshot.errorMessage.ifBlank { "MCP server did not become ready." })
+                }
+                McpValidationSummary(
+                    serverInfo = snapshot.serverInfo,
+                    toolCount = snapshot.tools.size,
+                    resourceCount = snapshot.resources.size,
+                    promptCount = snapshot.prompts.size,
+                )
+            } catch (throwable: TimeoutCancellationException) {
+                error("Connection timed out while waiting for MCP server response.")
+            } finally {
+                session.close()
+            }
+        }
     }
 
     suspend fun refreshServer(serverId: String) = withContext(Dispatchers.IO) {
@@ -355,6 +384,24 @@ class McpClientManager(
                 ?: error("MCP server '$serverId' is not connected.")
             result.toString()
         }
+    }
+
+    private fun createTransport(
+        server: McpServerConfig,
+        workspaceDirectory: String,
+    ): McpSessionTransport = when (val transportConfig = server.transport) {
+        is McpTransportConfig.StdIo -> StdIoMcpTransport(
+            serverId = server.id,
+            config = transportConfig,
+            workspaceDirectory = workspaceDirectory,
+            bashTool = bashTool,
+        )
+
+        is McpTransportConfig.StreamableHttp -> StreamableHttpMcpTransport(
+            config = transportConfig,
+            protocolVersion = DefaultMcpProtocolVersion,
+            httpClient = httpClient,
+        )
     }
 
     private fun resolveToolBinding(toolCallName: String): McpToolBinding? =
@@ -694,6 +741,8 @@ private class StreamableHttpMcpTransport(
     private val protocolVersion: String,
     private val httpClient: OkHttpClient,
 ) : McpSessionTransport {
+    private var sessionId: String = ""
+
     override suspend fun open() = Unit
 
     override suspend fun sendMessage(message: JSONObject): List<JSONObject> = withContext(Dispatchers.IO) {
@@ -703,20 +752,34 @@ private class StreamableHttpMcpTransport(
             .addHeader("Accept", "application/json, text/event-stream")
             .addHeader("MCP-Protocol-Version", protocolVersion)
             .apply {
+                if (sessionId.isNotBlank()) {
+                    addHeader("Mcp-Session-Id", sessionId)
+                }
                 config.headers.forEach { addHeader(it.key, it.value) }
             }
             .post(message.toString().toRequestBody("application/json".toMediaType()))
             .build()
         httpClient.newCall(request).execute().use { response ->
-            val body = response.body ?: error("MCP server returned an empty body.")
+            response.header("Mcp-Session-Id")
+                ?.trim()
+                ?.takeIf(String::isNotBlank)
+                ?.let { sessionId = it }
+            val body = response.body
             if (!response.isSuccessful) {
                 error("MCP server returned HTTP ${response.code}.")
             }
+            if (body == null || body.contentLength() == 0L) {
+                return@withContext emptyList()
+            }
             val contentType = response.header("Content-Type").orEmpty()
+            val responseText = body.string()
+            if (responseText.isBlank()) {
+                return@withContext emptyList()
+            }
             return@withContext if (contentType.contains("text/event-stream", ignoreCase = true)) {
-                parseSseMessages(body.source())
+                parseSseMessages(responseText)
             } else {
-                listOf(JSONObject(body.string()))
+                listOf(JSONObject(responseText))
             }
         }
     }
@@ -1038,20 +1101,19 @@ private fun parsePrompts(
     }
 }
 
-private fun parseSseMessages(source: BufferedSource): List<JSONObject> {
+private fun parseSseMessages(rawValue: String): List<JSONObject> {
     val results = mutableListOf<JSONObject>()
     val eventData = StringBuilder()
-    while (true) {
-        val line = source.readUtf8Line() ?: break
+    rawValue.lineSequence().forEach { line ->
         if (line.isEmpty()) {
             if (eventData.isNotEmpty()) {
                 runCatching { JSONObject(eventData.toString()) }.getOrNull()?.let(results::add)
                 eventData.setLength(0)
             }
-            continue
+            return@forEach
         }
-        if (line.startsWith(":")) continue
-        if (!line.startsWith("data:")) continue
+        if (line.startsWith(":")) return@forEach
+        if (!line.startsWith("data:")) return@forEach
         if (eventData.isNotEmpty()) {
             eventData.append('\n')
         }
@@ -1089,6 +1151,29 @@ private fun describeMcpMessage(message: JSONObject): String = buildString {
     when {
         message.has("result") -> append(" result")
         message.has("error") -> append(" error")
+    }
+}
+
+private fun validateMcpServerConfig(server: McpServerConfig) {
+    if (server.displayName.trim().isBlank()) {
+        error("Missing required field: server name.")
+    }
+    when (val transport = server.transport) {
+        is McpTransportConfig.StreamableHttp -> {
+            val url = transport.url.trim()
+            if (url.isBlank()) {
+                error("Missing required field: server URL.")
+            }
+            if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) {
+                error("Format error: server URL must start with http:// or https://.")
+            }
+        }
+
+        is McpTransportConfig.StdIo -> {
+            if (transport.command.trim().isBlank()) {
+                error("Missing required field: command.")
+            }
+        }
     }
 }
 

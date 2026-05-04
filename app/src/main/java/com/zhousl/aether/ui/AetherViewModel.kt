@@ -24,6 +24,9 @@ import com.zhousl.aether.data.ProviderModelOption
 import com.zhousl.aether.data.availableModelOptions
 import com.zhousl.aether.data.McpClientManager
 import com.zhousl.aether.data.McpServerConfig
+import com.zhousl.aether.data.McpTransportConfig
+import com.zhousl.aether.data.McpValidationSummary
+import com.zhousl.aether.data.generateQuickActionLabel
 import com.zhousl.aether.data.normalizeSelectableModelKey
 import com.zhousl.aether.data.normalizeLlmInactivityReconnectTimeoutSeconds
 import com.zhousl.aether.data.OnboardingStarterPrompt
@@ -54,6 +57,7 @@ import com.zhousl.aether.data.resolveModelSettings
 import com.zhousl.aether.data.resolveStoredOrAutomaticModelKey
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
+import java.net.URI
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -1634,31 +1638,10 @@ class AetherViewModel(
         url: String,
         headersRaw: String,
     ) {
-        val trimmedName = displayName.trim()
-        val trimmedUrl = url.trim()
-        if (trimmedName.isBlank() || trimmedUrl.isBlank()) return
+        val existingServer = serverId?.let(::findMcpServerById)
+        val server = buildStreamableHttpMcpServerConfig(serverId, displayName, url, headersRaw, existingServer) ?: return
         viewModelScope.launch {
-            val existingServer = serverId?.let(::findMcpServerById)
-            val now = System.currentTimeMillis()
-            extensionsRepository.upsertMcpServer(
-                McpServerConfig(
-                    id = existingServer?.id ?: "mcp-$now",
-                    displayName = trimmedName,
-                    actionLabel = com.zhousl.aether.data.generateQuickActionLabel(
-                        trimmedName,
-                        trimmedUrl,
-                    ),
-                    transport = com.zhousl.aether.data.McpTransportConfig.StreamableHttp(
-                        url = trimmedUrl,
-                        headers = parseKeyValueLines(headersRaw),
-                    ),
-                    isEnabled = existingServer?.isEnabled ?: true,
-                    connectTimeoutMillis = existingServer?.connectTimeoutMillis ?: 15_000L,
-                    requestTimeoutMillis = existingServer?.requestTimeoutMillis ?: 60_000L,
-                    createdAtMillis = existingServer?.createdAtMillis ?: now,
-                    updatedAtMillis = now,
-                ),
-            )
+            extensionsRepository.upsertMcpServer(server)
             if (existingServer != null) {
                 mcpClientManager.disconnect(existingServer.id)
             }
@@ -1676,32 +1659,10 @@ class AetherViewModel(
         workingDirectory: String,
         environmentRaw: String,
     ) {
-        val trimmedName = displayName.trim()
-        val trimmedCommand = command.trim()
-        if (trimmedName.isBlank() || trimmedCommand.isBlank()) return
+        val existingServer = serverId?.let(::findMcpServerById)
+        val server = buildStdIoMcpServerConfig(serverId, displayName, command, workingDirectory, environmentRaw, existingServer) ?: return
         viewModelScope.launch {
-            val existingServer = serverId?.let(::findMcpServerById)
-            val now = System.currentTimeMillis()
-            extensionsRepository.upsertMcpServer(
-                McpServerConfig(
-                    id = existingServer?.id ?: "mcp-$now",
-                    displayName = trimmedName,
-                    actionLabel = com.zhousl.aether.data.generateQuickActionLabel(
-                        trimmedName,
-                        trimmedCommand,
-                    ),
-                    transport = com.zhousl.aether.data.McpTransportConfig.StdIo(
-                        command = trimmedCommand,
-                        workingDirectory = workingDirectory.trim(),
-                        environment = parseKeyValueLines(environmentRaw),
-                    ),
-                    isEnabled = existingServer?.isEnabled ?: true,
-                    connectTimeoutMillis = existingServer?.connectTimeoutMillis ?: 15_000L,
-                    requestTimeoutMillis = existingServer?.requestTimeoutMillis ?: 60_000L,
-                    createdAtMillis = existingServer?.createdAtMillis ?: now,
-                    updatedAtMillis = now,
-                ),
-            )
+            extensionsRepository.upsertMcpServer(server)
             if (existingServer != null) {
                 mcpClientManager.disconnect(existingServer.id)
             }
@@ -1709,6 +1670,171 @@ class AetherViewModel(
                 event = "mcp server added",
                 properties = mapOf("transport" to "stdio"),
             )
+        }
+    }
+
+    fun validateStreamableHttpMcpServer(
+        serverId: String?,
+        displayName: String,
+        url: String,
+        headersRaw: String,
+        onComplete: (Boolean, String) -> Unit,
+    ) {
+        val existingServer = serverId?.let(::findMcpServerById)
+        val server = buildStreamableHttpMcpServerConfig(serverId, displayName, url, headersRaw, existingServer)
+        validateMcpServerConfig(server, "streamable_http", onComplete)
+    }
+
+    fun validateStdIoMcpServer(
+        serverId: String?,
+        displayName: String,
+        command: String,
+        workingDirectory: String,
+        environmentRaw: String,
+        onComplete: (Boolean, String) -> Unit,
+    ) {
+        val existingServer = serverId?.let(::findMcpServerById)
+        val server = buildStdIoMcpServerConfig(serverId, displayName, command, workingDirectory, environmentRaw, existingServer)
+        validateMcpServerConfig(server, "stdio", onComplete)
+    }
+
+    private fun validateMcpServerConfig(
+        server: McpServerConfig?,
+        transport: String,
+        onComplete: (Boolean, String) -> Unit,
+    ) {
+        if (server == null) {
+            onComplete(false, "字段缺失：请填写服务器名称以及必填连接信息。")
+            return
+        }
+        val localFormatIssue = localMcpConfigIssue(server)
+        if (localFormatIssue != null) {
+            onComplete(false, localFormatIssue)
+            return
+        }
+        viewModelScope.launch {
+            val workspaceDirectory = workspaceFileBridge.workspaceDirectory(server.id)
+            val result = mcpClientManager.validateServer(server, workspaceDirectory)
+            result.fold(
+                onSuccess = { summary ->
+                    onComplete(true, buildMcpValidationSuccessMessage(summary))
+                    captureAnalyticsEvent(
+                        event = "mcp server validated",
+                        properties = mapOf("transport" to transport, "success" to true),
+                    )
+                },
+                onFailure = { throwable ->
+                    onComplete(false, formatMcpValidationFailure(throwable))
+                    captureAnalyticsEvent(
+                        event = "mcp server validated",
+                        properties = mapOf("transport" to transport, "success" to false),
+                    )
+                },
+            )
+        }
+    }
+
+    private fun buildStreamableHttpMcpServerConfig(
+        serverId: String?,
+        displayName: String,
+        url: String,
+        headersRaw: String,
+        existingServer: McpServerConfig?,
+    ): McpServerConfig? {
+        val trimmedName = displayName.trim()
+        val trimmedUrl = url.trim()
+        if (trimmedName.isBlank() || trimmedUrl.isBlank()) return null
+        val now = System.currentTimeMillis()
+        return McpServerConfig(
+            id = existingServer?.id ?: serverId ?: "mcp-$now",
+            displayName = trimmedName,
+            actionLabel = generateQuickActionLabel(trimmedName, trimmedUrl),
+            transport = McpTransportConfig.StreamableHttp(
+                url = trimmedUrl,
+                headers = parseKeyValueLines(headersRaw),
+            ),
+            isEnabled = existingServer?.isEnabled ?: true,
+            connectTimeoutMillis = existingServer?.connectTimeoutMillis ?: 15_000L,
+            requestTimeoutMillis = existingServer?.requestTimeoutMillis ?: 60_000L,
+            createdAtMillis = existingServer?.createdAtMillis ?: now,
+            updatedAtMillis = now,
+        )
+    }
+
+    private fun buildStdIoMcpServerConfig(
+        serverId: String?,
+        displayName: String,
+        command: String,
+        workingDirectory: String,
+        environmentRaw: String,
+        existingServer: McpServerConfig?,
+    ): McpServerConfig? {
+        val trimmedName = displayName.trim()
+        val trimmedCommand = command.trim()
+        if (trimmedName.isBlank() || trimmedCommand.isBlank()) return null
+        val now = System.currentTimeMillis()
+        return McpServerConfig(
+            id = existingServer?.id ?: serverId ?: "mcp-$now",
+            displayName = trimmedName,
+            actionLabel = generateQuickActionLabel(trimmedName, trimmedCommand),
+            transport = McpTransportConfig.StdIo(
+                command = trimmedCommand,
+                workingDirectory = workingDirectory.trim(),
+                environment = parseKeyValueLines(environmentRaw),
+            ),
+            isEnabled = existingServer?.isEnabled ?: true,
+            connectTimeoutMillis = existingServer?.connectTimeoutMillis ?: 15_000L,
+            requestTimeoutMillis = existingServer?.requestTimeoutMillis ?: 60_000L,
+            createdAtMillis = existingServer?.createdAtMillis ?: now,
+            updatedAtMillis = now,
+        )
+    }
+
+    private fun localMcpConfigIssue(server: McpServerConfig): String? {
+        if (server.displayName.isBlank()) return "字段缺失：服务器名称不能为空。"
+        return when (val transport = server.transport) {
+            is McpTransportConfig.StreamableHttp -> {
+                val url = transport.url.trim()
+                when {
+                    url.isBlank() -> "字段缺失：服务器 URL 不能为空。"
+                    runCatching { URI(url) }.getOrNull()?.scheme !in listOf("http", "https") ->
+                        "格式错误：服务器 URL 必须是 http:// 或 https:// 地址。"
+                    else -> null
+                }
+            }
+
+            is McpTransportConfig.StdIo -> {
+                if (transport.command.trim().isBlank()) "字段缺失：启动命令不能为空。" else null
+            }
+        }
+    }
+
+    private fun buildMcpValidationSuccessMessage(summary: McpValidationSummary): String = buildString {
+        append("配置有效：MCP 服务已正常响应")
+        val serverInfo = summary.serverInfo.trim()
+        if (serverInfo.isNotBlank()) {
+            append("（")
+            append(serverInfo)
+            append("）")
+        }
+        append("。工具 ")
+        append(summary.toolCount)
+        append(" 个，资源 ")
+        append(summary.resourceCount)
+        append(" 个，提示词 ")
+        append(summary.promptCount)
+        append(" 个。")
+    }
+
+    private fun formatMcpValidationFailure(throwable: Throwable): String {
+        val message = throwable.message.orEmpty().ifBlank { "MCP 服务无响应。" }
+        return when {
+            message.contains("Missing required field", ignoreCase = true) -> "字段缺失：${message.substringAfter(':').trim()}"
+            message.contains("Format error", ignoreCase = true) -> "格式错误：${message.substringAfter(':').trim()}"
+            message.contains("timed out", ignoreCase = true) || message.contains("timeout", ignoreCase = true) -> "连接超时：$message"
+            message.contains("launch", ignoreCase = true) || message.contains("command", ignoreCase = true) -> "命令执行失败：$message"
+            message.contains("HTTP", ignoreCase = true) -> "服务地址不可访问：$message"
+            else -> "服务无响应：$message"
         }
     }
 
