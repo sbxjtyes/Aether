@@ -29,6 +29,29 @@ class ProviderConfigSerializationTest {
     }
 
     @Test
+    fun providerIdAcceptsLongGeneratedNames() {
+        val longProviderName = "Provider " + (1..80).joinToString(" ") { "segment$it" }
+        val providerId = longProviderName.sanitizeProviderId()
+
+        assertTrue(providerId.length > 256)
+        assertTrue(isValidProviderId(providerId))
+
+        val config = LlmProviderConfig(
+            id = "long-provider",
+            providerId = providerId,
+            name = longProviderName,
+            providerType = LlmProvider.OpenAiCompatible,
+            apiKey = "",
+            baseUrl = "https://long-provider.example/v1",
+            modelId = "model-a",
+        )
+
+        val restoredConfig = parseProviderConfigs(serializeProviderConfigs(listOf(config))).single()
+        assertEquals(providerId, restoredConfig.providerId)
+        assertEquals(providerId, listOf(restoredConfig).availableModelOptions().single().providerId)
+    }
+
+    @Test
     fun availableModelOptionsSkipsConfigsWithBlankBaseUrl() {
         val options = listOf(
             LlmProviderConfig(

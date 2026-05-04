@@ -120,10 +120,11 @@ class ProviderFormState internal constructor(
     }
 
     fun isValid(existingProviderIds: Set<String>): Boolean {
-        val trimmedProviderId = providerId.trim()
-        val providerIdAvailable = trimmedProviderId !in (existingProviderIds - setOf(existingConfig?.providerId.orEmpty()))
+        val normalizedProviderId = normalizedProviderId
+        val normalizedExistingProviderIds = existingProviderIds.map { it.trim().sanitizeProviderId() }.toSet()
+        val providerIdAvailable = normalizedProviderId !in (normalizedExistingProviderIds - setOf(existingProviderId))
         return providerIdAvailable &&
-            isValidProviderId(trimmedProviderId) &&
+            isValidProviderId(normalizedProviderId) &&
             isProviderSetupValid(
                 provider = selectedProvider,
                 apiKey = apiKey,
@@ -183,7 +184,7 @@ class ProviderFormState internal constructor(
 
     fun buildConfig(): LlmProviderConfig = LlmProviderConfig(
         id = existingConfig?.id ?: UUID.randomUUID().toString(),
-        providerId = providerId.trim().sanitizeProviderId(),
+        providerId = normalizedProviderId,
         name = name.trim().ifBlank { selectedProvider.displayName },
         providerType = selectedProvider,
         apiKey = apiKey.trim(),
@@ -199,6 +200,12 @@ class ProviderFormState internal constructor(
         createdAtMillis = existingConfig?.createdAtMillis ?: System.currentTimeMillis(),
     )
 
+    val normalizedProviderId: String
+        get() = providerId.trim().sanitizeProviderId()
+
+    val existingProviderId: String
+        get() = existingConfig?.providerId.orEmpty().trim().sanitizeProviderId()
+ 
     companion object {
         fun fromConfig(existingConfig: LlmProviderConfig?): ProviderFormState {
             val initialProvider = existingConfig?.providerType ?: LlmProvider.OpenAiCompatible
@@ -252,10 +259,13 @@ fun ProviderConfigurationForm(
     cardColor: Color = AetherSurfaceHigh,
 ) {
     val selectedProvider = state.selectedProvider
-    val providerIdAlreadyUsed = state.providerId.trim() in (existingProviderIds - setOf(state.buildConfig().providerId))
+    val normalizedProviderId = state.normalizedProviderId
+    val existingProviderId = state.existingProviderId
+    val normalizedExistingProviderIds = existingProviderIds.map { it.trim().sanitizeProviderId() }.toSet()
+    val providerIdAlreadyUsed = normalizedProviderId in (normalizedExistingProviderIds - setOf(existingProviderId))
     val providerIdError = when {
-        state.providerId.isBlank() -> "Provider ID is required."
-        !isValidProviderId(state.providerId.trim()) -> "Use lowercase letters, numbers, and underscores only."
+        normalizedProviderId.isBlank() -> "Provider ID is required."
+        !isValidProviderId(normalizedProviderId) -> "Use lowercase letters, numbers, and underscores only."
         providerIdAlreadyUsed -> "This provider ID is already in use."
         else -> ""
     }
