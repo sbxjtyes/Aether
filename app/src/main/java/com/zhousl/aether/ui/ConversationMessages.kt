@@ -136,6 +136,7 @@ import com.zhousl.aether.termux.TermuxSetupState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -3028,6 +3029,9 @@ private fun formatToolInvocationDetail(strings: AetherStrings, toolInvocation: C
 
     val result = when {
         output == null -> toolInvocation.outputJson.trim().ifBlank { strings.noOutput }
+        isMcpToolInvocation(toolInvocation.toolName, output) -> {
+            formatMcpToolResult(strings, output)
+        }
         toolInvocation.toolName.equals("fetch_web_url", ignoreCase = true) -> {
             formatFetchWebUrlResult(strings, output)
         }
@@ -3053,6 +3057,69 @@ private fun formatToolInvocationDetail(strings: AetherStrings, toolInvocation: C
         result = result,
     )
 }
+
+private fun isMcpToolInvocation(
+    toolName: String,
+    output: JSONObject,
+): Boolean = toolName == "mcp_call_tool" ||
+    toolName.startsWith("mcp__") ||
+    toolName.contains(':') ||
+    output.has("server_id") && output.has("tool_name") && output.has("result")
+
+private fun formatMcpToolResult(strings: AetherStrings, output: JSONObject): String {
+    val result = output.optJSONObject("result")
+    val contentText = result?.optJSONArray("content")
+        ?.let(::formatMcpContentItems)
+        .orEmpty()
+        .trim()
+    val structured = result?.opt("structuredContent")
+        ?: result?.opt("structured_content")
+    val structuredText = formatJsonLikeValue(structured).trim()
+    val fallbackResult = result?.let { formatJsonObjectForDisplay(it).trim() }.orEmpty()
+    val statusLine = output.optString("stdout").trim()
+    return buildString {
+        if (contentText.isNotBlank()) {
+            append(contentText)
+        } else if (structuredText.isNotBlank()) {
+            append(structuredText)
+        } else if (fallbackResult.isNotBlank()) {
+            append(fallbackResult)
+        } else {
+            append(strings.noOutput)
+        }
+        if (statusLine.isNotBlank()) {
+            appendLine()
+            appendLine()
+            append(statusLine)
+        }
+    }.trim()
+}
+
+private fun formatMcpContentItems(content: JSONArray): String = buildString {
+    for (index in 0 until content.length()) {
+        val item = content.optJSONObject(index)
+        val text = item?.optString("text")
+            ?.trim()
+            .orEmpty()
+        if (text.isBlank()) continue
+        if (isNotEmpty()) {
+            appendLine()
+            appendLine()
+        }
+        append(text)
+    }
+}
+
+private fun formatJsonLikeValue(value: Any?): String = when (value) {
+    is JSONObject -> formatJsonObjectForDisplay(value)
+    is JSONArray -> value.toString(2)
+    null -> ""
+    JSONObject.NULL -> ""
+    else -> value.toString()
+}
+
+private fun formatJsonObjectForDisplay(jsonObject: JSONObject): String =
+    runCatching { jsonObject.toString(2) }.getOrDefault(jsonObject.toString())
 
 private fun formatFetchWebUrlResult(strings: AetherStrings, output: JSONObject): String {
     val markdown = output.optString("markdown").trim()
