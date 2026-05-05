@@ -14,6 +14,11 @@ val localProperties = Properties().apply {
     if (file.exists()) load(file.inputStream())
 }
 
+val keystoreProperties = Properties().apply {
+    val file = rootProject.file("keystore.properties")
+    if (file.exists()) load(file.inputStream())
+}
+
 fun localOrEnv(
     localName: String,
     envName: String,
@@ -31,6 +36,17 @@ val posthogCliApiKey = localOrEnv("posthog.cliApiKey", "POSTHOG_CLI_API_KEY")
 val posthogExecutable = localOrEnv("posthog.executable", "POSTHOG_EXECUTABLE")
 
 android {
+    signingConfigs {
+        create("release") {
+            val storeFilePath = keystoreProperties.getProperty("storeFile", "").trim()
+            if (storeFilePath.isNotEmpty()) {
+                storeFile = file(storeFilePath)
+            }
+            storePassword = keystoreProperties.getProperty("storePassword", "")
+            keyAlias = keystoreProperties.getProperty("keyAlias", "")
+            keyPassword = keystoreProperties.getProperty("keyPassword", "")
+        }
+    }
     namespace = "com.zhousl.aether"
     compileSdk = 35
 
@@ -54,6 +70,7 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

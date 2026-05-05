@@ -741,7 +741,7 @@ private fun ConversationModelSelector(
     menuVisibility.targetState = expanded
     val strings = rememberAetherStrings()
     val density = LocalDensity.current
-    val menuWidth = 276.dp
+    val menuWidth = 340.dp
     val selectedOption = options.firstOrNull { it.key == selectedModelKey } ?: options.firstOrNull()
     val fallbackLabel = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
         "选择模型"
@@ -758,18 +758,34 @@ private fun ConversationModelSelector(
                 .onGloballyPositioned { coordinates ->
                     anchorBottomPx = coordinates.boundsInRoot().bottom.toInt()
                 }
+                .fillMaxWidth()
                 .clickable(enabled = options.isNotEmpty()) { expanded = true },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text(
-                text = selectedOption?.chatLabel ?: fallbackLabel,
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-                color = AetherOnSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.widthIn(max = 180.dp),
-            )
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(1.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(
+                    text = selectedOption?.providerName ?: fallbackLabel,
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                    color = AetherOnSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    text = selectedOption?.modelId ?: fallbackLabel,
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = AetherOnSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 19.sp,
+                )
+            }
             Icon(
                 imageVector = Icons.Rounded.ArrowDropDown,
                 contentDescription = null,
@@ -825,21 +841,42 @@ private fun ConversationModelSelector(
                                             expanded = false
                                             onSelected(option.key)
                                         }
-                                        .padding(horizontal = 18.dp, vertical = 15.dp),
+                                        .padding(horizontal = 18.dp, vertical = 13.dp),
                                 ) {
-                                    Text(
-                                        text = option.chatLabel,
-                                        style = MaterialTheme.typography.titleMedium.copy(
-                                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
-                                        ),
-                                        color = AetherOnSurface,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        textAlign = TextAlign.Center,
+                                    Column(
                                         modifier = Modifier
-                                            .align(Alignment.Center)
-                                            .padding(horizontal = 24.dp),
-                                    )
+                                            .align(Alignment.CenterStart)
+                                            .fillMaxWidth()
+                                            .padding(end = 34.dp),
+                                        verticalArrangement = Arrangement.spacedBy(3.dp),
+                                    ) {
+                                        Text(
+                                            text = option.providerName,
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                                            color = AetherOnSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        Text(
+                                            text = option.modelId,
+                                            style = MaterialTheme.typography.titleMedium.copy(
+                                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                            ),
+                                            color = AetherOnSurface,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                            lineHeight = 20.sp,
+                                        )
+                                        if (option.fullLabel != "${option.providerId}/${option.modelId}") {
+                                            Text(
+                                                text = option.fullLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = AetherOnSurfaceVariant.copy(alpha = 0.72f),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
                                     if (isSelected) {
                                         Icon(
                                             imageVector = Icons.Rounded.Check,
@@ -1967,6 +2004,26 @@ private fun AgentModePreviewPanel(
             AgentModePreviewToolStatus(toolInvocation = toolInvocation)
         } else {
             AgentModePreviewHeader(displayState = displayState)
+        }
+        if (displayState.userMessage.isNotBlank() || displayState.suggestion.isNotBlank()) {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                if (displayState.userMessage.isNotBlank()) {
+                    Text(
+                        text = displayState.userMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AetherOnSurface,
+                    )
+                }
+                if (displayState.suggestion.isNotBlank()) {
+                    Text(
+                        text = displayState.suggestion,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AetherOnSurfaceVariant,
+                    )
+                }
+            }
         }
         val previewBitmap = bitmap
         if (previewBitmap != null) {
