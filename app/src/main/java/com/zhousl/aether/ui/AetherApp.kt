@@ -230,7 +230,10 @@ private fun AetherAppContent(
     val pendingAssistantText = currentSessionExecution?.pendingAssistantText.orEmpty()
     val pendingInputs = currentSessionExecution?.pendingInputs.orEmpty()
     val isCurrentSessionRunning = currentSessionExecution?.isRunning == true
-    val currentWorkspaceDirectory = workspaceFileBridge.workspaceDirectory(uiState.currentSessionId)
+    val currentWorkspaceSessionId = uiState.editingSessionId
+        ?: uiState.draftWorkspaceId
+        ?: uiState.currentSessionId
+    val currentWorkspaceDirectory = workspaceFileBridge.workspaceDirectory(currentWorkspaceSessionId)
 
     LaunchedEffect(viewModel, context) {
         viewModel.transientMessages.collectLatest { message ->
@@ -270,7 +273,7 @@ private fun AetherAppContent(
         onResult = onPickedDocuments,
     )
     val filePicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetMultipleContents(),
+        contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = onPickedDocuments,
     )
     val skillFolderPicker = rememberLauncherForActivityResult(
@@ -545,6 +548,7 @@ private fun AetherAppContent(
                     pendingInputs = pendingInputs,
                     inputValue = uiState.draftInput,
                     draftAttachments = uiState.draftAttachments,
+                    draftAttachmentRevision = uiState.draftAttachmentRevision,
                     modelOptions = conversationModelOptions,
                     selectedModelKey = selectedConversationModelKey,
                     availableSkills = uiState.installedSkills.filter { it.isEnabled },
@@ -587,7 +591,7 @@ private fun AetherAppContent(
                             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                         )
                     },
-                    onPickFiles = { filePicker.launch("*/*") },
+                    onPickFiles = { filePicker.launch(arrayOf("*/*")) },
                     onSaveAttachment = { attachment ->
                         pendingSaveTarget = PendingSaveTarget.Attachment(attachment)
                         saveAttachmentLauncher.launch(attachment.name)

@@ -22,6 +22,7 @@ private const val ManagedCommandWatchWindowSeconds = 45
 private const val DefaultManagedLogTailBytes = 12 * 1024
 private const val MaxManagedLogTailBytes = 64 * 1024
 private const val InternalCommandTimeoutMillis = 15_000L
+private const val SetupProbeTimeoutMillis = 12_000L
 private const val SessionWorkspaceRoot = "${TermuxContract.HomeDirectory}/.aether/workspaces"
 private const val TermuxLogTag = "AetherTermux"
 private val EnableTermuxLogging: Boolean
@@ -65,7 +66,7 @@ class TermuxBashTool(
         val probeResult = dispatchCommand(
             command = "printf '__aether_termux_ready__'",
             workingDirectory = TermuxContract.HomeDirectory,
-            awaitTimeoutMillis = 4000,
+            awaitTimeoutMillis = SetupProbeTimeoutMillis,
         )
         val json = runCatching { JSONObject(probeResult) }.getOrNull()
             ?: return@withContext TermuxSetupState(
@@ -214,6 +215,7 @@ class TermuxBashTool(
     suspend fun executeCommand(
         command: String,
         workingDirectory: String = TermuxContract.HomeDirectory,
+        awaitTimeoutMillis: Long = InternalCommandTimeoutMillis,
     ): String = withContext(Dispatchers.IO) {
         val normalizedWorkingDirectory = normalizeTermuxPath(workingDirectory)
         prepareWorkingDirectoryIfNeeded(normalizedWorkingDirectory)?.let { raw ->
@@ -229,7 +231,7 @@ class TermuxBashTool(
         dispatchCommand(
             command = command,
             workingDirectory = normalizedWorkingDirectory,
-            awaitTimeoutMillis = InternalCommandTimeoutMillis,
+            awaitTimeoutMillis = awaitTimeoutMillis,
         )
     }
 
@@ -376,6 +378,7 @@ class TermuxBashTool(
         val executionId = TermuxPendingResults.nextExecutionId()
         val deferred = TermuxPendingResults.register(executionId)
         val resultIntent = Intent(context, TermuxResultReceiver::class.java)
+            .setPackage(context.packageName)
             .putExtra(TermuxContract.ExecutionIdExtra, executionId)
         val flags = PendingIntent.FLAG_ONE_SHOT or
             PendingIntent.FLAG_UPDATE_CURRENT or
@@ -428,20 +431,25 @@ class TermuxBashTool(
                         ?: run {
                             TermuxPendingResults.remove(executionId)
                             logTermux(
-                                "dispatch timeout duration_ms=${System.currentTimeMillis() - startedAt} " +
+                                "dispatch timeout execution_id=$executionId duration_ms=${System.currentTimeMillis() - startedAt} " +
                                     "command=${summarizeCommand(command)}",
                             )
                             return buildSetupErrorResult(
                                 command = command,
                                 workingDirectory = workingDirectory,
+                                durationMillis = System.currentTimeMillis() - startedAt,
                                 message = "Timed out waiting for Termux to reply.",
                                 hint = "Open Termux once, paste the Aether Termux setup command, then refresh.",
+                                timedOut = true,
+                                executionId = executionId,
                             )
                         }
                 }
                 logTermux(
-                    "dispatch result duration_ms=${System.currentTimeMillis() - startedAt} " +
+                    "dispatch result execution_id=$executionId duration_ms=${System.currentTimeMillis() - startedAt} " +
                         "exit_code=${result.exitCode} err=${result.err} " +
+                        "stdout_bytes=${result.stdout.toByteArray(Charsets.UTF_8).size} " +
+                        "stderr_bytes=${result.stderr.toByteArray(Charsets.UTF_8).size} " +
                         "command=${summarizeCommand(command)}",
                 )
                 buildCommandResult(
@@ -951,16 +959,24 @@ class TermuxBashTool(
         workingDirectory: String,
         message: String,
         hint: String,
+        durationMillis: Long = 0L,
+        timedOut: Boolean = false,
+        executionId: Int? = null,
     ): String = JSONObject().apply {
         put("ok", false)
         put("command", command)
         put("working_directory", workingDirectory)
+        put("duration_ms", durationMillis.coerceAtLeast(0L))
         put("stdout", "")
         put("stderr", "")
         put("exit_code", -1)
         put("err", -1)
         put("errmsg", message)
         put("hint", hint)
+        put("timed_out", timedOut)
+        if (executionId != null) {
+            put("execution_id", executionId)
+        }
     }.toString()
 
     private fun buildInvalidArgumentsResult(message: String): String = JSONObject().apply {

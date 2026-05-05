@@ -22,7 +22,7 @@ class SettingsRepository(
             apiKey = preferences[API_KEY].orEmpty(),
             baseUrl = preferences[BASE_URL] ?: AppSettings().baseUrl,
             modelId = preferences[MODEL_ID] ?: AppSettings().modelId,
-            systemPrompt = preferences[SYSTEM_PROMPT] ?: AppSettings().systemPrompt,
+            systemPrompt = normalizeStoredSystemPrompt(preferences[SYSTEM_PROMPT]),
             tavilyApiKey = preferences[TAVILY_API_KEY].orEmpty(),
             llmInactivityReconnectTimeoutSeconds = normalizeLlmInactivityReconnectTimeoutSeconds(
                 preferences[LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS]
@@ -265,6 +265,19 @@ class SettingsRepository(
         const val MaxUnsupportedParallelToolCallKeys = 128
     }
 }
+
+private fun normalizeStoredSystemPrompt(value: String?): String {
+    val storedPrompt = value ?: return DefaultSystemPrompt
+    return if (storedPrompt.trim() in LegacyDefaultSystemPrompts) {
+        DefaultSystemPrompt
+    } else {
+        storedPrompt
+    }
+}
+
+private val LegacyDefaultSystemPrompts = setOf(
+    "You are Aether, a local-first Android agent that can call tools and complete tasks on-device. Use available tools instead of guessing local state.",
+)
 
 private fun parseStoredStringList(rawValue: String): List<String> {
     if (rawValue.isBlank()) return emptyList()

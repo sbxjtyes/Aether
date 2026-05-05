@@ -78,6 +78,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -238,6 +239,7 @@ fun ConversationScreen(
     pendingInputs: List<PendingSessionInput>,
     inputValue: String,
     draftAttachments: List<ChatAttachment>,
+    draftAttachmentRevision: Long,
     modelOptions: List<ProviderModelOption>,
     selectedModelKey: String,
     availableSkills: List<InstalledSkill>,
@@ -594,6 +596,7 @@ fun ConversationScreen(
                 onBodyHeightChanged = { composerBodyHeightPx = it },
                 value = inputValue,
                 attachments = draftAttachments,
+                attachmentRevision = draftAttachmentRevision,
                 availableSkills = availableSkills,
                 availableMcpServers = availableMcpServers,
                 selectedSkillIds = selectedSkillIds,
@@ -1215,6 +1218,7 @@ private fun ConversationComposerOverlay(
     onBodyHeightChanged: (Int) -> Unit,
     value: String,
     attachments: List<ChatAttachment>,
+    attachmentRevision: Long,
     availableSkills: List<InstalledSkill>,
     availableMcpServers: List<McpServerConfig>,
     selectedSkillIds: List<String>,
@@ -1269,6 +1273,7 @@ private fun ConversationComposerOverlay(
             ConversationComposerBar(
                 value = value,
                 attachments = attachments,
+                attachmentRevision = attachmentRevision,
                 availableSkills = availableSkills,
                 availableMcpServers = availableMcpServers,
             selectedSkillIds = selectedSkillIds,
@@ -1310,6 +1315,7 @@ private fun ConversationComposerBar(
     modifier: Modifier = Modifier,
     value: String,
     attachments: List<ChatAttachment>,
+    attachmentRevision: Long,
     availableSkills: List<InstalledSkill>,
     availableMcpServers: List<McpServerConfig>,
     selectedSkillIds: List<String>,
@@ -1485,10 +1491,12 @@ private fun ConversationComposerBar(
             )
         }
         if (attachments.isNotEmpty()) {
-            ComposerAttachmentTray(
-                attachments = attachments,
-                onRemoveAttachment = onRemoveAttachment,
-            )
+            key(attachmentRevision) {
+                ComposerAttachmentTray(
+                    attachments = attachments,
+                    onRemoveAttachment = onRemoveAttachment,
+                )
+            }
         }
 
         val fieldShape = if (plusSeparated) ComposerFocusedCardShape else ComposerCardShape

@@ -179,6 +179,7 @@ data class AetherUiState(
     val currentSessionId: String = DraftSessionId,
     val draftInput: String = "",
     val draftAttachments: List<ChatAttachment> = emptyList(),
+    val draftAttachmentRevision: Long = 0L,
     val draftSelectedModelKey: String = "",
     val draftSelectedSkillIds: List<String> = emptyList(),
     val draftSelectedMcpServerIds: List<String> = emptyList(),

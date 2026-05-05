@@ -2,6 +2,7 @@ package com.zhousl.aether.data
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import android.webkit.MimeTypeMap
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
@@ -12,6 +13,9 @@ import java.util.Base64
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
@@ -20,12 +24,19 @@ private const val MaxWorkspaceDownloadBytes = 32 * 1024 * 1024
 private const val WorkspaceTransferChunkBytes = 6 * 1024
 private const val WorkspaceUploadChunkChars = 64 * 1024
 private const val WorkspaceBaseDirectoryName = ".aether/workspaces"
+private const val WorkspaceUploadTimeoutMillis = 60_000L
+private const val WorkspaceUploadProbeTimeoutMillis = 10_000L
+private const val WorkspaceUploadVerificationTimeoutMillis = 35_000L
+private const val WorkspaceUploadVerificationIntervalMillis = 500L
 private const val RootReadTimeoutMillis = 20_000L
+private const val WorkspaceFileBridgeLogTag = "AetherWorkspaceFile"
 
 class WorkspaceFileBridge(
     private val context: Context,
     private val bashTool: TermuxBashTool = TermuxBashTool(context),
 ) {
+    private val workspaceUploadMutex = Mutex()
+
     fun workspaceDirectory(sessionId: String): String =
         "${TermuxContract.HomeDirectory}/$WorkspaceBaseDirectoryName/$sessionId"
 
@@ -43,20 +54,26 @@ class WorkspaceFileBridge(
         val bytes = readContentBytes(
             sourceUri = sourceUri,
             byteLimit = MaxWorkspaceImportBytes + 1,
-        ) ?: error("Couldn't read the selected file.")
+        ).getOrElse { throwable ->
+            error(
+                throwable.message
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "Couldn't read the selected file."
+            )
+        }
 
         if (bytes.size > MaxWorkspaceImportBytes) {
             error("File is larger than ${formatBytes(MaxWorkspaceImportBytes.toLong())}.")
         }
 
-        writeWorkspaceBytes(
+        val bytesCopied = writeWorkspaceBytes(
             absolutePath = destinationPath,
             bytes = bytes,
         ).getOrThrow()
 
         ImportedWorkspaceFile(
             absolutePath = destinationPath,
-            bytesCopied = bytes.size.toLong(),
+            bytesCopied = bytesCopied,
         )
     }
 
@@ -245,42 +262,195 @@ class WorkspaceFileBridge(
     suspend fun writeWorkspaceBytes(
         absolutePath: String,
         bytes: ByteArray,
-    ): Result<Long> = runCatching {
-        val pathBase64 = encodeBase64(absolutePath)
-        executeUploadCommand(
-            command = buildInitWorkspaceUploadCommand(pathBase64),
-            fallbackMessage = "Couldn't prepare $absolutePath in the workspace.",
-        )
-
-        val contentBase64 = Base64.getEncoder().encodeToString(bytes)
-        contentBase64.chunked(WorkspaceUploadChunkChars).forEach { chunk ->
-            executeUploadCommand(
-                command = buildAppendWorkspaceUploadChunkCommand(
-                    pathBase64 = pathBase64,
-                    chunk = chunk,
-                ),
-                fallbackMessage = "Couldn't append a file chunk for $absolutePath in the workspace.",
+    ): Result<Long> = workspaceUploadMutex.withLock {
+        runCatching {
+            val startedAtMillis = System.currentTimeMillis()
+            val pathBase64 = encodeBase64(absolutePath)
+            val expectedBytes = bytes.size.toLong()
+            Log.i(
+                WorkspaceFileBridgeLogTag,
+                "upload start target=$absolutePath source_bytes=$expectedBytes",
             )
-        }
 
-        val rawResult = executeUploadCommand(
-            command = buildFinalizeWorkspaceUploadCommand(pathBase64),
-            fallbackMessage = "Couldn't finalize $absolutePath in the workspace.",
-        )
-        val values = parseStructuredStdout(rawResult.optString("stdout"))
-        values["bytes_written"]?.toLongOrNull() ?: bytes.size.toLong()
+            executeUploadCommand(
+                command = buildInitWorkspaceUploadCommand(pathBase64),
+                stage = "init",
+                absolutePath = absolutePath,
+                fallbackMessage = "Couldn't prepare $absolutePath in the workspace.",
+                verifier = { status ->
+                    status.tmpBase64Exists && status.tmpBase64SizeBytes == 0L
+                },
+            )
+
+            val contentBase64 = Base64.getEncoder().encodeToString(bytes)
+            var expectedTempBase64Chars = 0L
+            contentBase64.chunked(WorkspaceUploadChunkChars).forEachIndexed { index, chunk ->
+                expectedTempBase64Chars += chunk.length.toLong()
+                executeUploadCommand(
+                    command = buildAppendWorkspaceUploadChunkCommand(
+                        pathBase64 = pathBase64,
+                        chunk = chunk,
+                    ),
+                    stage = "append[$index]",
+                    absolutePath = absolutePath,
+                    fallbackMessage = "Couldn't append a file chunk for $absolutePath in the workspace.",
+                    verifier = { status ->
+                        status.tmpBase64Exists && status.tmpBase64SizeBytes >= expectedTempBase64Chars
+                    },
+                )
+            }
+
+            val rawResult = executeUploadCommand(
+                command = buildFinalizeWorkspaceUploadCommand(pathBase64),
+                stage = "finalize",
+                absolutePath = absolutePath,
+                fallbackMessage = "Couldn't finalize $absolutePath in the workspace.",
+                verifier = { status ->
+                    status.destinationExists && status.destinationIsFile && status.destinationSizeBytes == expectedBytes
+                },
+            )
+            val values = parseStructuredStdout(rawResult.optString("stdout"))
+            val bytesWritten = values["bytes_written"]?.toLongOrNull() ?: expectedBytes
+            if (bytesWritten != expectedBytes) {
+                val finalStatus = waitForUploadStatus(
+                    absolutePath = absolutePath,
+                    timeoutMillis = WorkspaceUploadVerificationTimeoutMillis,
+                ) { status ->
+                    status.destinationExists && status.destinationIsFile && status.destinationSizeBytes == expectedBytes
+                } ?: readUploadStatus(absolutePath).getOrNull()
+                error(
+                    "Workspace upload size check failed for $absolutePath: " +
+                        "expected=$expectedBytes actual=${finalStatus?.destinationSizeBytes ?: bytesWritten} exists=${finalStatus?.destinationExists ?: false}"
+                )
+            }
+            Log.i(
+                WorkspaceFileBridgeLogTag,
+                "upload success target=$absolutePath source_bytes=$expectedBytes bytes_written=$bytesWritten " +
+                    "elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+            )
+            bytesWritten
+        }
     }
 
     private suspend fun executeUploadCommand(
         command: String,
+        stage: String,
+        absolutePath: String,
         fallbackMessage: String,
+        verifier: suspend (WorkspaceUploadStatus) -> Boolean,
+        awaitTimeoutMillis: Long = WorkspaceUploadTimeoutMillis,
     ): JSONObject {
-        val rawResult = JSONObject(bashTool.executeCommand(command))
+        val startedAtMillis = System.currentTimeMillis()
+        val rawResult = JSONObject(
+            bashTool.executeCommand(
+                command = command,
+                awaitTimeoutMillis = awaitTimeoutMillis,
+            )
+        )
+        val ok = rawResult.optBoolean("ok")
+        val message = rawResult.optString("errmsg")
+        val timedOut = message.contains("Timed out waiting for Termux", ignoreCase = true)
+        Log.d(
+            WorkspaceFileBridgeLogTag,
+            "upload command result stage=$stage target=$absolutePath ok=$ok exit=${rawResult.optInt("exit_code", -1)} " +
+                "err=${rawResult.optInt("err", -1)} timed_out=$timedOut duration_ms=${rawResult.optLong("duration_ms", -1)} " +
+                "elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+        )
+        if (ok) return rawResult
+
+        if (timedOut) {
+            val verifiedStatus = waitForUploadStatus(
+                absolutePath = absolutePath,
+                timeoutMillis = WorkspaceUploadVerificationTimeoutMillis,
+                predicate = verifier,
+            )
+            Log.w(
+                WorkspaceFileBridgeLogTag,
+                "upload timeout compensation stage=$stage target=$absolutePath verified=${verifiedStatus != null} " +
+                    "status=${verifiedStatus?.toLogString().orEmpty()} elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+            )
+            if (verifiedStatus != null) {
+                return rawResult.apply {
+                    put("ok", true)
+                    put("aether_timeout_compensated", true)
+                    put("stdout", optString("stdout").ifBlank { "stage=$stage\ntimeout_compensated=true\n" })
+                    put("errmsg", "")
+                }
+            }
+        }
+
         ensureBashSuccess(
             rawResult = rawResult,
             fallbackMessage = fallbackMessage,
         )
         return rawResult
+    }
+
+    private suspend fun waitForUploadStatus(
+        absolutePath: String,
+        timeoutMillis: Long,
+        predicate: suspend (WorkspaceUploadStatus) -> Boolean,
+    ): WorkspaceUploadStatus? {
+        val startedAtMillis = System.currentTimeMillis()
+        var lastStatus: WorkspaceUploadStatus? = null
+        while (System.currentTimeMillis() - startedAtMillis <= timeoutMillis) {
+            val status = readUploadStatus(absolutePath).getOrNull()
+            if (status != null) {
+                lastStatus = status
+                if (predicate(status)) {
+                    Log.d(
+                        WorkspaceFileBridgeLogTag,
+                        "upload verify matched target=$absolutePath status=${status.toLogString()} " +
+                            "elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+                    )
+                    return status
+                }
+            }
+            delay(WorkspaceUploadVerificationIntervalMillis)
+        }
+        Log.w(
+            WorkspaceFileBridgeLogTag,
+            "upload verify timeout target=$absolutePath last_status=${lastStatus?.toLogString().orEmpty()} " +
+                "elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+        )
+        return null
+    }
+
+    private suspend fun readUploadStatus(
+        absolutePath: String,
+    ): Result<WorkspaceUploadStatus> = runCatching {
+        val rawResult = JSONObject(
+            bashTool.executeCommand(
+                command = buildWorkspaceUploadStatusCommand(encodeBase64(absolutePath)),
+                awaitTimeoutMillis = WorkspaceUploadProbeTimeoutMillis,
+            )
+        )
+        ensureBashSuccess(
+            rawResult = rawResult,
+            fallbackMessage = "Couldn't verify workspace upload status for $absolutePath.",
+        )
+        val values = parseStructuredStdout(rawResult.optString("stdout"))
+        WorkspaceUploadStatus(
+            destinationExists = values["dest_exists"].toBoolean(),
+            destinationIsFile = values["dest_is_file"].toBoolean(),
+            destinationSizeBytes = values["dest_size_bytes"]?.toLongOrNull() ?: -1L,
+            tmpBase64Exists = values["tmp_b64_exists"].toBoolean(),
+            tmpBase64SizeBytes = values["tmp_b64_size_bytes"]?.toLongOrNull() ?: -1L,
+            tmpPathExists = values["tmp_path_exists"].toBoolean(),
+            tmpPathSizeBytes = values["tmp_path_size_bytes"]?.toLongOrNull() ?: -1L,
+            probeDurationMillis = rawResult.optLong("duration_ms", -1L),
+        ).also { status ->
+            Log.d(
+                WorkspaceFileBridgeLogTag,
+                "upload status target=$absolutePath ${status.toLogString()}",
+            )
+        }
+    }.onFailure { throwable ->
+        Log.w(
+            WorkspaceFileBridgeLogTag,
+            "upload status probe failed target=$absolutePath message=${throwable.message.orEmpty()}",
+            throwable,
+        )
     }
 
     private fun buildWorkspaceFileName(
@@ -570,6 +740,48 @@ class WorkspaceFileBridge(
         appendLine("emit_kv stage appended")
     }
 
+    private fun buildWorkspaceUploadStatusCommand(
+        pathBase64: String,
+    ): String = buildString {
+        appendCommonShellPreamble(this)
+        appendLine("path=\"\$(decode_b64 '$pathBase64')\"")
+        appendLine("tmp_b64=\"\${path}.aether-upload.b64\"")
+        appendLine("tmp_path=\"\${path}.aether-tmp\"")
+        appendLine("dest_exists=false")
+        appendLine("dest_is_file=false")
+        appendLine("dest_size_bytes=-1")
+        appendLine("tmp_b64_exists=false")
+        appendLine("tmp_b64_size_bytes=-1")
+        appendLine("tmp_path_exists=false")
+        appendLine("tmp_path_size_bytes=-1")
+        appendLine("if [ -e \"\$path\" ]; then")
+        appendLine("  dest_exists=true")
+        appendLine("fi")
+        appendLine("if [ -f \"\$path\" ]; then")
+        appendLine("  dest_is_file=true")
+        appendLine("  dest_size_bytes=\$(wc -c < \"\$path\" | tr -d '[:space:]')")
+        appendLine("fi")
+        appendLine("if [ -e \"\$tmp_b64\" ]; then")
+        appendLine("  tmp_b64_exists=true")
+        appendLine("fi")
+        appendLine("if [ -f \"\$tmp_b64\" ]; then")
+        appendLine("  tmp_b64_size_bytes=\$(wc -c < \"\$tmp_b64\" | tr -d '[:space:]')")
+        appendLine("fi")
+        appendLine("if [ -e \"\$tmp_path\" ]; then")
+        appendLine("  tmp_path_exists=true")
+        appendLine("fi")
+        appendLine("if [ -f \"\$tmp_path\" ]; then")
+        appendLine("  tmp_path_size_bytes=\$(wc -c < \"\$tmp_path\" | tr -d '[:space:]')")
+        appendLine("fi")
+        appendLine("emit_kv dest_exists \"\$dest_exists\"")
+        appendLine("emit_kv dest_is_file \"\$dest_is_file\"")
+        appendLine("emit_kv dest_size_bytes \"\$dest_size_bytes\"")
+        appendLine("emit_kv tmp_b64_exists \"\$tmp_b64_exists\"")
+        appendLine("emit_kv tmp_b64_size_bytes \"\$tmp_b64_size_bytes\"")
+        appendLine("emit_kv tmp_path_exists \"\$tmp_path_exists\"")
+        appendLine("emit_kv tmp_path_size_bytes \"\$tmp_path_size_bytes\"")
+    }
+
     private fun buildFinalizeWorkspaceUploadCommand(
         pathBase64: String,
     ): String = buildString {
@@ -589,7 +801,7 @@ class WorkspaceFileBridge(
     private fun readContentBytes(
         sourceUri: Uri,
         byteLimit: Int,
-    ): ByteArray? = runCatching {
+    ): Result<ByteArray> = runCatching {
         context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
@@ -610,8 +822,8 @@ class WorkspaceFileBridge(
             }
 
             output.toByteArray()
-        }
-    }.getOrNull()
+        } ?: error("Couldn't open the selected file. The document provider did not return a readable stream.")
+    }
 
     private fun encodeBase64(value: String): String =
         Base64.getEncoder().encodeToString(value.toByteArray(Charsets.UTF_8))
@@ -654,6 +866,22 @@ private data class RootReadCommandResult(
         .map(String::trim)
         .filter(String::isNotBlank)
         .joinToString("\n")
+}
+
+private data class WorkspaceUploadStatus(
+    val destinationExists: Boolean,
+    val destinationIsFile: Boolean,
+    val destinationSizeBytes: Long,
+    val tmpBase64Exists: Boolean,
+    val tmpBase64SizeBytes: Long,
+    val tmpPathExists: Boolean,
+    val tmpPathSizeBytes: Long,
+    val probeDurationMillis: Long,
+) {
+    fun toLogString(): String =
+        "dest_exists=$destinationExists dest_is_file=$destinationIsFile dest_size=$destinationSizeBytes " +
+            "tmp_b64_exists=$tmpBase64Exists tmp_b64_size=$tmpBase64SizeBytes " +
+            "tmp_path_exists=$tmpPathExists tmp_path_size=$tmpPathSizeBytes probe_duration_ms=$probeDurationMillis"
 }
 
 data class ImportedWorkspaceFile(

@@ -2889,8 +2889,14 @@ private fun formatAttachmentMetaLabel(strings: AetherStrings, attachment: ChatAt
 private fun formatComposerAttachmentMetaLabel(strings: AetherStrings, attachment: ChatAttachment): String {
     val statusLabel = when (attachment.workspaceState) {
         AttachmentWorkspaceState.Pending -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) "正在复制到工作区" else "Copying to workspace"
-        AttachmentWorkspaceState.Failed -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) "工作区复制失败" else "Workspace copy failed"
-        AttachmentWorkspaceState.Ready -> null
+        AttachmentWorkspaceState.Failed -> attachment.workspaceError.ifBlank {
+            if (strings.appLanguage == AppLanguage.SimplifiedChinese) "工作区复制失败" else "Workspace copy failed"
+        }
+        AttachmentWorkspaceState.Ready -> if (attachment.workspacePath.isNotBlank()) {
+            if (strings.appLanguage == AppLanguage.SimplifiedChinese) "已复制到工作区" else "Copied to workspace"
+        } else {
+            null
+        }
     }
     return listOfNotNull(
         formatAttachmentMetaLabel(strings, attachment).ifBlank { null },

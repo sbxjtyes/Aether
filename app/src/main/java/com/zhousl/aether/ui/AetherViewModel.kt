@@ -3,6 +3,7 @@ package com.zhousl.aether.ui
 import android.app.Application
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zhousl.aether.BuildConfig
@@ -75,6 +76,7 @@ import java.util.concurrent.TimeUnit
 private const val FollowUpTourAutoOpenDelayMillis = 2_500L
 private const val AppUpdateCheckIntervalMillis = 3L * 24L * 60L * 60L * 1000L
 private const val LogcatReadTimeoutSeconds = 4L
+private const val AetherViewModelLogTag = "AetherViewModel"
 private const val SessionTitleSystemPrompt =
     "Generate a concise chat title for this conversation. Return only the title, in the user's language when possible, with no quotes, no emoji, and at most 6 words."
 
@@ -97,6 +99,8 @@ class AetherViewModel(
     private var didEvaluateStartupUpdateCheck = false
     private var lastTrackedTermuxDetectedIssue: TermuxSetupIssue? = null
     private var pendingTermuxSetupSource: String? = null
+    @Volatile
+    private var lastTermuxCommandSuccessAtMillis: Long = 0L
     private val _uiState = MutableStateFlow(AetherUiState())
     private val _transientMessages = MutableSharedFlow<String>(extraBufferCapacity = 4)
 
@@ -265,11 +269,24 @@ class AetherViewModel(
 
     fun refreshTermuxSetup() {
         viewModelScope.launch {
+            val refreshStartedAtMillis = System.currentTimeMillis()
             val setupState = withContext(Dispatchers.IO) {
                 inspectTermuxSetupWithRootRepair()
             }
+            if (setupState.isReady) {
+                lastTermuxCommandSuccessAtMillis = System.currentTimeMillis()
+            }
             trackTermuxSetupState(setupState, source = "refresh")
-            _uiState.update { current -> current.copy(termuxSetupState = setupState) }
+            _uiState.update { current ->
+                val staleFailureAfterKnownSuccess = !setupState.isReady &&
+                    current.termuxSetupState.isReady &&
+                    lastTermuxCommandSuccessAtMillis >= refreshStartedAtMillis
+                if (staleFailureAfterKnownSuccess) {
+                    current
+                } else {
+                    current.copy(termuxSetupState = setupState)
+                }
+            }
         }
     }
 
@@ -777,13 +794,17 @@ class AetherViewModel(
                     current
                 } else {
                     current.copy(
-                        draftAttachments = current.draftAttachments + newAttachments
+                        draftAttachments = current.draftAttachments + newAttachments,
+                        draftAttachmentRevision = current.draftAttachmentRevision + 1,
                     )
                 }
             }
 
-            attachmentsToImport.forEach { attachment ->
-                launch(Dispatchers.IO) {
+            withContext(Dispatchers.IO) {
+                // Termux RUN_COMMAND requests are serviced out-of-process and can be queued during
+                // cold start. Import attachments one by one so each upload's init/chunk/finalize
+                // command sequence can finish before the next file starts dispatching commands.
+                attachmentsToImport.forEach { attachment ->
                     importDraftAttachmentToWorkspace(
                         attachment = attachment,
                         sessionId = targetSessionId,
@@ -795,9 +816,15 @@ class AetherViewModel(
 
     fun removeDraftAttachment(attachmentId: String) {
         _uiState.update { current ->
-            current.copy(
-                draftAttachments = current.draftAttachments.filterNot { it.id == attachmentId }
-            )
+            val updatedAttachments = current.draftAttachments.filterNot { it.id == attachmentId }
+            if (updatedAttachments == current.draftAttachments) {
+                current
+            } else {
+                current.copy(
+                    draftAttachments = updatedAttachments,
+                    draftAttachmentRevision = current.draftAttachmentRevision + 1,
+                )
+            }
         }
     }
 
@@ -2232,6 +2259,12 @@ class AetherViewModel(
         attachment: ChatAttachment,
         sessionId: String,
     ) {
+        val startedAtMillis = System.currentTimeMillis()
+        Log.i(
+            AetherViewModelLogTag,
+            "Importing attachment '${attachment.name}' (${attachment.uri}) into workspace session=$sessionId " +
+                "attachment_id=${attachment.id} source_size=${attachment.sizeBytes ?: -1}",
+        )
         val importResult = workspaceFileBridge.importAttachmentToWorkspace(
             sourceUri = Uri.parse(attachment.uri),
             sessionId = sessionId,
@@ -2239,10 +2272,40 @@ class AetherViewModel(
             displayName = attachment.name,
         )
 
+        importResult.onSuccess { importedFile ->
+            Log.i(
+                AetherViewModelLogTag,
+                "Imported attachment '${attachment.name}' into workspace path=${importedFile.absolutePath} " +
+                    "bytes=${importedFile.bytesCopied} elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+            )
+        }
+
+        importResult.exceptionOrNull()?.let { throwable ->
+            val message = throwable.userFacingMessage()
+            Log.w(
+                AetherViewModelLogTag,
+                "Failed to import attachment '${attachment.name}' (${attachment.uri}) into workspace session=$sessionId " +
+                    "source_size=${attachment.sizeBytes ?: -1} elapsed_ms=${System.currentTimeMillis() - startedAtMillis}: $message",
+                throwable,
+            )
+            emitTransientMessage(
+                if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
+                    "文件复制到工作区失败：$message"
+                } else {
+                    "Couldn't copy attachment into workspace: $message"
+                }
+            )
+        }
+
+        var didUpdateDraftAttachment = false
         _uiState.update { current ->
-            val attachmentIndex = current.draftAttachments.indexOfFirst { it.id == attachment.id }
+            val attachmentIndex = current.draftAttachments.indexOfFirst { draftAttachment ->
+                draftAttachment.id == attachment.id ||
+                    (draftAttachment.uri == attachment.uri && draftAttachment.workspaceState == AttachmentWorkspaceState.Pending)
+            }
             if (attachmentIndex < 0) return@update current
 
+            didUpdateDraftAttachment = true
             val existingAttachment = current.draftAttachments[attachmentIndex]
             val updatedAttachment = importResult.fold(
                 onSuccess = { importedFile ->
@@ -2272,9 +2335,47 @@ class AetherViewModel(
                 },
             )
 
+            val updatedAttachments = current.draftAttachments.toMutableList().apply {
+                set(attachmentIndex, updatedAttachment)
+            }
+            Log.i(
+                AetherViewModelLogTag,
+                "Attachment import UI state update session=$sessionId attachment_id=${attachment.id} " +
+                    "index=$attachmentIndex success=${importResult.isSuccess} " +
+                    "state=${updatedAttachment.workspaceState} workspace_path=${updatedAttachment.workspacePath} " +
+                    "current_session=${current.currentSessionId} draft_workspace=${current.draftWorkspaceId} " +
+                    "editing_session=${current.editingSessionId}",
+            )
+            if (importResult.isSuccess) {
+                lastTermuxCommandSuccessAtMillis = System.currentTimeMillis()
+            }
+            val updatedTermuxSetupState = if (importResult.isSuccess && !current.termuxSetupState.isReady) {
+                TermuxSetupState(TermuxSetupIssue.Ready)
+            } else {
+                current.termuxSetupState
+            }
             current.copy(
-                draftAttachments = current.draftAttachments.toMutableList().apply {
-                    set(attachmentIndex, updatedAttachment)
+                draftAttachments = updatedAttachments,
+                draftAttachmentRevision = current.draftAttachmentRevision + 1,
+                termuxSetupState = updatedTermuxSetupState,
+            )
+        }
+
+        if (!didUpdateDraftAttachment) {
+            val snapshot = _uiState.value
+            Log.w(
+                AetherViewModelLogTag,
+                "Attachment import finished but draft attachment was not present for UI update " +
+                    "session=$sessionId attachment_id=${attachment.id} uri=${attachment.uri} success=${importResult.isSuccess} " +
+                    "current_session=${snapshot.currentSessionId} draft_workspace=${snapshot.draftWorkspaceId} " +
+                    "editing_session=${snapshot.editingSessionId} draft_count=${snapshot.draftAttachments.size}",
+            )
+        } else if (importResult.isSuccess) {
+            emitTransientMessage(
+                if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
+                    "附件已复制到工作区"
+                } else {
+                    "Attachment copied to workspace"
                 }
             )
         }
