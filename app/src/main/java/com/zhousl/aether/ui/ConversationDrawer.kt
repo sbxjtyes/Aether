@@ -184,24 +184,31 @@ fun ConversationDrawer(
     onRenameSession: (String, String) -> Unit,
     onExportSession: (ChatSession) -> Unit,
     onDeleteSession: (String) -> Unit,
+    onDeleteSessions: (Set<String>) -> Unit = { ids -> ids.forEach(onDeleteSession) },
     onSettingsSelected: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
     var searchExpanded by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
+    var selectedSessionIds by rememberSaveable { mutableStateOf(emptySet<String>()) }
     var overlayHeightPx by remember { mutableIntStateOf(0) }
     val density = LocalDensity.current
     val overlayHeight = with(density) {
         if (overlayHeightPx > 0) overlayHeightPx.toDp() else 132.dp
     }
-    val filteredSessions = remember(sessions, searchQuery) {
+    val searchMatches = remember(sessions, searchQuery) {
         val query = searchQuery.trim().lowercase()
         if (query.isBlank()) {
-            sessions
+            sessions.map { ConversationSearchMatch(it) }
         } else {
-            sessions.filter { session -> session.title.lowercase().contains(query) }
+            sessions.mapNotNull { session -> session.searchMatch(query) }
         }
     }
+    val selectableSessionIds = remember(sessions) { sessions.map { it.id }.toSet() }
+    LaunchedEffect(selectableSessionIds) {
+        selectedSessionIds = selectedSessionIds.filterTo(mutableSetOf()) { it in selectableSessionIds }
+    }
+    val isSelectionMode = selectedSessionIds.isNotEmpty()
 
     ModalDrawerSheet(
         modifier = Modifier
@@ -215,7 +222,7 @@ fun ConversationDrawer(
                 .fillMaxSize()
                 .padding(bottom = 18.dp)
         ) {
-            if (filteredSessions.isEmpty()) {
+            if (searchMatches.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -244,20 +251,34 @@ fun ConversationDrawer(
                     ),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    items(filteredSessions, key = { it.id }) { session ->
+                    items(searchMatches, key = { it.session.id }) { match ->
+                        val session = match.session
                         DrawerSessionRow(
                             session = session,
                             selected = session.id == selectedSessionId,
+                            selectionMode = isSelectionMode,
+                            checked = selectedSessionIds.contains(session.id),
+                            searchSnippet = match.snippet,
                             indicator = when {
                                 sessionExecutionStates[session.id]?.isRunning == true -> DrawerSessionIndicator.Working
                                 unviewedCompletedSessionIds.contains(session.id) -> DrawerSessionIndicator.UnviewedComplete
                                 else -> DrawerSessionIndicator.None
                             },
                             onClick = {
-                                searchExpanded = false
-                                searchQuery = ""
-                                onSessionSelected(session.id)
+                                if (isSelectionMode) {
+                                    selectedSessionIds = selectedSessionIds.toggle(session.id)
+                                } else {
+                                    searchExpanded = false
+                                    searchQuery = ""
+                                    onSessionSelected(session.id)
+                                }
                             },
+                            onLongClick = {
+                                if (isSelectionMode) {
+                                    selectedSessionIds = selectedSessionIds.toggle(session.id)
+                                }
+                            },
+                            onSelect = { selectedSessionIds = selectedSessionIds + session.id },
                             onRename = { title -> onRenameSession(session.id, title) },
                             onExport = { onExportSession(session) },
                             onDelete = { onDeleteSession(session.id) },
@@ -291,10 +312,28 @@ fun ConversationDrawer(
                             color = AetherOnSurface,
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            if (isSelectionMode) {
+                                HeaderCircleButton(
+                                    icon = LucideIcons.X,
+                                    contentDescription = strings.cancel,
+                                    onClick = { selectedSessionIds = emptySet() },
+                                    size = 46.dp,
+                                    containerColor = AetherSurface.copy(alpha = 0.90f),
+                                )
+                                DrawerSelectionDeleteButton(
+                                    count = selectedSessionIds.size,
+                                    onClick = {
+                                        val idsToDelete = selectedSessionIds
+                                        selectedSessionIds = emptySet()
+                                        onDeleteSessions(idsToDelete)
+                                    },
+                                )
+                            }
                             HeaderCircleButton(
                                 icon = LucideIcons.Search,
                                 contentDescription = strings.search,
                                 onClick = {
+                                    selectedSessionIds = emptySet()
                                     if (searchExpanded || searchQuery.isNotBlank()) {
                                         searchExpanded = false
                                         searchQuery = ""
@@ -309,6 +348,7 @@ fun ConversationDrawer(
                                 icon = LucideIcons.Settings,
                                 contentDescription = strings.settings,
                                 onClick = {
+                                    selectedSessionIds = emptySet()
                                     searchExpanded = false
                                     searchQuery = ""
                                     onSettingsSelected()
@@ -346,6 +386,7 @@ fun ConversationDrawer(
                     .navigationBarsPadding()
                     .padding(end = 18.dp, bottom = 18.dp),
                 onClick = {
+                    selectedSessionIds = emptySet()
                     searchExpanded = false
                     searchQuery = ""
                     onNewChat()
@@ -359,6 +400,68 @@ private enum class DrawerSessionIndicator {
     None,
     Working,
     UnviewedComplete,
+}
+
+private data class ConversationSearchMatch(
+    val session: ChatSession,
+    val snippet: String? = null,
+)
+
+private fun Set<String>.toggle(id: String): Set<String> =
+    if (contains(id)) this - id else this + id
+
+private fun ChatSession.searchMatch(query: String): ConversationSearchMatch? {
+    if (title.contains(query, ignoreCase = true)) return ConversationSearchMatch(this)
+    if (preview.contains(query, ignoreCase = true)) return ConversationSearchMatch(this, preview.toSearchSnippet(query))
+    messages.forEach { message ->
+        val text = message.text
+        if (text.contains(query, ignoreCase = true)) {
+            return ConversationSearchMatch(this, text.toSearchSnippet(query))
+        }
+        message.attachments.firstOrNull { attachment ->
+            attachment.name.contains(query, ignoreCase = true) ||
+                attachment.workspacePath.contains(query, ignoreCase = true)
+        }?.let { attachment ->
+            return ConversationSearchMatch(this, attachment.name.toSearchSnippet(query))
+        }
+        message.toolInvocations.firstOrNull { tool ->
+            tool.argumentsJson.contains(query, ignoreCase = true) ||
+                tool.outputJson.contains(query, ignoreCase = true)
+        }?.let { tool ->
+            return ConversationSearchMatch(this, tool.toolName.toSearchSnippet(query))
+        }
+        message.reasoningTrace?.let { trace ->
+            val reasoningText = buildString {
+                append(trace.rawText)
+                trace.chunks.forEach { chunk ->
+                    append('\n')
+                    append(chunk.title)
+                    append('\n')
+                    append(chunk.detail)
+                    append('\n')
+                    append(chunk.rawText)
+                }
+            }
+            if (reasoningText.contains(query, ignoreCase = true)) {
+                return ConversationSearchMatch(this, reasoningText.toSearchSnippet(query))
+            }
+        }
+    }
+    return null
+}
+
+private fun String.toSearchSnippet(query: String, radius: Int = 42): String {
+    val normalized = replace(Regex("\\s+"), " ").trim()
+    if (normalized.isBlank()) return ""
+    val index = normalized.lowercase().indexOf(query.lowercase())
+    if (index < 0) return normalized.take(96)
+    val start = (index - radius).coerceAtLeast(0)
+    val end = (index + query.length + radius).coerceAtMost(normalized.length)
+    return buildString {
+        if (start > 0) append("...")
+        append(normalized.substring(start, end))
+        if (end < normalized.length) append("...")
+    }
 }
 
 @Composable
@@ -406,14 +509,51 @@ private fun DrawerCompactSearchField(
     }
 }
 
+@Composable
+private fun DrawerSelectionDeleteButton(
+    count: Int,
+    onClick: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    Row(
+        modifier = Modifier
+            .height(46.dp)
+            .shadow(12.dp, RoundedCornerShape(999.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+            .clip(RoundedCornerShape(999.dp))
+            .background(Color(0xFFFFEDEA))
+            .clickable(onClick = onClick)
+            .padding(start = 14.dp, end = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Icon(
+            imageVector = LucideIcons.Trash2,
+            contentDescription = null,
+            tint = Color(0xFFB42318),
+            modifier = Modifier.size(17.dp),
+        )
+        Text(
+            text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "删除 $count" else "Delete $count",
+            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium),
+            color = Color(0xFFB42318),
+            maxLines = 1,
+        )
+    }
+}
+
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DrawerSessionRow(
     session: ChatSession,
     selected: Boolean,
+    selectionMode: Boolean,
+    checked: Boolean,
+    searchSnippet: String?,
     indicator: DrawerSessionIndicator,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onSelect: () -> Unit,
     onRename: (String) -> Unit,
     onExport: () -> Unit,
     onDelete: () -> Unit,
@@ -460,13 +600,38 @@ private fun DrawerSessionRow(
                             onClick = {
                                 onClick()
                             },
-                            onLongClick = { menuExpanded = true },
+                            onLongClick = {
+                                if (selectionMode) {
+                                    onLongClick()
+                                } else {
+                                    menuExpanded = true
+                                }
+                            },
                         )
                     }
                 )
                 .padding(horizontal = 12.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            if (selectionMode) {
+                Box(
+                    modifier = Modifier
+                        .padding(end = 10.dp)
+                        .size(20.dp)
+                        .clip(CircleShape)
+                        .background(if (checked) AetherPrimary else AetherSurfaceHigh),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (checked) {
+                        Icon(
+                            imageVector = Icons.Rounded.Check,
+                            contentDescription = null,
+                            tint = AetherOnPrimary,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+            }
             if (isRenaming) {
                 BasicTextField(
                     value = titleValue,
@@ -491,16 +656,27 @@ private fun DrawerSessionRow(
                         },
                 )
             } else {
-                Text(
-                    text = session.title.ifBlank { strings.newChat },
-                    style = MaterialTheme.typography.bodyLarge.copy(
-                        fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
-                    ),
-                    color = AetherOnSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = session.title.ifBlank { strings.newChat },
+                        style = MaterialTheme.typography.bodyLarge.copy(
+                            fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+                        ),
+                        color = AetherOnSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (!searchSnippet.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(3.dp))
+                        Text(
+                            text = searchSnippet,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AetherOnSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
             }
             if (indicator != DrawerSessionIndicator.None) {
                 Spacer(modifier = Modifier.width(10.dp))
@@ -522,6 +698,10 @@ private fun DrawerSessionRow(
         DrawerSessionActionMenu(
             expanded = menuExpanded,
             onDismissRequest = { menuExpanded = false },
+            onSelect = {
+                menuExpanded = false
+                onSelect()
+            },
             onRename = {
                 menuExpanded = false
                 titleValue = session.title.ifBlank { strings.newChat }
@@ -545,6 +725,7 @@ private fun DrawerSessionRow(
 private fun DrawerSessionActionMenu(
     expanded: Boolean,
     onDismissRequest: () -> Unit,
+    onSelect: () -> Unit,
     onRename: () -> Unit,
     onExport: () -> Unit,
     onDelete: () -> Unit,
@@ -578,6 +759,10 @@ private fun DrawerSessionActionMenu(
                     .padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
+                DrawerSessionActionRow(
+                    if (strings.appLanguage == AppLanguage.SimplifiedChinese) "选择" else "Select",
+                    onSelect,
+                )
                 DrawerSessionActionRow(strings.rename, onRename)
                 DrawerSessionActionRow(strings.export, onExport)
                 DrawerSessionActionRow(strings.delete, onDelete, destructive = true)

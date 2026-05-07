@@ -1175,13 +1175,13 @@ private fun ProvidersListPage(
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        tr(strings, "Add a provider to connect to an LLM API.", "Add a provider to connect to an LLM API."),
+                        tr(strings, "Add a provider to connect to an LLM API.", "添加一个模型提供方以连接 LLM API。"),
                         style = MaterialTheme.typography.bodyMedium,
                         color = AetherOnSurfaceVariant,
                     )
                     Spacer(Modifier.height(16.dp))
                     SettingsActionButton(
-                        label = tr(strings, "Add Provider", "Add Provider"),
+                        label = tr(strings, "Add Provider", "添加 Provider"),
                         onClick = onAddNew,
                     )
                 }
@@ -1425,6 +1425,7 @@ private fun ModelSelectionListRow(
     selected: Boolean,
     onClick: () -> Unit,
 ) {
+    val strings = rememberAetherStrings()
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1530,7 +1531,7 @@ private fun PersonalizationPage(
         Text(
             text = tr(
                 strings,
-                "This is the system prompt Aether uses in every conversation. It doesn't affect tool capabilities.",
+                "这是 Aether 在每次对话中都会使用的系统提示词，不会影响工具能力。",
                 "This is the system prompt Aether uses in every conversation. It doesn't affect tool capabilities.",
             ),
             style = MaterialTheme.typography.bodySmall,
@@ -1576,15 +1577,15 @@ private fun ReliabilityPage(
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 SettingsToggleRow(
-                    title = tr(strings, "Keep tasks running in background", "Keep tasks running in background"),
-                    subtitle = tr(strings, "Uses an Android foreground service so active chats can keep working after you leave Aether.", "Uses an Android foreground service so active chats can keep working after you leave Aether."),
+                    title = tr(strings, "Keep tasks running in background", "保持任务在后台运行"),
+                    subtitle = tr(strings, "Uses an Android foreground service so active chats can keep working after you leave Aether.", "使用 Android 前台服务，让活跃对话在离开 Aether 后继续工作。"),
                     checked = keepTasksRunningInBackground,
                     onCheckedChange = onKeepTasksRunningInBackgroundChanged,
                 )
                 Spacer(Modifier.height(4.dp))
                 SettingsToggleRow(
                     title = tr(strings, "Notify when background tasks finish", "后台任务结束时通知"),
-                    subtitle = tr(strings, "Shows a completion alert when a run ends while Aether is not on screen.", "Shows a completion alert when a run ends while Aether is not on screen."),
+                    subtitle = tr(strings, "Shows a completion alert when a run ends while Aether is not on screen.", "当 Aether 不在前台且任务结束时显示完成提醒。"),
                     checked = notifyOnTaskCompletion,
                     onCheckedChange = onNotifyOnTaskCompletionChanged,
                 )
@@ -1619,7 +1620,7 @@ private fun ReliabilityPage(
 
         Spacer(Modifier.height(8.dp))
         Text(
-            text = tr(strings, "If a request produces no response activity at all for this many seconds, Aether cancels that attempt and reconnects with backoff. Range: 30-3600 seconds.", "If a request produces no response activity at all for this many seconds, Aether cancels that attempt and reconnects with backoff. Range: 30-3600 seconds."),
+            text = tr(strings, "If a request produces no response activity at all for this many seconds, Aether cancels that attempt and reconnects with backoff. Range: 30-3600 seconds.", "如果请求在这段时间内完全没有响应活动，Aether 会取消本次尝试并退避重连。范围：30-3600 秒。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -1651,7 +1652,7 @@ private fun WebToolsPage(
 
         Spacer(Modifier.height(8.dp))
         Text(
-            text = tr(strings, "fetch_web_url works without extra setup and converts pages to Markdown on-device. tavily_search uses this API key for public web search.", "fetch_web_url works without extra setup and converts pages to Markdown on-device. tavily_search uses this API key for public web search."),
+            text = tr(strings, "fetch_web_url works without extra setup and converts pages to Markdown on-device. tavily_search uses this API key for public web search.", "fetch_web_url 无需额外设置，会在设备上把网页转换为 Markdown。tavily_search 使用此 API 密钥进行公开网页搜索。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -1676,7 +1677,7 @@ private fun SkillsListPage(
         onTrailingAction = onAddNew,
     ) {
         Text(
-            text = tr(strings, "Manage installed skills and keep only the bundles you want Aether to use in chat.", "Manage installed skills and keep only the bundles you want Aether to use in chat."),
+            text = tr(strings, "Manage installed skills and keep only the bundles you want Aether to use in chat.", "管理已安装技能，只保留希望 Aether 在对话中使用的技能包。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -1693,19 +1694,19 @@ private fun SkillsListPage(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
-                        tr(strings, "No skills installed", "No skills installed"),
+                        tr(strings, "No skills installed", "未安装技能"),
                         style = MaterialTheme.typography.titleMedium,
                         color = AetherOnSurface,
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        tr(strings, "Import skills from a folder, zip, or remote URL.", "Import skills from a folder, zip, or remote URL."),
+                        tr(strings, "Import skills from a folder, zip, or remote URL.", "从文件夹、Zip 或远程 URL 导入技能。"),
                         style = MaterialTheme.typography.bodyMedium,
                         color = AetherOnSurfaceVariant,
                     )
                     Spacer(Modifier.height(16.dp))
                     SettingsActionButton(
-                        label = tr(strings, "Add Skill", "Add Skill"),
+                        label = tr(strings, "Add Skill", "添加技能"),
                         onClick = onAddNew,
                     )
                 }
@@ -1792,10 +1793,10 @@ private fun SkillCard(
             Spacer(Modifier.height(14.dp))
             Spacer(Modifier.height(14.dp))
             DetailLine(tr(strings, "Skill ID", "技能 ID"), skill.id)
-            DetailLine(tr(strings, "Files", "Files"), "${skill.resourceEntries.size}")
-            DetailLine(tr(strings, "Allowed tools", "Allowed tools"), skill.allowedTools.ifEmpty { listOf(tr(strings, "Any", "Any")) }.joinToString(", "))
+            DetailLine(tr(strings, "Files", "文件"), "${skill.resourceEntries.size}")
+            DetailLine(tr(strings, "Allowed tools", "允许的工具"), skill.allowedTools.ifEmpty { listOf(tr(strings, "Any", "任意")) }.joinToString(", "))
             if (skill.compatibility.isNotBlank()) {
-                DetailLine(tr(strings, "Compatibility", "Compatibility"), skill.compatibility)
+                DetailLine(tr(strings, "Compatibility", "兼容性"), skill.compatibility)
             }
             if (skill.source.label.isNotBlank()) {
                 DetailLine(tr(strings, "Source", "来源"), skill.source.label)
@@ -1825,14 +1826,14 @@ private fun AddSkillPage(
     val strings = rememberAetherStrings()
 
     val tabOptions = listOf(
-        tr(strings, "Folder", "Folder"),
+        tr(strings, "Folder", "文件夹"),
         "Zip",
         "URL",
     )
 
     SubPageScaffold(title = title, onBack = onBack) {
         Text(
-            text = tr(strings, "Import Agent Skills from a local folder, zip file, or remote URL.", "Import Agent Skills from a local folder, zip file, or remote URL."),
+            text = tr(strings, "Import Agent Skills from a local folder, zip file, or remote URL.", "从本地文件夹、Zip 文件或远程 URL 导入 Agent 技能。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -1885,7 +1886,7 @@ private fun AddSkillPage(
                         )
                         Spacer(Modifier.height(16.dp))
                         SettingsActionButton(
-                            label = tr(strings, "Choose Folder", "Choose Folder"),
+                            label = tr(strings, "Choose Folder", "选择文件夹"),
                             onClick = {
                                 onImportSkillFolder()
                                 // Will navigate back via callback on success
@@ -1939,7 +1940,7 @@ private fun AddSkillPage(
 
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = tr(strings, "GitHub repo/tree URLs and direct zip links are supported.", "GitHub repo/tree URLs and direct zip links are supported."),
+                    text = tr(strings, "GitHub repo/tree URLs and direct zip links are supported.", "支持 GitHub 仓库/目录 URL 和直接 Zip 链接。"),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 4.dp),
@@ -2004,7 +2005,7 @@ private fun McpServersListPage(
         onTrailingAction = onAddNew,
     ) {
         Text(
-            text = tr(strings, "Manage MCP servers, inspect each transport config, and keep only the connections you want active.", "Manage MCP servers, inspect each transport config, and keep only the connections you want active."),
+            text = tr(strings, "Manage MCP servers, inspect each transport config, and keep only the connections you want active.", "管理 MCP 服务器，检查传输配置，并只保留需要启用的连接。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -2021,19 +2022,19 @@ private fun McpServersListPage(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
-                        tr(strings, "No MCP servers", "No MCP servers"),
+                        tr(strings, "No MCP servers", "没有 MCP 服务器"),
                         style = MaterialTheme.typography.titleMedium,
                         color = AetherOnSurface,
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        tr(strings, "Add HTTP or stdio servers to extend capabilities.", "Add HTTP or stdio servers to extend capabilities."),
+                        tr(strings, "Add HTTP or stdio servers to extend capabilities.", "添加 HTTP 或 stdio 服务器来扩展能力。"),
                         style = MaterialTheme.typography.bodyMedium,
                         color = AetherOnSurfaceVariant,
                     )
                     Spacer(Modifier.height(16.dp))
                     SettingsActionButton(
-                        label = tr(strings, "Add Server", "Add Server"),
+                        label = tr(strings, "Add Server", "添加服务器"),
                         onClick = onAddNew,
                     )
                 }
@@ -2131,7 +2132,7 @@ private fun McpServerCard(
             when (val transport = server.transport) {
                 is com.zhousl.aether.data.McpTransportConfig.StreamableHttp -> {
                     DetailLine("URL", transport.url)
-                    DetailLine(tr(strings, "Headers", "Headers"), transport.headers.size.toString())
+                    DetailLine(tr(strings, "Headers", "请求头"), transport.headers.size.toString())
                 }
 
                 is com.zhousl.aether.data.McpTransportConfig.StdIo -> {
@@ -2227,9 +2228,9 @@ private fun AddMcpServerPage(
     SubPageScaffold(title = title, onBack = onBack) {
         Text(
             text = if (isEditing) {
-                tr(strings, "Update the transport config and quick action source for this MCP server.", "Update the transport config and quick action source for this MCP server.")
+                tr(strings, "Update the transport config and quick action source for this MCP server.", "更新此 MCP 服务器的传输配置和快捷操作来源。")
             } else {
-                tr(strings, "Add an HTTP server for remote APIs or a stdio server for local Termux processes.", "Add an HTTP server for remote APIs or a stdio server for local Termux processes.")
+                tr(strings, "Add an HTTP server for remote APIs or a stdio server for local Termux processes.", "添加用于远程 API 的 HTTP 服务器，或用于本地 Termux 进程的 stdio 服务器。")
             },
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
@@ -2517,7 +2518,7 @@ private fun TermuxSettingsPage(
         onTrailingAction = onRefreshTermuxSetup,
     ) {
         Text(
-            text = tr(strings, "Aether runs bash through Termux. Finish setup here so tool calls work for every user without manual adb steps.", "Aether runs bash through Termux. Finish setup here so tool calls work for every user without manual adb steps."),
+            text = tr(strings, "Aether runs bash through Termux. Finish setup here so tool calls work for every user without manual adb steps.", "Aether 通过 Termux 运行 bash。在这里完成设置后，每个用户都能使用工具调用，无需手动 adb 步骤。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -2539,10 +2540,10 @@ private fun TermuxSettingsPage(
         if (termuxSetupState.isReady) {
             SettingsCardGroup {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text(tr(strings, "Termux is connected", "Termux is connected"), style = MaterialTheme.typography.labelLarge, color = AetherOnSurface)
+                    Text(tr(strings, "Termux is connected", "Termux 已连接"), style = MaterialTheme.typography.labelLarge, color = AetherOnSurface)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        tr(strings, "Permission is granted and the setup probe succeeded.", "Permission is granted and the setup probe succeeded."),
+                        tr(strings, "Permission is granted and the setup probe succeeded.", "权限已授予，设置检测已通过。"),
                         style = MaterialTheme.typography.bodySmall,
                         color = AetherOnSurfaceVariant,
                     )
@@ -2638,7 +2639,7 @@ private fun AgentModeSettingsPage(
         onTrailingAction = ::refreshAgentModeStatus,
     ) {
         Text(
-            text = tr(strings, "Authorize isolated virtual-display tools with Shizuku or Root. Skip this on devices without either option.", "Authorize isolated virtual-display tools with Shizuku or Root. Skip this on devices without either option."),
+            text = tr(strings, "Authorize isolated virtual-display tools with Shizuku or Root. Skip this on devices without either option.", "通过 Shizuku 或 Root 授权隔离的虚拟显示工具。没有这两种能力的设备可以跳过。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -2650,7 +2651,7 @@ private fun AgentModeSettingsPage(
             Column(modifier = Modifier.padding(16.dp)) {
                 SettingsToggleRow(
                     title = tr(strings, "Agent Mode authorization", "Agent 模式授权"),
-                    subtitle = tr(strings, "Enables isolated virtual-display tools. Requires Shizuku or Root.", "Enables isolated virtual-display tools. Requires Shizuku or Root."),
+                    subtitle = tr(strings, "Enables isolated virtual-display tools. Requires Shizuku or Root.", "启用隔离的虚拟显示工具，需要 Shizuku 或 Root。"),
                     checked = agentModeAuthorizationEnabled,
                     onCheckedChange = onAgentModeAuthorizationEnabledChanged,
                 )
@@ -2666,8 +2667,8 @@ private fun AgentModeSettingsPage(
                         SettingsChoiceRow(
                             title = method.displayName,
                             subtitle = when (method) {
-                                AgentModeAuthorizationMethod.Shizuku -> tr(strings, "Uses an elevated Shizuku service.", "Uses an elevated Shizuku service.")
-                                AgentModeAuthorizationMethod.Root -> tr(strings, "Uses root shell for privileged input.", "Uses root shell for privileged input.")
+                                AgentModeAuthorizationMethod.Shizuku -> tr(strings, "Uses an elevated Shizuku service.", "使用提权后的 Shizuku 服务。")
+                                AgentModeAuthorizationMethod.Root -> tr(strings, "Uses root shell for privileged input.", "使用 root shell 执行特权输入。")
                             },
                             selected = agentModeAuthorizationMethod == method,
                             onClick = { onAgentModeAuthorizationMethodChanged(method) },
@@ -2676,7 +2677,7 @@ private fun AgentModeSettingsPage(
                 }
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = tr(strings, "Shizuku mode creates the display from a Shizuku user service so apps can render off the main screen. Root mode remains experimental.", "Shizuku mode creates the display from a Shizuku user service so apps can render off the main screen. Root mode remains experimental."),
+                    text = tr(strings, "Shizuku mode creates the display from a Shizuku user service so apps can render off the main screen. Root mode remains experimental.", "Shizuku 模式会通过 Shizuku 用户服务创建显示，让应用在主屏幕之外渲染。Root 模式仍处于实验阶段。"),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                 )
@@ -2715,9 +2716,9 @@ private fun AgentModeSettingsPage(
                 Spacer(Modifier.height(6.dp))
                 Text(
                     text = if (agentModeDisplayState.isActive) {
-                        tr(strings, "Display ${agentModeDisplayState.displayId ?: "-"} is active at ${agentModeDisplayState.width} x ${agentModeDisplayState.height}.", "Display ${agentModeDisplayState.displayId ?: "-"} is active at ${agentModeDisplayState.width} x ${agentModeDisplayState.height}.")
+                        tr(strings, "Display ${agentModeDisplayState.displayId ?: "-"} is active at ${agentModeDisplayState.width} x ${agentModeDisplayState.height}.", "显示 ${agentModeDisplayState.displayId ?: "-"} 正在运行，分辨率为 ${agentModeDisplayState.width} x ${agentModeDisplayState.height}。")
                     } else {
-                        tr(strings, "No Agent Mode virtual display is active.", "No Agent Mode virtual display is active.")
+                        tr(strings, "No Agent Mode virtual display is active.", "当前没有活动的 Agent 模式虚拟显示。")
                     },
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
@@ -2741,7 +2742,7 @@ private fun AgentModeSettingsPage(
                 Spacer(Modifier.height(8.dp))
                 if (agentModeDisplayState.displays.isEmpty()) {
                     Text(
-                        text = tr(strings, "No displays are currently visible to Aether.", "No displays are currently visible to Aether."),
+                        text = tr(strings, "No displays are currently visible to Aether.", "Aether 当前看不到任何显示。"),
                         style = MaterialTheme.typography.bodySmall,
                         color = AetherOnSurfaceVariant,
                     )
@@ -2770,7 +2771,7 @@ private fun AgentModeSettingsPage(
                                     )
                                     Text(
                                         text = listOf(
-                                            display.name.ifBlank { tr(strings, "Unnamed", "Unnamed") },
+                                            display.name.ifBlank { tr(strings, "Unnamed", "未命名") },
                                             "${display.width} x ${display.height}",
                                             if (display.isAetherDisplay) "Aether" else "",
                                         ).filter { it.isNotBlank() }.joinToString(" · "),
@@ -3256,15 +3257,15 @@ private fun AgentModeAuthorizationNotice(
     val strings = rememberAetherStrings()
     val statusText = when {
         enabled && method == AgentModeAuthorizationMethod.Root -> when (state.issue) {
-            AgentModeAuthorizationIssue.Ready -> tr(strings, "Root authorization is ready.", "Root authorization is ready.")
-            AgentModeAuthorizationIssue.RootUnavailable -> tr(strings, "No su binary was detected on this device.", "No su binary was detected on this device.")
-            AgentModeAuthorizationIssue.RootPermissionMissing -> tr(strings, "Grant su to Aether, then refresh this status.", "Grant su to Aether, then refresh this status.")
-            AgentModeAuthorizationIssue.RootPermissionDenied -> tr(strings, "Root authorization was denied. Grant su to Aether, then refresh this status.", "Root authorization was denied. Grant su to Aether, then refresh this status.")
+            AgentModeAuthorizationIssue.Ready -> tr(strings, "Root authorization is ready.", "Root 授权已就绪。")
+            AgentModeAuthorizationIssue.RootUnavailable -> tr(strings, "No su binary was detected on this device.", "此设备未检测到 su。")
+            AgentModeAuthorizationIssue.RootPermissionMissing -> tr(strings, "Grant su to Aether, then refresh this status.", "请向 Aether 授予 su，然后刷新状态。")
+            AgentModeAuthorizationIssue.RootPermissionDenied -> tr(strings, "Root authorization was denied. Grant su to Aether, then refresh this status.", "Root 授权被拒绝。请向 Aether 授予 su，然后刷新状态。")
             AgentModeAuthorizationIssue.Error -> state.detail.ifBlank {
-                tr(strings, "Unable to inspect Root status.", "Unable to inspect Root status.")
+                tr(strings, "Unable to inspect Root status.", "无法检查 Root 状态。")
             }
             else -> state.detail.ifBlank {
-                tr(strings, "Refresh Root status before using Agent Mode.", "Refresh Root status before using Agent Mode.")
+                tr(strings, "Refresh Root status before using Agent Mode.", "使用 Agent 模式前请刷新 Root 状态。")
             }
         }
         !enabled -> tr(strings, "Agent Mode authorization is off.", "Agent 模式授权已关闭。")
@@ -3279,7 +3280,7 @@ private fun AgentModeAuthorizationNotice(
             AgentModeAuthorizationIssue.RootUnavailable,
             AgentModeAuthorizationIssue.RootPermissionMissing,
             AgentModeAuthorizationIssue.RootPermissionDenied -> state.detail.ifBlank {
-                tr(strings, "Switch to Root mode to inspect Root status.", "Switch to Root mode to inspect Root status.")
+                tr(strings, "Switch to Root mode to inspect Root status.", "切换到 Root 模式以检查 Root 状态。")
             }
             AgentModeAuthorizationIssue.Error -> state.detail.ifBlank {
                 tr(strings, "Unable to inspect Shizuku status.", "无法检查 Shizuku 状态。")
@@ -3349,7 +3350,7 @@ private fun DeveloperSettingsPage(
     val strings = rememberAetherStrings()
     SubPageScaffold(title = title, onBack = onBack) {
         Text(
-            text = tr(strings, "Developer-only tools and replay controls.", "Developer-only tools and replay controls."),
+            text = tr(strings, "Developer-only tools and replay controls.", "开发者专用工具和引导重播控制。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -3366,7 +3367,7 @@ private fun DeveloperSettingsPage(
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = tr(strings, "Import or export the complete local Aether data set as JSON.", "Import or export the complete local Aether data set as JSON."),
+                    text = tr(strings, "Import or export the complete local Aether data set as JSON.", "以 JSON 格式导入或导出完整的本地 Aether 数据。"),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                 )
@@ -3414,7 +3415,7 @@ private fun DeveloperSettingsPage(
         SettingsCardGroup {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
-                    text = tr(strings, "Update testing", "Update testing"),
+                    text = tr(strings, "Update testing", "更新测试"),
                     style = MaterialTheme.typography.labelLarge,
                     color = AetherOnSurface,
                 )
@@ -3422,7 +3423,7 @@ private fun DeveloperSettingsPage(
                 Text(
                     text = tr(
                         strings,
-                        "Fetch the latest GitHub Release and show the update prompt even when the installed version is current.",
+                        "拉取最新 GitHub Release，即使当前已是最新版本也显示更新提示。",
                         "Fetch the latest GitHub Release and show the update prompt even when the installed version is current.",
                     ),
                     style = MaterialTheme.typography.bodySmall,
@@ -3430,7 +3431,7 @@ private fun DeveloperSettingsPage(
                 )
                 Spacer(Modifier.height(16.dp))
                 SettingsSubtleActionButton(
-                    label = tr(strings, "Force update prompt", "Force update prompt"),
+                    label = tr(strings, "Force update prompt", "强制显示更新提示"),
                     onClick = onForceUpdateCheckForTesting,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -3448,7 +3449,7 @@ private fun DeveloperSettingsPage(
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = tr(strings, "Starts from Termux, then goes through Agent Mode, Tavily, Skills, and MCP.", "Starts from Termux, then goes through Agent Mode, Tavily, Skills, and MCP."),
+                    text = tr(strings, "Starts from Termux, then goes through Agent Mode, Tavily, Skills, and MCP.", "从 Termux 开始，然后依次进入 Agent 模式、Tavily、技能和 MCP。"),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                 )
@@ -3482,15 +3483,15 @@ private fun AboutPage(
     val strings = rememberAetherStrings()
     val updateSubtitle = when {
         appUpdate.isDownloading -> appUpdate.downloadProgress?.let { progress ->
-            tr(strings, "Downloading ${(progress * 100).toInt()}%", "Downloading ${(progress * 100).toInt()}%")
-        } ?: tr(strings, "Downloading update", "Downloading update")
-        appUpdate.isChecking -> tr(strings, "Checking GitHub Releases", "Checking GitHub Releases")
+            tr(strings, "Downloading ${(progress * 100).toInt()}%", "正在下载 ${(progress * 100).toInt()}%")
+        } ?: tr(strings, "Downloading update", "正在下载更新")
+        appUpdate.isChecking -> tr(strings, "Checking GitHub Releases", "正在检查 GitHub Releases")
         appUpdate.availableRelease != null -> tr(
             strings,
             "Aether ${appUpdate.availableRelease.versionName} is available",
-            "Aether ${appUpdate.availableRelease.versionName} is available",
+            "Aether ${appUpdate.availableRelease.versionName} 可用",
         )
-        else -> tr(strings, "Check GitHub Releases for a newer APK", "Check GitHub Releases for a newer APK")
+        else -> tr(strings, "Check GitHub Releases for a newer APK", "检查 GitHub Releases 中是否有新版 APK")
     }
     val releaseLabel = tr(strings, "Release ${BuildConfig.VERSION_NAME}", "版本 ${BuildConfig.VERSION_NAME}")
     SubPageScaffold(title = title, onBack = onBack) {
@@ -3522,13 +3523,13 @@ private fun AboutPage(
         Spacer(Modifier.height(24.dp))
 
         SettingsCardGroup {
-            AboutInfoRow(label = tr(strings, "Author", "Author"), value = "Zhou-Shilin")
+            AboutInfoRow(label = tr(strings, "Author", "作者"), value = "Zhou-Shilin")
             CardDivider()
             AboutInfoRow(label = tr(strings, "Version", "版本"), value = releaseLabel)
             CardDivider()
             SettingsNavRow(
                 icon = Icons.Rounded.Refresh,
-                title = tr(strings, "Check for updates", "Check for updates"),
+                title = tr(strings, "Check for updates", "检查更新"),
                 subtitle = updateSubtitle,
                 onClick = onCheckForUpdates,
             )
@@ -3554,7 +3555,7 @@ private fun AboutPage(
                 label = if (appUpdate.isDownloading) {
                     updateSubtitle
                 } else {
-                    tr(strings, "Download and install", "Download and install")
+                    tr(strings, "Download and install", "下载并安装")
                 },
                 onClick = onDownloadAndInstallUpdate,
                 enabled = !appUpdate.isDownloading,
@@ -3569,6 +3570,7 @@ private fun AboutInfoRow(
     label: String,
     value: String,
 ) {
+    val strings = rememberAetherStrings()
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -3690,6 +3692,7 @@ private fun SettingsTopBar(
     trailingEnabled: Boolean = true,
     onTrailingAction: (() -> Unit)? = null,
 ) {
+    val strings = rememberAetherStrings()
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -3700,7 +3703,7 @@ private fun SettingsTopBar(
     ) {
         SettingsCircleButton(
             icon = Icons.AutoMirrored.Rounded.ArrowBack,
-            contentDescription = "Back",
+            contentDescription = strings.back,
             onClick = onBack,
         )
         Text(

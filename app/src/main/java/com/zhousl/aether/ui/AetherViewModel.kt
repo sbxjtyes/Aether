@@ -915,31 +915,44 @@ class AetherViewModel(
     }
 
     fun deleteSession(sessionId: String) {
-        if (sessionExecutionManager.isSessionRunning(sessionId)) {
+        deleteSessions(setOf(sessionId))
+    }
+
+    fun deleteSessions(sessionIds: Set<String>) {
+        val requestedIds = sessionIds.filterTo(mutableSetOf()) { it != DraftSessionId }
+        if (requestedIds.isEmpty()) return
+        val runningIds = requestedIds.filter(sessionExecutionManager::isSessionRunning).toSet()
+        if (runningIds.isNotEmpty()) {
             emitTransientMessage("Pause this session before deleting it.")
-            return
+            requestedIds.removeAll(runningIds)
+            if (requestedIds.isEmpty()) return
         }
 
         var didUpdate = false
+        var deletedIds = emptySet<String>()
         _uiState.update { current ->
-            val updatedSessions = current.sessions.filterNot { it.id == sessionId }
+            val existingIds = current.sessions.mapTo(mutableSetOf()) { it.id }
+            deletedIds = requestedIds.intersect(existingIds)
+            if (deletedIds.isEmpty()) return@update current
+            val updatedSessions = current.sessions.filterNot { it.id in deletedIds }
             if (updatedSessions.size == current.sessions.size) return@update current
             didUpdate = true
             current.copy(
                 sessions = updatedSessions,
-                currentSessionId = if (current.currentSessionId == sessionId) DraftSessionId else current.currentSessionId,
-                draftInput = if (current.editingSessionId == sessionId) "" else current.draftInput,
-                draftAttachments = if (current.editingSessionId == sessionId) emptyList() else current.draftAttachments,
-                draftWorkspaceId = if (current.editingSessionId == sessionId) null else current.draftWorkspaceId,
-                editingSessionId = if (current.editingSessionId == sessionId) null else current.editingSessionId,
-                editingMessageId = if (current.editingSessionId == sessionId) null else current.editingMessageId,
-                unviewedCompletedSessionIds = current.unviewedCompletedSessionIds - sessionId,
+                currentSessionId = if (current.currentSessionId in deletedIds) DraftSessionId else current.currentSessionId,
+                draftInput = if (current.editingSessionId in deletedIds) "" else current.draftInput,
+                draftAttachments = if (current.editingSessionId in deletedIds) emptyList() else current.draftAttachments,
+                draftWorkspaceId = if (current.editingSessionId in deletedIds) null else current.draftWorkspaceId,
+                editingSessionId = if (current.editingSessionId in deletedIds) null else current.editingSessionId,
+                editingMessageId = if (current.editingSessionId in deletedIds) null else current.editingMessageId,
+                unviewedCompletedSessionIds = current.unviewedCompletedSessionIds - deletedIds,
                 showStarterPromptHint = false,
             )
         }
         if (didUpdate) {
-            persistDeleteSession(sessionId)
-            captureAnalyticsEvent(event = "conversation deleted")
+            persistDeleteSessions(deletedIds)
+            cleanupDeletedSessionWorkspaces(deletedIds)
+            captureAnalyticsEvent(event = if (deletedIds.size == 1) "conversation deleted" else "conversations deleted")
         }
     }
 
@@ -2520,16 +2533,36 @@ class AetherViewModel(
     }
 
     private fun persistDeleteSession(sessionId: String) {
+        persistDeleteSessions(setOf(sessionId))
+    }
+
+    private fun persistDeleteSessions(sessionIds: Set<String>) {
+        if (sessionIds.isEmpty()) return
         chatStateStore.update { persisted ->
-            val updatedSessions = persisted.sessions.filterNot { it.id == sessionId }
+            val updatedSessions = persisted.sessions.filterNot { it.id in sessionIds }
             persisted.copy(
                 sessions = updatedSessions,
-                currentSessionId = if (persisted.currentSessionId == sessionId) {
+                currentSessionId = if (persisted.currentSessionId in sessionIds) {
                     DraftSessionId
                 } else {
                     persisted.currentSessionId
                 },
             )
+        }
+    }
+
+    private fun cleanupDeletedSessionWorkspaces(sessionIds: Set<String>) {
+        sessionIds.forEach { sessionId ->
+            viewModelScope.launch(Dispatchers.IO) {
+                workspaceFileBridge.deleteWorkspace(sessionId)
+                    .onFailure { throwable ->
+                        Log.w(
+                            AetherViewModelLogTag,
+                            "Failed to delete Termux workspace for session=$sessionId: ${throwable.message.orEmpty()}",
+                            throwable,
+                        )
+                    }
+            }
         }
     }
 
@@ -2916,10 +2949,6 @@ class AetherViewModel(
         seedMessage: ChatMessage,
         settings: AppSettings,
     ) {
-        if (!isProviderSetupValid(settings.provider, settings.apiKey, settings.baseUrl, settings.modelId)) {
-            return
-        }
-
         val titleInput = buildTitleGenerationInput(seedMessage)
         if (titleInput.isBlank()) return
 
@@ -2931,6 +2960,9 @@ class AetherViewModel(
                 preferredModelKey = resolveDefaultTitleModelKey(settings, providerConfigs),
                 fallbackModelKey = resolveDefaultChatModelKey(settings, providerConfigs),
             )
+            if (!isProviderSetupValid(titleSettings.provider, titleSettings.apiKey, titleSettings.baseUrl, titleSettings.modelId)) {
+                return@launch
+            }
             val titleResult = client.createChatCompletion(
                 settings = titleSettings,
                 systemPrompt = SessionTitleSystemPrompt,

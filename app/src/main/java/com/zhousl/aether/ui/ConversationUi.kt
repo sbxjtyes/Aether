@@ -306,6 +306,7 @@ fun ConversationScreen(
     val composerBodyHeight = with(density) {
         if (composerBodyHeightPx > 0) composerBodyHeightPx.toDp() else 112.dp
     }
+    val conversationBottomClearance = composerBodyHeight + 72.dp
     val imeBottom = with(density) {
         WindowInsets.ime.getBottom(this).toDp()
     }
@@ -458,7 +459,7 @@ fun ConversationScreen(
                 ConversationEmptyState(
                     modifier = Modifier.padding(
                         top = topBarBodyHeight + 20.dp,
-                        bottom = composerBodyHeight + animatedImeBottom + 16.dp,
+                        bottom = conversationBottomClearance + animatedImeBottom,
                     ),
                     inputFocused = composerFocused,
                     showResumeSetupBanner = showResumeSetupBanner,
@@ -475,7 +476,7 @@ fun ConversationScreen(
                         start = 20.dp,
                         end = 20.dp,
                         top = topBarBodyHeight + 10.dp,
-                        bottom = composerBodyHeight + animatedImeBottom + 28.dp,
+                        bottom = conversationBottomClearance + animatedImeBottom,
                     ),
                     verticalArrangement = Arrangement.spacedBy(22.dp),
                 ) {

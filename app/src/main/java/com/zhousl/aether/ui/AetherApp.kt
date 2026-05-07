@@ -460,6 +460,7 @@ private fun AetherAppContent(
                     sessionExportLauncher.launch("${session.title.ifBlank { "aether-session" }}.json")
                 },
                 onDeleteSession = viewModel::deleteSession,
+                onDeleteSessions = viewModel::deleteSessions,
                 onSettingsSelected = {
                     scope.launch {
                         drawerState.close()

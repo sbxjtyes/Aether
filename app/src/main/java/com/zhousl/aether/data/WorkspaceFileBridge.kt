@@ -19,10 +19,10 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
-private const val MaxWorkspaceImportBytes = 20 * 1024 * 1024
+private const val MaxWorkspaceImportBytes = 128 * 1024 * 1024
 private const val MaxWorkspaceDownloadBytes = 32 * 1024 * 1024
 private const val WorkspaceTransferChunkBytes = 6 * 1024
-private const val WorkspaceUploadChunkChars = 64 * 1024
+private const val WorkspaceUploadChunkChars = 192 * 1024
 private const val WorkspaceBaseDirectoryName = ".aether/workspaces"
 private const val WorkspaceUploadTimeoutMillis = 60_000L
 private const val WorkspaceUploadProbeTimeoutMillis = 10_000L
@@ -39,6 +39,20 @@ class WorkspaceFileBridge(
 
     fun workspaceDirectory(sessionId: String): String =
         "${TermuxContract.HomeDirectory}/$WorkspaceBaseDirectoryName/$sessionId"
+
+    suspend fun deleteWorkspace(sessionId: String): Result<Unit> = runCatching {
+        val workspacePath = workspaceDirectory(sessionId)
+        val rawResult = JSONObject(
+            bashTool.executeCommand(
+                command = buildDeleteWorkspaceCommand(encodeBase64(workspacePath)),
+                awaitTimeoutMillis = WorkspaceUploadProbeTimeoutMillis,
+            )
+        )
+        ensureBashSuccess(
+            rawResult = rawResult,
+            fallbackMessage = "Couldn't delete workspace files for $sessionId.",
+        )
+    }
 
     suspend fun importAttachmentToWorkspace(
         sourceUri: Uri,
@@ -796,6 +810,19 @@ class WorkspaceFileBridge(
         appendLine("rm -f \"\$tmp_b64\"")
         appendLine("trap - EXIT")
         appendLine("emit_kv bytes_written \"\$bytes_written\"")
+    }
+
+    private fun buildDeleteWorkspaceCommand(
+        pathBase64: String,
+    ): String = buildString {
+        appendCommonShellPreamble(this)
+        appendLine("path=\"\$(decode_b64 '$pathBase64')\"")
+        appendLine("case \"\$path\" in")
+        appendLine("  \"${TermuxContract.HomeDirectory}/$WorkspaceBaseDirectoryName\"/*) ;;")
+        appendLine("  *) printf 'Refusing to delete unexpected workspace path: %s\\n' \"\$path\" >&2; exit 64 ;;")
+        appendLine("esac")
+        appendLine("rm -rf -- \"\$path\"")
+        appendLine("emit_kv deleted \"\$path\"")
     }
 
     private fun readContentBytes(

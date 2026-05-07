@@ -1177,6 +1177,17 @@ fun ToolInvocationList(
         }
 
         AnimatedVisibility(
+            visible = headerVisible && !expanded,
+            enter = fadeIn(animationSpec = tween(durationMillis = 180, easing = ToolTransitionEasing)),
+            exit = fadeOut(animationSpec = tween(durationMillis = 140, easing = FastOutLinearInEasing)),
+        ) {
+            CollapsedToolInvocationPreview(
+                toolInvocations = toolInvocations,
+                onExpand = { expanded = true },
+            )
+        }
+
+        AnimatedVisibility(
             visible = expanded,
             enter = expandVertically(
                 animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
@@ -1762,9 +1773,18 @@ private fun ReasoningTimelineToolRow(
     val title = remember(toolInvocation, strings.appLanguage) {
         strings.toolInvocationTitleLabel(toolInvocation.toolName, toolInvocation.isRunning, arguments)
     }
+    val detail = remember(toolInvocation, strings.appLanguage) {
+        formatToolInvocationDetail(strings, toolInvocation)
+    }
+    var expanded by rememberSaveable(toolInvocation.id) { mutableStateOf(false) }
     val webSourceMetadata = remember(toolInvocation.toolName, toolInvocation.argumentsJson, toolInvocation.outputJson) {
         webSourceMetadata(toolInvocation.toolName, arguments, output)
     }
+    val arrowRotation by animateFloatAsState(
+        targetValue = if (expanded) 90f else 0f,
+        animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
+        label = "reasoning_tool_arrow_rotation",
+    )
 
     Row(
         modifier = Modifier
@@ -1782,17 +1802,39 @@ private fun ReasoningTimelineToolRow(
                 .padding(bottom = if (isLast) 0.dp else 18.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (toolInvocation.isRunning) {
-                ShimmerStatusText(
-                    text = title,
-                    travelDurationMillis = 3200,
-                    pauseDurationMillis = 1000,
-                )
-            } else {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = AetherOnSurface,
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .noRippleClickable { expanded = !expanded },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (toolInvocation.isRunning) {
+                    ShimmerStatusText(
+                        text = title,
+                        modifier = Modifier.weight(1f),
+                        travelDurationMillis = 3200,
+                        pauseDurationMillis = 1000,
+                    )
+                } else {
+                    Text(
+                        text = title,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AetherOnSurface,
+                    )
+                }
+                Icon(
+                    imageVector = Icons.AutoMirrored.Rounded.ArrowForwardIos,
+                    contentDescription = if (expanded) {
+                        if (strings.appLanguage == AppLanguage.SimplifiedChinese) "折叠工具详情" else "Collapse tool details"
+                    } else {
+                        if (strings.appLanguage == AppLanguage.SimplifiedChinese) "展开工具详情" else "Expand tool details"
+                    },
+                    tint = AetherOnSurfaceVariant,
+                    modifier = Modifier
+                        .size(13.dp)
+                        .graphicsLayer { rotationZ = arrowRotation },
                 )
             }
             webSourceMetadata?.let { metadata ->
@@ -1800,6 +1842,38 @@ private fun ReasoningTimelineToolRow(
                     metadata = metadata,
                     onOpenLink = onOpenLink,
                 )
+            }
+            AnimatedVisibility(
+                visible = expanded && detail.command.isNotBlank(),
+                enter = expandVertically(
+                    animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
+                    expandFrom = Alignment.Top,
+                ) + fadeIn(
+                    animationSpec = tween(
+                        durationMillis = ToolTransitionDurationMillis - 90,
+                        delayMillis = 40,
+                        easing = ToolTransitionEasing,
+                    ),
+                ),
+                exit = shrinkVertically(
+                    animationSpec = tween(durationMillis = 240, easing = FastOutLinearInEasing),
+                    shrinkTowards = Alignment.Top,
+                ) + fadeOut(
+                    animationSpec = tween(durationMillis = 160, easing = FastOutLinearInEasing),
+                ),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SyntaxHighlightedCodeBlock(
+                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "命令" else "Command",
+                        content = remember(detail.command) { highlightBashCommand(detail.command) },
+                    )
+                    detail.result?.let { result ->
+                        SyntaxHighlightedCodeBlock(
+                            label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "结果" else "Result",
+                            content = remember(result) { highlightToolResult(result) },
+                        )
+                    }
+                }
             }
         }
     }
@@ -2227,6 +2301,7 @@ private fun SyntaxHighlightedCodeBlock(
                     .background(AetherSurfaceHigh)
                     .padding(horizontal = 12.dp, vertical = 10.dp)
                     .heightIn(max = 220.dp)
+                    .horizontalScroll(rememberScrollState())
                     .verticalScroll(rememberScrollState()),
             ) {
                 Text(
@@ -3291,31 +3366,104 @@ private fun parseJsonObject(rawValue: String): JSONObject? {
 }
 
 private fun highlightBashCommand(command: String): AnnotatedString = buildAnnotatedString {
-    appendStyled("$ ", SpanStyle(color = AetherSecondary, fontWeight = FontWeight.SemiBold))
-
     val tokenPattern = Regex("""\s+|&&|\|\||[|;><()]|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\$[A-Za-z_][A-Za-z0-9_]*|--?[A-Za-z0-9][\w-]*|[^\s|;><()]+""")
-    var expectsCommand = true
-
-    tokenPattern.findAll(command).forEach { match ->
-        val token = match.value
-        val style = when {
-            token.isBlank() -> null
-            token in setOf("|", "||", "&&", ";", ">", "<", "(", ")") -> {
-                expectsCommand = true
-                SpanStyle(color = AetherOnSurfaceVariant)
+    command.lineSequence().forEachIndexed { lineIndex, rawLine ->
+        if (lineIndex > 0) append('\n')
+        appendStyled(
+            if (lineIndex == 0) "$ " else "> ",
+            SpanStyle(color = AetherSecondary, fontWeight = FontWeight.SemiBold),
+        )
+        var expectsCommand = true
+        tokenPattern.findAll(rawLine).forEach { match ->
+            val token = match.value
+            val style = when {
+                token.isBlank() -> null
+                token in setOf("|", "||", "&&", ";", ">", "<", "(", ")") -> {
+                    expectsCommand = true
+                    SpanStyle(color = AetherOnSurfaceVariant)
+                }
+                token.startsWith("\"") || token.startsWith("'") -> SpanStyle(color = AetherTertiary)
+                token.startsWith("$") -> SpanStyle(color = AetherPrimary)
+                token.startsWith("-") -> SpanStyle(color = AetherSecondary)
+                token.startsWith("/") || token.startsWith("~/") || token.startsWith("./") || token.startsWith("../") -> SpanStyle(color = AetherSecondary)
+                expectsCommand -> {
+                    expectsCommand = false
+                    SpanStyle(color = AetherPrimary, fontWeight = FontWeight.SemiBold)
+                }
+                token.all(Char::isDigit) -> SpanStyle(color = AetherTertiary)
+                else -> SpanStyle(color = AetherOnSurface)
             }
-            token.startsWith("\"") || token.startsWith("'") -> SpanStyle(color = AetherTertiary)
-            token.startsWith("$") -> SpanStyle(color = AetherPrimary)
-            token.startsWith("-") -> SpanStyle(color = AetherSecondary)
-            token.startsWith("/") || token.startsWith("~/") || token.startsWith("./") || token.startsWith("../") -> SpanStyle(color = AetherSecondary)
-            expectsCommand -> {
-                expectsCommand = false
-                SpanStyle(color = AetherPrimary, fontWeight = FontWeight.SemiBold)
-            }
-            token.all(Char::isDigit) -> SpanStyle(color = AetherTertiary)
-            else -> SpanStyle(color = AetherOnSurface)
+            appendStyled(token, style)
         }
-        appendStyled(token, style)
+    }
+}
+
+@Composable
+private fun CollapsedToolInvocationPreview(
+    toolInvocations: List<ChatToolInvocation>,
+    onExpand: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(AetherSurfaceHigh.copy(alpha = 0.62f))
+            .noRippleClickable(onClick = onExpand)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        toolInvocations.take(4).forEach { invocation ->
+            val detail = remember(invocation, strings.appLanguage) {
+                formatToolInvocationDetail(strings, invocation)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    imageVector = reasoningToolIcon(invocation.toolName),
+                    contentDescription = null,
+                    tint = if (invocation.isRunning) AetherPrimary else AetherOnSurfaceVariant,
+                    modifier = Modifier
+                        .padding(top = 1.dp)
+                        .size(14.dp),
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = detail.command.ifBlank {
+                            strings.toolInvocationTitleLabel(invocation.toolName, invocation.isRunning)
+                        },
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        color = AetherOnSurface,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    val result = detail.result.orEmpty()
+                    if (!invocation.isRunning && result.isNotBlank() && result != strings.noOutput) {
+                        Text(
+                            text = result.lineSequence().firstOrNull { it.isNotBlank() }?.take(120).orEmpty(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = AetherOnSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
+        if (toolInvocations.size > 4) {
+            Text(
+                text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                    "还有 ${toolInvocations.size - 4} 个工具，点按展开"
+                } else {
+                    "${toolInvocations.size - 4} more tools, tap to expand"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = AetherOnSurfaceVariant,
+            )
+        }
     }
 }
 
