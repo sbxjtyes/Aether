@@ -526,7 +526,7 @@ private fun UserMessageActionDialog(
         offset = popupOffset,
         onDismissRequest = onDismissRequest,
         properties = PopupProperties(
-            focusable = true,
+            focusable = false,
             dismissOnBackPress = true,
             dismissOnClickOutside = true,
         ),

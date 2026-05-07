@@ -26,7 +26,6 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -43,7 +42,6 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -180,6 +178,7 @@ private val ChatGptControlShadow = Color(0x14000000)
 private val ChatGptComposerShadow = Color(0x18000000)
 private val ChatGptPurple = Color(0xFF9B5CFF)
 private val ChatGptMotionEasing = CubicBezierEasing(0.22f, 0.84f, 0.18f, 1f)
+private const val ImeInsetStabilizationMillis = 90L
 
 internal enum class PendingGenerationIndicator {
     None,
@@ -310,8 +309,19 @@ fun ConversationScreen(
     val imeBottom = with(density) {
         WindowInsets.ime.getBottom(this).toDp()
     }
+    var stableImeBottom by remember { mutableStateOf(0.dp) }
+    LaunchedEffect(imeBottom, composerFocused) {
+        if (composerFocused && imeBottom > 24.dp) {
+            stableImeBottom = imeBottom
+        } else {
+            delay(ImeInsetStabilizationMillis)
+            if (!composerFocused || imeBottom <= 24.dp) {
+                stableImeBottom = 0.dp
+            }
+        }
+    }
     val animatedImeBottom by animateDpAsState(
-        targetValue = imeBottom,
+        targetValue = stableImeBottom,
         animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
         label = "conversation_empty_ime_bottom",
     )
@@ -595,6 +605,7 @@ fun ConversationScreen(
             ConversationComposerOverlay(
                 modifier = Modifier.align(Alignment.BottomCenter),
                 onBodyHeightChanged = { composerBodyHeightPx = it },
+                imeBottomPadding = animatedImeBottom,
                 value = inputValue,
                 attachments = draftAttachments,
                 attachmentRevision = draftAttachmentRevision,
@@ -801,7 +812,7 @@ private fun ConversationModelSelector(
                 offset = IntOffset(0, anchorBottomPx - with(density) { 32.dp.roundToPx() }),
                 onDismissRequest = { expanded = false },
                 properties = PopupProperties(
-                    focusable = true,
+                    focusable = false,
                     dismissOnBackPress = true,
                     dismissOnClickOutside = true,
                 ),
@@ -1254,6 +1265,7 @@ private fun PendingSessionInputBubble(
 private fun ConversationComposerOverlay(
     modifier: Modifier = Modifier,
     onBodyHeightChanged: (Int) -> Unit,
+    imeBottomPadding: Dp,
     value: String,
     attachments: List<ChatAttachment>,
     attachmentRevision: Long,
@@ -1289,19 +1301,16 @@ private fun ConversationComposerOverlay(
     onQueueFollowUp: () -> Unit,
     onSteerFollowUp: () -> Unit,
 ) {
-    val density = LocalDensity.current
-    val imeVisible = WindowInsets.ime.getBottom(density) > 0
     val bottomLift by animateDpAsState(
-        targetValue = if (imeVisible) 12.dp else 18.dp,
+        targetValue = if (imeBottomPadding > 0.dp) 12.dp else 18.dp,
         animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
         label = "composer_bottom_lift",
     )
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .windowInsetsPadding(WindowInsets.ime.only(WindowInsetsSides.Bottom))
             .navigationBarsPadding()
-            .padding(bottom = bottomLift),
+            .padding(bottom = imeBottomPadding + bottomLift),
     ) {
         Box(
             modifier = Modifier
@@ -1397,7 +1406,18 @@ private fun ConversationComposerBar(
     var measuredTextLineCount by remember { mutableIntStateOf(1) }
     var measuredTextHeight by remember { mutableStateOf(22.dp) }
     val density = LocalDensity.current
-    val imeVisible = WindowInsets.ime.getBottom(density) > 0
+    val rawImeBottom = WindowInsets.ime.getBottom(density)
+    var stableImeVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(rawImeBottom, textFieldFocused) {
+        if (textFieldFocused && rawImeBottom > with(density) { 24.dp.roundToPx() }) {
+            stableImeVisible = true
+        } else {
+            delay(ImeInsetStabilizationMillis)
+            if (!textFieldFocused || rawImeBottom <= with(density) { 24.dp.roundToPx() }) {
+                stableImeVisible = false
+            }
+        }
+    }
     val selectedSkillSet = remember(selectedSkillIds) { selectedSkillIds.toSet() }
     val selectedMcpServerSet = remember(selectedMcpServerIds) { selectedMcpServerIds.toSet() }
     val selectedSkillActions = remember(availableSkills, selectedSkillSet) {
@@ -1425,7 +1445,7 @@ private fun ConversationComposerBar(
     val showPauseButton = isSending && !hasDraft
     val showSubmitButton = !isSending || hasDraft
     val keepPlusSeparated = value.isNotBlank() || hasSelectedActions
-    val plusSeparated = keepPlusSeparated || (textFieldFocused && imeVisible)
+    val plusSeparated = keepPlusSeparated || (textFieldFocused && stableImeVisible)
     val explicitTextLineCount = if (value.isBlank()) {
         1
     } else {
@@ -1457,8 +1477,8 @@ private fun ConversationComposerBar(
         isMultilineComposer -> 12.dp
         else -> 8.dp
     }
-    LaunchedEffect(plusSeparated) {
-        onFocusChanged(plusSeparated)
+    LaunchedEffect(textFieldFocused) {
+        onFocusChanged(textFieldFocused)
     }
     val composerHorizontalPadding by animateDpAsState(
         targetValue = when {
@@ -1683,7 +1703,7 @@ private fun ConversationComposerBar(
                                         },
                                         onDismissRequest = { followUpMenuExpanded = false },
                                         properties = PopupProperties(
-                                            focusable = true,
+                                            focusable = false,
                                             dismissOnBackPress = true,
                                             dismissOnClickOutside = true,
                                         ),
@@ -1766,7 +1786,7 @@ private fun ConversationComposerBar(
                         },
                         onDismissRequest = { attachmentMenuExpanded = false },
                         properties = PopupProperties(
-                            focusable = true,
+                            focusable = false,
                             dismissOnBackPress = true,
                             dismissOnClickOutside = true,
                         ),
