@@ -31,6 +31,7 @@ google-services.json
 # Agent/editor scratch data
 .agents/
 .claude/
+.vscode/
 .trash/
 reports/
 *-report.md
