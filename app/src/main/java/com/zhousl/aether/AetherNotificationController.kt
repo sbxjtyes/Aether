@@ -25,8 +25,6 @@ class AetherNotificationController(
     private val notificationManager = NotificationManagerCompat.from(context)
 
     fun ensureChannels() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-
         val manager = context.getSystemService(NotificationManager::class.java)
         val foregroundChannel = NotificationChannel(
             ForegroundChannelId,

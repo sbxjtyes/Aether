@@ -1,6 +1,7 @@
 package com.zhousl.aether.ui
 
 import android.graphics.BitmapFactory
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.CubicBezierEasing
@@ -15,7 +16,6 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
@@ -26,16 +26,13 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
-import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
@@ -49,8 +46,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
@@ -67,10 +62,8 @@ import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.runtime.Composable
@@ -80,6 +73,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.State
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -95,7 +89,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -103,18 +96,13 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
-import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -134,7 +122,6 @@ import com.zhousl.aether.data.McpServerConfig
 import com.zhousl.aether.data.McpTransportConfig
 import com.zhousl.aether.data.PendingSessionInput
 import com.zhousl.aether.data.ProviderModelOption
-import com.zhousl.aether.data.SessionExecutionState
 import com.zhousl.aether.data.SessionFollowUpMode
 import com.zhousl.aether.data.quickActionLabel
 import com.zhousl.aether.termux.TermuxSetupState
@@ -148,7 +135,6 @@ import com.zhousl.aether.ui.theme.AetherScrim
 import com.zhousl.aether.ui.theme.AetherSurface
 import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import com.zhousl.aether.ui.theme.AetherSurfaceHigher
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.delay
 import org.json.JSONObject
@@ -179,6 +165,32 @@ private val ChatGptComposerShadow = Color(0x18000000)
 private val ChatGptPurple = Color(0xFF9B5CFF)
 private val ChatGptMotionEasing = CubicBezierEasing(0.22f, 0.84f, 0.18f, 1f)
 private const val ImeInsetStabilizationMillis = 90L
+private val ImeStabilizationMinVisibleHeight = 24.dp
+
+/**
+ * 监听 IME 高度并配合输入框聚焦状态做稳定化处理。
+ *
+ * 当 [focused] 为 true 且 IME 高度高于 [ImeStabilizationMinVisibleHeight] 时立即返回当前高度；
+ * 否则延迟 [ImeInsetStabilizationMillis] 毫秒确认输入法确实已收起，再回落到 0.dp。
+ * 该延迟用于过滤弹层切换造成的瞬时 IME 抖动。
+ */
+@Composable
+private fun rememberStableImeBottom(focused: Boolean): State<Dp> {
+    val density = LocalDensity.current
+    val imeBottom = with(density) { WindowInsets.ime.getBottom(this).toDp() }
+    val stable = remember { mutableStateOf(0.dp) }
+    LaunchedEffect(imeBottom, focused) {
+        if (focused && imeBottom > ImeStabilizationMinVisibleHeight) {
+            stable.value = imeBottom
+        } else {
+            delay(ImeInsetStabilizationMillis)
+            if (!focused || imeBottom <= ImeStabilizationMinVisibleHeight) {
+                stable.value = 0.dp
+            }
+        }
+    }
+    return stable
+}
 
 internal enum class PendingGenerationIndicator {
     None,
@@ -306,20 +318,7 @@ fun ConversationScreen(
         if (composerBodyHeightPx > 0) composerBodyHeightPx.toDp() else 112.dp
     }
     val conversationBottomClearance = composerBodyHeight + 72.dp
-    val imeBottom = with(density) {
-        WindowInsets.ime.getBottom(this).toDp()
-    }
-    var stableImeBottom by remember { mutableStateOf(0.dp) }
-    LaunchedEffect(imeBottom, composerFocused) {
-        if (composerFocused && imeBottom > 24.dp) {
-            stableImeBottom = imeBottom
-        } else {
-            delay(ImeInsetStabilizationMillis)
-            if (!composerFocused || imeBottom <= 24.dp) {
-                stableImeBottom = 0.dp
-            }
-        }
-    }
+    val stableImeBottom by rememberStableImeBottom(focused = composerFocused)
     val animatedImeBottom by animateDpAsState(
         targetValue = stableImeBottom,
         animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
@@ -616,11 +615,11 @@ fun ConversationScreen(
                 agentModeAvailable = agentModeAvailable,
                 agentModeSelected = agentModeSelected,
                 isEditing = isEditing,
-                        termuxSetupState = termuxSetupState,
-                        isSending = isSending,
-                        showStarterPromptHint = showStarterPromptHint,
-                        showTermuxSetupNotice = showTermuxSetupNotice,
-                        onValueChange = onInputChanged,
+                termuxSetupState = termuxSetupState,
+                isSending = isSending,
+                showStarterPromptHint = showStarterPromptHint,
+                showTermuxSetupNotice = showTermuxSetupNotice,
+                onValueChange = onInputChanged,
                 onRemoveAttachment = onRemoveDraftAttachment,
                 onSetSkillSelected = onSetSkillSelected,
                 onSetMcpServerSelected = onSetMcpServerSelected,
@@ -633,10 +632,10 @@ fun ConversationScreen(
                 onOpenTermuxSettings = onOpenTermuxSettings,
                 onOpenTermux = onOpenTermux,
                 onInstallTermux = onInstallTermux,
-                        onRefreshTermuxSetup = onRefreshTermuxSetup,
-                        onPauseGeneration = onPauseGeneration,
-                        onDismissStarterPromptHint = onDismissStarterPromptHint,
-                        onFocusChanged = { composerFocused = it },
+                onRefreshTermuxSetup = onRefreshTermuxSetup,
+                onPauseGeneration = onPauseGeneration,
+                onDismissStarterPromptHint = onDismissStarterPromptHint,
+                onFocusChanged = { composerFocused = it },
                 onSend = onSend,
                 onQueueFollowUp = onQueueFollowUp,
                 onSteerFollowUp = onSteerFollowUp,
@@ -806,6 +805,7 @@ private fun ConversationModelSelector(
             )
         }
 
+        BackHandler(enabled = expanded) { expanded = false }
         if (menuVisibility.currentState || menuVisibility.targetState) {
             Popup(
                 alignment = Alignment.TopCenter,
@@ -927,6 +927,7 @@ private fun ConversationEmptyState(
     onStarterPromptSelected: (String) -> Unit,
 ) {
     val strings = rememberAetherStrings()
+    val density = LocalDensity.current
     val titleOffset by animateDpAsState(
         targetValue = if (inputFocused) (-34).dp else (-24).dp,
         animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
@@ -936,7 +937,7 @@ private fun ConversationEmptyState(
         modifier = modifier
             .fillMaxSize()
             .padding(horizontal = 26.dp)
-            .offset(y = titleOffset),
+            .offset { IntOffset(0, with(density) { titleOffset.roundToPx() }) },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
@@ -1323,20 +1324,20 @@ private fun ConversationComposerOverlay(
                 attachmentRevision = attachmentRevision,
                 availableSkills = availableSkills,
                 availableMcpServers = availableMcpServers,
-            selectedSkillIds = selectedSkillIds,
-            selectedMcpServerIds = selectedMcpServerIds,
-            agentModeAvailable = agentModeAvailable,
-            agentModeSelected = agentModeSelected,
-            isEditing = isEditing,
+                selectedSkillIds = selectedSkillIds,
+                selectedMcpServerIds = selectedMcpServerIds,
+                agentModeAvailable = agentModeAvailable,
+                agentModeSelected = agentModeSelected,
+                isEditing = isEditing,
                 termuxSetupState = termuxSetupState,
                 isSending = isSending,
                 showStarterPromptHint = showStarterPromptHint,
                 showTermuxSetupNotice = showTermuxSetupNotice,
                 onValueChange = onValueChange,
                 onRemoveAttachment = onRemoveAttachment,
-            onSetSkillSelected = onSetSkillSelected,
-            onSetMcpServerSelected = onSetMcpServerSelected,
-            onSetAgentModeSelected = onSetAgentModeSelected,
+                onSetSkillSelected = onSetSkillSelected,
+                onSetMcpServerSelected = onSetMcpServerSelected,
+                onSetAgentModeSelected = onSetAgentModeSelected,
                 onCancelEdit = onCancelEdit,
                 onPickImages = onPickImages,
                 onPickFiles = onPickFiles,
@@ -1402,22 +1403,14 @@ private fun ConversationComposerBar(
     var followUpMenuExpanded by remember { mutableStateOf(false) }
     val followUpMenuVisibility = remember { MutableTransitionState(false) }
     followUpMenuVisibility.targetState = followUpMenuExpanded
+    BackHandler(enabled = attachmentMenuExpanded) { attachmentMenuExpanded = false }
+    BackHandler(enabled = followUpMenuExpanded) { followUpMenuExpanded = false }
     var textFieldFocused by remember { mutableStateOf(false) }
     var measuredTextLineCount by remember { mutableIntStateOf(1) }
     var measuredTextHeight by remember { mutableStateOf(22.dp) }
     val density = LocalDensity.current
-    val rawImeBottom = WindowInsets.ime.getBottom(density)
-    var stableImeVisible by remember { mutableStateOf(false) }
-    LaunchedEffect(rawImeBottom, textFieldFocused) {
-        if (textFieldFocused && rawImeBottom > with(density) { 24.dp.roundToPx() }) {
-            stableImeVisible = true
-        } else {
-            delay(ImeInsetStabilizationMillis)
-            if (!textFieldFocused || rawImeBottom <= with(density) { 24.dp.roundToPx() }) {
-                stableImeVisible = false
-            }
-        }
-    }
+    val stableImeBottom by rememberStableImeBottom(focused = textFieldFocused)
+    val stableImeVisible = stableImeBottom > ImeStabilizationMinVisibleHeight
     val selectedSkillSet = remember(selectedSkillIds) { selectedSkillIds.toSet() }
     val selectedMcpServerSet = remember(selectedMcpServerIds) { selectedMcpServerIds.toSet() }
     val selectedSkillActions = remember(availableSkills, selectedSkillSet) {
@@ -1762,10 +1755,10 @@ private fun ConversationComposerBar(
                 }
             }
 
-                Box(
-            modifier = Modifier
-                .align(plusButtonAlignment)
-                .size(48.dp)
+            Box(
+                modifier = Modifier
+                    .align(plusButtonAlignment)
+                    .size(48.dp)
                     .shadow(plusShadowElevation, CircleShape, ambientColor = ChatGptControlShadow, spotColor = ChatGptControlShadow)
                     .clip(CircleShape)
                     .background(if (plusSeparated) AetherSurface else Color.Transparent)

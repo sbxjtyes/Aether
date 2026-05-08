@@ -9,10 +9,10 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Point
+import androidx.core.graphics.createBitmap
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
-import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
@@ -136,9 +136,7 @@ class AetherAgentModeShizukuService @Keep constructor(
             ?: error("Display $displayId is not available.")
         val displayContext = context.createDisplayContext(targetDisplay)
         val options = ActivityOptions.makeBasic()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            options.launchDisplayId = displayId
-        }
+        options.launchDisplayId = displayId
 
         focusDisplayForInput(displayId)
         val failures = mutableListOf<String>()
@@ -161,8 +159,7 @@ class AetherAgentModeShizukuService @Keep constructor(
             return
         }
 
-        val pendingIntentFlags = PendingIntent.FLAG_UPDATE_CURRENT or
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+        val pendingIntentFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         val pendingIntent = PendingIntent.getActivity(
             displayContext,
             baseIntent.filterHashCode(),
@@ -349,7 +346,7 @@ class AetherAgentModeShizukuService @Keep constructor(
             ?: error("Display $displayId is not managed by Aether Agent Mode.")
         val width = display.display.mode?.physicalWidth?.takeIf { it > 0 } ?: display.display.width
         val height = display.display.mode?.physicalHeight?.takeIf { it > 0 } ?: display.display.height
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val bitmap = createBitmap(width, height)
         val latch = CountDownLatch(1)
         var result = PixelCopy.ERROR_UNKNOWN
         PixelCopy.request(display.surface, bitmap, { copyResult ->

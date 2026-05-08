@@ -3,7 +3,9 @@ package com.zhousl.aether.ui
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.SystemClock
+import androidx.core.net.toUri
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
@@ -516,6 +518,7 @@ private fun UserMessageActionDialog(
     menuVisibility.targetState = expanded
     if (!menuVisibility.currentState && !menuVisibility.targetState) return
 
+    BackHandler(enabled = expanded) { onDismissRequest() }
     val density = LocalDensity.current
     val popupOffset = with(density) {
         IntOffset(x = 0, y = 30.dp.roundToPx())
@@ -2763,7 +2766,7 @@ private fun rememberAttachmentBitmap(
     val bitmap by produceState<ImageBitmap?>(initialValue = null, uriString, maxSize) {
         value = withContext(Dispatchers.IO) {
             val resolver = context.contentResolver
-            val uri = Uri.parse(uriString)
+            val uri = uriString.toUri()
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
@@ -2813,7 +2816,7 @@ private fun readAttachmentBytes(
     uriString: String,
     byteLimit: Int,
 ): ByteArray? = runCatching {
-    resolver.openInputStream(Uri.parse(uriString))?.use { inputStream ->
+    resolver.openInputStream(uriString.toUri())?.use { inputStream ->
         val output = java.io.ByteArrayOutputStream()
         val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
         var totalRead = 0
@@ -3502,8 +3505,8 @@ private fun AnnotatedString.Builder.appendStyled(
 }
 
 private fun formatAttachmentSize(bytes: Long): String = when {
-    bytes >= 1024 * 1024 -> String.format("%.1f MB", bytes / (1024f * 1024f))
-    bytes >= 1024 -> String.format("%.1f KB", bytes / 1024f)
+    bytes >= 1024 * 1024 -> String.format(Locale.US, "%.1f MB", bytes / (1024f * 1024f))
+    bytes >= 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024f)
     else -> "$bytes B"
 }
 

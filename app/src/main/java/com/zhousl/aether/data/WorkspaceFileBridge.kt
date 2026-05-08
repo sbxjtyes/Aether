@@ -10,6 +10,7 @@ import java.io.ByteArrayOutputStream
 import java.net.URLDecoder
 import java.nio.file.Paths
 import java.util.Base64
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlinx.coroutines.Dispatchers
@@ -876,8 +877,8 @@ class WorkspaceFileBridge(
     }
 
     private fun formatBytes(bytes: Long): String = when {
-        bytes >= 1024 * 1024 -> String.format("%.1f MB", bytes / (1024f * 1024f))
-        bytes >= 1024 -> String.format("%.1f KB", bytes / 1024f)
+        bytes >= 1024 * 1024 -> String.format(Locale.US, "%.1f MB", bytes / (1024f * 1024f))
+        bytes >= 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024f)
         else -> "$bytes B"
     }
 }

@@ -5,6 +5,7 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import androidx.core.net.toUri
 import android.util.Patterns
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -243,7 +244,7 @@ private fun AetherAppContent(
     LaunchedEffect(uiState.appUpdate.pendingInstallUri) {
         val installUri = uiState.appUpdate.pendingInstallUri
         if (installUri.isNotBlank()) {
-            requestApkInstall(context, Uri.parse(installUri))
+            requestApkInstall(context, installUri.toUri())
             viewModel.consumePendingUpdateInstallUri()
         }
     }
@@ -927,7 +928,7 @@ private fun saveAttachmentToDocument(
     destinationUri: Uri,
 ): Boolean = runCatching {
     val resolver = context.contentResolver
-    val sourceUri = Uri.parse(attachment.uri)
+    val sourceUri = attachment.uri.toUri()
     val expectedSize = resolver.openAssetFileDescriptor(sourceUri, "r")?.use { descriptor ->
         descriptor.length.takeIf { it >= 0L }
     }
@@ -961,7 +962,7 @@ private suspend fun handleAssistantLink(
         return
     }
 
-    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(normalizedLink)).apply {
+    val intent = Intent(Intent.ACTION_VIEW, normalizedLink.toUri()).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     launchIntentSafely(context, intent) {
@@ -1101,7 +1102,7 @@ private fun openAppPermissionSettings(
     }
     val fallbackIntent = Intent(
         Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-        Uri.parse("package:${context.packageName}"),
+        "package:${context.packageName}".toUri(),
     ).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
@@ -1139,7 +1140,7 @@ private fun openTermuxInstallPage(
 ) {
     val intent = Intent(
         Intent.ACTION_VIEW,
-        Uri.parse("https://f-droid.org/en/packages/com.termux/"),
+        "https://f-droid.org/en/packages/com.termux/".toUri(),
     ).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
@@ -1168,7 +1169,7 @@ private fun openShizukuInstallPage(
 ) {
     val intent = Intent(
         Intent.ACTION_VIEW,
-        Uri.parse("https://shizuku.rikka.app/download/"),
+        "https://shizuku.rikka.app/download/".toUri(),
     ).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
@@ -1185,7 +1186,7 @@ private fun openExternalUrl(
     context: android.content.Context,
     url: String,
 ) {
-    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+    val intent = Intent(Intent.ACTION_VIEW, url.toUri()).apply {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     }
     launchIntentSafely(context, intent) {

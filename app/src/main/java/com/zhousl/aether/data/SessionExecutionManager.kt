@@ -16,6 +16,7 @@ import com.zhousl.aether.ui.MessageAuthor
 import com.zhousl.aether.ui.ReasoningSummaryChunk
 import com.zhousl.aether.ui.ReasoningTrace
 import com.zhousl.aether.ui.syncActiveBranches
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -1138,8 +1139,8 @@ class SessionExecutionManager(
     }
 
     private fun formatBytes(bytes: Long): String = when {
-        bytes >= 1024 * 1024 -> String.format("%.1f MB", bytes / (1024f * 1024f))
-        bytes >= 1024 -> String.format("%.1f KB", bytes / 1024f)
+        bytes >= 1024 * 1024 -> String.format(Locale.US, "%.1f MB", bytes / (1024f * 1024f))
+        bytes >= 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024f)
         else -> "$bytes B"
     }
 

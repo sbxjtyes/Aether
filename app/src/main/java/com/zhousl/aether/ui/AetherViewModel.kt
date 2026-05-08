@@ -3,6 +3,7 @@ package com.zhousl.aether.ui
 import android.app.Application
 import android.net.Uri
 import android.provider.OpenableColumns
+import androidx.core.net.toUri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -71,6 +72,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 private const val FollowUpTourAutoOpenDelayMillis = 2_500L
@@ -2279,7 +2281,7 @@ class AetherViewModel(
                 "attachment_id=${attachment.id} source_size=${attachment.sizeBytes ?: -1}",
         )
         val importResult = workspaceFileBridge.importAttachmentToWorkspace(
-            sourceUri = Uri.parse(attachment.uri),
+            sourceUri = attachment.uri.toUri(),
             sessionId = sessionId,
             attachmentId = attachment.id,
             displayName = attachment.name,
@@ -3161,8 +3163,8 @@ class AetherViewModel(
     }
 
     private fun formatBytes(bytes: Long): String = when {
-        bytes >= 1024 * 1024 -> String.format("%.1f MB", bytes / (1024f * 1024f))
-        bytes >= 1024 -> String.format("%.1f KB", bytes / 1024f)
+        bytes >= 1024 * 1024 -> String.format(Locale.US, "%.1f MB", bytes / (1024f * 1024f))
+        bytes >= 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024f)
         else -> "$bytes B"
     }
 

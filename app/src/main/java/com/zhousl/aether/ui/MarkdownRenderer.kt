@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
+import androidx.core.net.toUri
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.webkit.JavascriptInterface
@@ -547,13 +548,16 @@ private fun MarkdownImageBlock(
         }
     }
     var showPreview by remember(resolvedUrl) { mutableStateOf(false) }
-    val canPreview = imageState.bitmap != null || imageState.html != null
+    val htmlSnapshot = imageState.html
+    val bitmapSnapshot = imageState.bitmap
+    val errorSnapshot = imageState.error
+    val canPreview = bitmapSnapshot != null || htmlSnapshot != null
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MarkdownMediaWidthContainer(layout = image.layout) { widthModifier ->
             when {
-                imageState.html != null -> MarkdownHtmlBlock(
-                    html = imageState.html!!,
+                htmlSnapshot != null -> MarkdownHtmlBlock(
+                    html = htmlSnapshot,
                     layout = image.layout,
                     defaultMinHeightDp = DefaultImageMinHeightDp,
                     defaultMaxHeightDp = DefaultImageMaxHeightDp,
@@ -568,8 +572,8 @@ private fun MarkdownImageBlock(
                     },
                 )
 
-                imageState.bitmap != null -> MarkdownBitmapImageBlock(
-                    bitmap = imageState.bitmap!!,
+                bitmapSnapshot != null -> MarkdownBitmapImageBlock(
+                    bitmap = bitmapSnapshot,
                     altText = image.altText,
                     layout = image.layout,
                     modifier = widthModifier
@@ -589,9 +593,9 @@ private fun MarkdownImageBlock(
                         .padding(12.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    if (imageState.error != null) {
+                    if (errorSnapshot != null) {
                         Text(
-                            text = imageState.error.orEmpty(),
+                            text = errorSnapshot,
                             style = MaterialTheme.typography.bodyMedium,
                             color = AetherOnSurfaceVariant,
                         )
@@ -2146,7 +2150,7 @@ private fun readContentMarkdownImage(
     context: Context,
     rawUrl: String,
 ): MarkdownImageBinary? {
-    val uri = Uri.parse(rawUrl)
+    val uri = rawUrl.toUri()
     val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
         readBytesWithLimit(input, MaxMarkdownImageBytes + 1)
     } ?: return null
