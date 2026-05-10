@@ -1101,5 +1101,5 @@ internal object TermuxContract {
     const val HomeDirectory = "/data/data/com.termux/files/home"
     const val ManagedCommandsDirectory = "$HomeDirectory/.aether/bash-runs"
     const val ExternalAppsSetupCommand =
-        "mkdir -p ~/.termux && touch ~/.termux/termux.properties && if grep -Eq '^[[:space:]]*#?[[:space:]]*allow-external-apps[[:space:]]*=' ~/.termux/termux.properties; then sed -i -E 's/^[[:space:]]*#?[[:space:]]*allow-external-apps[[:space:]]*=.*/allow-external-apps=true/' ~/.termux/termux.properties; else printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties; fi && termux-reload-settings"
+        "mkdir -p ~/.termux && touch ~/.termux/termux.properties && sed -i '/^allow-external-apps=/d' ~/.termux/termux.properties && printf '\\nallow-external-apps=true\\n' >> ~/.termux/termux.properties && termux-reload-settings"
 }

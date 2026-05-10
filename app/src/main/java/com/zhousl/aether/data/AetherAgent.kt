@@ -1474,10 +1474,29 @@ class AetherAgent(
         if (agentModeEnabled) {
             append("\n\n")
             append(
-                "Agent Mode is enabled for this chat. Use agent_display to operate an isolated Android virtual display, not the user's main screen. " +
-                    "Coordinates for tap and swipe are normalized from 0 to 1000, matching the Ruto/AutoGLM convention. " +
+                "Agent Mode is enabled for this chat. Use agent_display to operate an isolated Android virtual display (900×1600 px), not the user's main screen. " +
+                    "Coordinates for tap and swipe are normalized from 0 to 1000 on both axes (top-left = 0,0; bottom-right = 1000,1000). " +
+                    "The screenshot has red ruler tick-marks along all four edges at every 50-unit interval (minor ticks) and every 100-unit interval (major ticks with numeric labels 0, 100, 200, ... 1000). " +
+                    "Use these rulers as visual anchors to estimate coordinates precisely. " +
+                    "IMPORTANT coordinate tips: " +
+                    "(1) Always aim for the exact CENTER of the target UI element—horizontally and vertically. " +
+                    "(2) Cross-reference the element's position against the nearest ruler tick marks on BOTH the horizontal (top/bottom) and vertical (left/right) edges. " +
+                    "(3) For text buttons or list items, the tap point should be at the middle of the text label, not at the edge. " +
+                    "(4) For input fields, tap the center of the field area, not the hint text edge. " +
+                    "(5) After tapping, always take a screenshot to verify the result; if the tap missed, re-examine the coordinates and retry. " +
+                    "(6) When elements are small (icons, checkboxes), be extra careful—estimate each axis independently using the nearest two ruler labels. " +
                     "Call agent_display with action=start before operating apps, action=launch to open an app by package name or exact label, and action=screenshot after visible changes. " +
                     "After each agent_display action that captures the display, the latest screenshot is automatically inserted into the next model request as an image, following the Ruto-GLM workflow. Use that image directly instead of calling analyze_image for Agent Mode screenshots. " +
+                    "SPEED OPTIMIZATION: Use action=sequence with a steps array to batch multiple actions in one tool call. " +
+                    "This executes all steps server-side without intermediate screenshots, only capturing once at the end. " +
+                    "Example: {\"action\":\"sequence\",\"steps\":[{\"action\":\"tap\",\"x\":500,\"y\":200},{\"action\":\"wait\",\"wait_ms\":500},{\"action\":\"text\",\"text\":\"hello\"},{\"action\":\"key\",\"key\":\"ENTER\"}]} " +
+                    "Use sequence when you are confident about the next 2-5 steps (e.g. tap a known field, type text, press enter). " +
+                    "Fall back to single actions when you need to see the screen before deciding the next step. " +
+                    "RECOVERY FROM MISTAKES: After every tap, always screenshot to verify you reached the expected screen. " +
+                    "If the screenshot shows an unexpected page, popup, ad, or wrong app screen, IMMEDIATELY use action=key with key=BACK to go back, then screenshot again. " +
+                    "Repeat BACK presses until you return to the intended screen. " +
+                    "If BACK does not help after 2-3 attempts, use action=key with key=HOME to return to the launcher, then re-launch the target app. " +
+                    "Never continue operating on a wrong screen—always correct your position first. " +
                     "Do not use Agent Mode tools when the user only wants a normal chat answer."
             )
         }
@@ -2080,7 +2099,7 @@ class AetherAgent(
         name = "agent_display",
         description = "Operate Aether Agent Mode on an isolated Android virtual display. Use this only when Agent Mode is selected in the chat composer.",
         properties = JSONObject().apply {
-            put("action", stringProperty("One of: start, status, launch, tap, swipe, key, text, screenshot, stop."))
+            put("action", stringProperty("One of: start, status, launch, tap, swipe, key, text, sequence, screenshot, stop."))
             put("target", stringProperty("For launch: package name or exact app label."))
             put("x", integerProperty("For tap: normalized X coordinate from 0 to 1000."))
             put("y", integerProperty("For tap: normalized Y coordinate from 0 to 1000."))
@@ -2092,6 +2111,14 @@ class AetherAgent(
             put("durationMs", integerProperty("Alias of duration_ms."))
             put("key", stringProperty("For key: Android key code name or number, such as BACK, HOME, ENTER, or 4."))
             put("text", stringProperty("For text: text to type into the focused field."))
+            put("steps", JSONObject().apply {
+                put("type", "array")
+                put("description", "For sequence: array of step objects. Each step has action (tap/swipe/key/text/wait/launch) plus the same params as the corresponding action. Optional wait_ms (0-5000) between steps.")
+                put("items", JSONObject().apply {
+                    put("type", "object")
+                    put("additionalProperties", true)
+                })
+            })
         },
         required = listOf("action"),
     )

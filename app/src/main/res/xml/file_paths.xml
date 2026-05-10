@@ -4,6 +4,9 @@
         name="assistant_local_open"
         path="assistant-local-open/" />
     <cache-path
+        name="agent_mode"
+        path="agent-mode/" />
+    <cache-path
         name="app_updates"
         path="updates/" />
 </paths>

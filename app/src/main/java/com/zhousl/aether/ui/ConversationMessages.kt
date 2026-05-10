@@ -102,7 +102,6 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.AnnotatedString
@@ -132,7 +131,6 @@ import com.zhousl.aether.ui.theme.AetherSurface
 import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import com.zhousl.aether.ui.theme.AetherTertiary
 import com.zhousl.aether.data.AppLanguage
-import com.zhousl.aether.termux.TermuxContract
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
 import kotlinx.coroutines.Dispatchers
@@ -151,7 +149,7 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.roundToInt
 
-private const val ToolInvocationCollapseThreshold = 3
+private const val ToolInvocationCollapseThreshold = 10
 private const val ToolTransitionDurationMillis = 360
 private const val ToolInvocationAutoExpandDelayMillis = 1_000L
 private const val ToolGroupCollapseStageDelayMillis = 180L
@@ -256,19 +254,14 @@ fun TermuxSetupNotice(
     if (setupState.isReady) return
     val strings = rememberAetherStrings()
     val context = LocalContext.current
-    val clipboardManager = LocalClipboardManager.current
 
     fun copyTermuxSetupCommand() {
-        clipboardManager.setText(AnnotatedString(TermuxContract.ExternalAppsSetupCommand))
+        copyTermuxSetupCommandToClipboard(context)
         Toast.makeText(
             context,
             if (strings.appLanguage == AppLanguage.SimplifiedChinese) "已复制 Termux 配置命令" else "Termux setup command copied",
             Toast.LENGTH_SHORT,
         ).show()
-    }
-    fun copyTermuxSetupCommandAndOpenTermux() {
-        copyTermuxSetupCommand()
-        onOpenTermux()
     }
 
     val title: String
@@ -359,9 +352,15 @@ fun TermuxSetupNotice(
                 TermuxSetupIssue.ExternalAppsDisabled -> {
                     ActionIconLabel(
                         icon = Icons.AutoMirrored.Rounded.OpenInNew,
-                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制并打开 Termux" else "Copy and Open Termux",
+                        label = strings.openTermux,
                         enabled = true,
-                        onClick = ::copyTermuxSetupCommandAndOpenTermux,
+                        onClick = onOpenTermux,
+                    )
+                    ActionIconLabel(
+                        icon = Icons.Rounded.ContentCopy,
+                        label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制配置命令" else "Copy setup command",
+                        enabled = true,
+                        onClick = ::copyTermuxSetupCommand,
                     )
                     if (showRefreshAction) {
                         ActionIconLabel(
@@ -2200,7 +2199,6 @@ fun ToolInvocationCard(
         toolInvocation.completedAtUptimeMillis,
     ) {
         if (!toolInvocation.isRunning) {
-            expanded = false
             return@LaunchedEffect
         }
 

@@ -70,10 +70,8 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -95,7 +93,6 @@ import com.zhousl.aether.data.RootSetupState
 import com.zhousl.aether.data.usesOfficialVertexEndpoint
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
-import com.zhousl.aether.termux.TermuxContract
 import com.zhousl.aether.R
 import com.zhousl.aether.ui.theme.AetherBackground
 import com.zhousl.aether.ui.theme.AetherOnPrimary
@@ -847,20 +844,15 @@ private fun TermuxStep(
 ) {
     val strings = rememberAetherStrings()
     val context = LocalContext.current
-    val clipboardManager = LocalClipboardManager.current
     var shouldAutoContinue by rememberSaveable(stepIndex) { mutableStateOf(!setupState.isReady) }
     var showRootSetupPrompt by rememberSaveable(stepIndex) { mutableStateOf(true) }
     fun copyTermuxSetupCommand() {
-        clipboardManager.setText(AnnotatedString(TermuxContract.ExternalAppsSetupCommand))
+        copyTermuxSetupCommandToClipboard(context)
         Toast.makeText(
             context,
             if (strings.appLanguage == AppLanguage.SimplifiedChinese) "已复制 Termux 配置命令" else "Termux setup command copied",
             Toast.LENGTH_SHORT,
         ).show()
-    }
-    fun copyTermuxSetupCommandAndOpenTermux() {
-        copyTermuxSetupCommand()
-        onOpenTermux()
     }
 
     LaunchedEffect(stepIndex) {
@@ -934,11 +926,13 @@ private fun TermuxStep(
 
                     TermuxSetupIssue.ExternalAppsDisabled -> {
                         TourActionRow(
-                            primaryLabel = tr(strings, "Copy and Open Termux", "复制并打开 Termux"),
-                            onPrimary = ::copyTermuxSetupCommandAndOpenTermux,
+                            primaryLabel = strings.openTermux,
+                            onPrimary = onOpenTermux,
                             secondaryLabel = strings.skip,
                             onSecondary = onContinue,
                         )
+                        SecondaryTextAction(label = tr(strings, "Copy setup command", "复制配置命令"), onClick = ::copyTermuxSetupCommand)
+                        SecondaryTextAction(label = tr(strings, "Termux settings", "Termux 设置"), onClick = onOpenTermuxSettings)
                     }
 
                     TermuxSetupIssue.DispatchFailed -> {

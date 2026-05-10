@@ -198,6 +198,7 @@ class OpenAiCompatibleClient(
             put("type", "function_call_output")
             put("call_id", callId)
             put("output", output)
+            put("status", "completed")
         }
 
         LlmProvider.OpenAiCompatible -> JSONObject().apply {
@@ -461,7 +462,9 @@ class OpenAiCompatibleClient(
     }
 
     private fun serializeOpenAiResponsesConversationMessage(message: LlmMessage): JSONObject = JSONObject().apply {
+        put("type", "message")
         put("role", message.role)
+        put("status", "completed")
         put(
             "content",
             JSONArray().apply {
@@ -1175,11 +1178,32 @@ class OpenAiCompatibleClient(
         val wrappedItems = item.optJSONArray(OpenAiResponsesItemsKey)
         if (wrappedItems != null) {
             for (index in 0 until wrappedItems.length()) {
-                wrappedItems.optJSONObject(index)?.let(::put)
+                wrappedItems.optJSONObject(index)?.let { put(normalizeOpenAiResponsesInputItem(it)) }
             }
             return
         }
-        put(item)
+        put(normalizeOpenAiResponsesInputItem(item))
+    }
+
+    /**
+     * 标准化 Responses API input item，补齐第二轮回放时服务端要求的完成状态。
+     */
+    private fun normalizeOpenAiResponsesInputItem(item: JSONObject): JSONObject {
+        val normalized = JSONObject(item.toString())
+        if (normalized.optString("type").isBlank() && normalized.has("role") && normalized.has("content")) {
+            normalized.put("type", "message")
+        }
+        when (normalized.optString("type")) {
+            "message",
+            "function_call",
+            "function_call_output",
+            "reasoning" -> {
+                if (!normalized.has("status") || normalized.optString("status").isBlank()) {
+                    normalized.put("status", "completed")
+                }
+            }
+        }
+        return normalized
     }
 
     private fun emptyObjectSchema(): JSONObject = JSONObject().apply {
@@ -2073,7 +2097,7 @@ private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult 
         val item = output.optJSONObject(index) ?: continue
         when (item.optString("type")) {
             "message" -> {
-                assistantItems.put(JSONObject(item.toString()))
+                assistantItems.put(normalizeOpenAiResponsesOutputItem(item))
                 val content = item.optJSONArray("content") ?: JSONArray()
                 for (contentIndex in 0 until content.length()) {
                     val block = content.optJSONObject(contentIndex) ?: continue
@@ -2088,7 +2112,7 @@ private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult 
             }
 
             "function_call" -> {
-                assistantItems.put(JSONObject(item.toString()))
+                assistantItems.put(normalizeOpenAiResponsesOutputItem(item))
                 toolCalls += ChatCompletionToolCall(
                     id = item.optString("call_id")
                         .ifBlank { item.optString("id") }
@@ -2107,6 +2131,24 @@ private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult 
             put(OpenAiResponsesItemsKey, assistantItems)
         },
     )
+}
+
+/**
+ * 标准化 Responses API output item，确保后续作为 input 回放时具备完成状态。
+ */
+private fun normalizeOpenAiResponsesOutputItem(item: JSONObject): JSONObject {
+    val normalized = JSONObject(item.toString())
+    when (normalized.optString("type")) {
+        "message",
+        "function_call",
+        "function_call_output",
+        "reasoning" -> {
+            if (!normalized.has("status") || normalized.optString("status").isBlank()) {
+                normalized.put("status", "completed")
+            }
+        }
+    }
+    return normalized
 }
 
 private fun buildAnthropicResultFromContent(

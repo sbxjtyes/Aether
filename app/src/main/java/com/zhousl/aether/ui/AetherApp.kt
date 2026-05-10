@@ -1001,11 +1001,16 @@ private suspend fun openAssistantLocalFile(
         Toast.makeText(context, "Unable to open that file", Toast.LENGTH_SHORT).show()
         return
     }
-    val contentUri = FileProvider.getUriForFile(
-        context,
-        "${context.packageName}.fileprovider",
-        resolvedFile,
-    )
+    val contentUri = runCatching {
+        FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            resolvedFile,
+        )
+    }.getOrElse {
+        Toast.makeText(context, "Unable to open that file", Toast.LENGTH_SHORT).show()
+        return
+    }
     val intent = Intent(Intent.ACTION_VIEW).apply {
         setDataAndType(contentUri, "*/*")
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

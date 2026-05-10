@@ -1,13 +1,23 @@
 package com.zhousl.aether.data
 
+import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.ServiceConnection
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Point
 import android.hardware.display.DisplayManager
+import android.os.Build
 import android.os.DeadObjectException
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.util.Base64
@@ -15,26 +25,34 @@ import android.view.Display
 import android.util.Log
 import androidx.core.content.getSystemService
 import com.rosan.app_process.AppProcess
+import com.zhousl.aether.agentmode.AetherAgentModeProcessContract
+import com.zhousl.aether.agentmode.AetherAgentModeProcessMain
 import com.zhousl.aether.agentmode.AetherAgentModeShizukuService
 import com.zhousl.aether.agentmode.IAetherAgentModeService
 import com.zhousl.aether.termux.TermuxBashTool
 import java.io.File
+import java.util.UUID
 import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.CompletableDeferred
+import java.util.concurrent.TimeoutException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
 
-private const val FallbackAgentDisplayWidth = 720
-private const val FallbackAgentDisplayHeight = 1280
-private const val FallbackAgentDisplayDensityDpi = 320
+/**
+ * Agent Mode 虚拟显示固定分辨率。
+ * 使用 900×1600 而非设备物理分辨率，确保截图尺寸可控，
+ * 避免高分辨率图片被模型 API 内部缩放导致坐标精度损失。
+ */
+private const val AgentDisplayWidth = 900
+private const val AgentDisplayHeight = 1600
+private const val AgentDisplayDensityDpi = 440
 private const val AgentDisplayName = "aether-agent-mode"
 private const val ShizukuPermissionRequestCode = 4201
 private const val RootAuthorizationProbeTimeoutMillis = 2_000L
@@ -50,8 +68,8 @@ data class AgentModeDisplayState(
     val isActive: Boolean = false,
     val isConnecting: Boolean = false,
     val displayId: Int? = null,
-    val width: Int = FallbackAgentDisplayWidth,
-    val height: Int = FallbackAgentDisplayHeight,
+    val width: Int = AgentDisplayWidth,
+    val height: Int = AgentDisplayHeight,
     val displays: List<AgentModeDisplayInfo> = emptyList(),
     val latestPreviewPath: String = "",
     val latestWorkspacePath: String = "",
@@ -174,8 +192,7 @@ class AgentModeController(
 
     private var shizukuDisplayId: Int? = null
     private var shizukuService: IAetherAgentModeService? = null
-    private var shizukuServiceArgs: Shizuku.UserServiceArgs? = null
-    private var shizukuServiceConnection: ServiceConnection? = null
+    private var shizukuProcess: Process? = null
     private var rootService: IAetherAgentModeService? = null
     private var rootProcess: AppProcess.Terminal? = null
     @Volatile private var isConnectingShizukuService = false
@@ -232,8 +249,15 @@ class AgentModeController(
         runCatching {
             when (action) {
             "start" -> {
-                ensureDisplay(settings)
-                captureAfterDelay(settings, workspaceDirectory, delayMillis = 350)
+                val displayId = ensureDisplay(settings)
+                val state = _displayState.value
+                JSONObject().apply {
+                    put("ok", true)
+                    put("display_id", displayId)
+                    put("width", state.width)
+                    put("height", state.height)
+                    put("stdout", "Agent Mode virtual display started (${state.width}x${state.height}). No screenshot yet — use action=launch to open an app first, then action=screenshot.")
+                }.toString()
             }
             "status" -> statusResult(settings)
             "launch" -> {
@@ -243,7 +267,7 @@ class AgentModeController(
                     invalidArguments("缺少要启动的应用名称或包名。请提供 target，例如 com.android.chrome。", "missing_target")
                 } else {
                     launchTarget(settings, target)
-                    captureAfterDelay(settings, workspaceDirectory, delayMillis = 900)
+                    captureAfterDelay(settings, workspaceDirectory, delayMillis = 2500)
                 }
             }
             "tap" -> {
@@ -300,6 +324,16 @@ class AgentModeController(
                     captureAfterDelay(settings, workspaceDirectory, delayMillis = 350)
                 }
             }
+            "sequence" -> {
+                val displayId = ensureDisplay(settings)
+                val steps = arguments.optJSONArray("steps")
+                if (steps == null || steps.length() == 0) {
+                    invalidArguments("sequence 需要提供 steps 数组。", "missing_steps")
+                } else {
+                    executeSequence(settings, displayId, steps)
+                    captureAfterDelay(settings, workspaceDirectory, delayMillis = 350)
+                }
+            }
             "screenshot" -> {
                 ensureDisplay(settings)
                 captureAfterDelay(settings, workspaceDirectory, delayMillis = 0)
@@ -311,7 +345,7 @@ class AgentModeController(
                     put("stdout", "Agent Mode virtual display stopped.")
                 }.toString()
             }
-            else -> invalidArguments("不支持的 Agent 模式操作：$action。请使用 start、status、launch、tap、swipe、key、text、screenshot 或 stop。", "unsupported_action").also {
+            else -> invalidArguments("不支持的 Agent 模式操作：$action。请使用 start、status、launch、tap、swipe、key、text、sequence、screenshot 或 stop。", "unsupported_action").also {
                 captureAgentModeFailed(
                     settings = settings,
                     action = action.ifBlank { "unknown" },
@@ -540,7 +574,7 @@ class AgentModeController(
                 throw throwable
             }
         val captureId = "capture-${System.currentTimeMillis()}"
-        val previewPath = File(cacheDirectory, "$captureId.png").absolutePath
+        val previewPath = File(cacheDirectory, "$captureId.jpg").absolutePath
         runCatching { File(previewPath).writeBytes(bytes) }
             .onFailure { throwable ->
                 Log.e(TAG, "Failed to write Agent Mode preview image to $previewPath", throwable)
@@ -552,21 +586,17 @@ class AgentModeController(
                     cause = throwable,
                 )
             }
-        runCatching { File(cacheDirectory, "latest.png").writeBytes(bytes) }
+        runCatching { File(cacheDirectory, "latest.jpg").writeBytes(bytes) }
             .onFailure { throwable -> Log.w(TAG, "Failed to update latest Agent Mode preview cache.", throwable) }
-        val workspacePath = "$workspaceDirectory/agent-mode/$captureId.png"
-        workspaceFileBridge.writeWorkspaceBytes(
-            absolutePath = workspacePath,
-            bytes = bytes,
-        ).getOrElse { throwable ->
-            Log.e(TAG, "Failed to write Agent Mode screenshot to workspace: $workspacePath", throwable)
-            throwAgentModeError(
-                code = "workspace_screenshot_write_failed",
-                message = "截图已生成，但无法写入工作区文件。",
-                suggestion = "请检查工作区目录是否可写，或重新选择可访问的工作区后重试。",
-                developerDetail = throwable.message.orEmpty(),
-                cause = throwable,
-            )
+        val workspacePath = "$workspaceDirectory/agent-mode/$captureId.jpg"
+        // 异步写入工作区文件，不阻塞截图响应返回给模型
+        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+            workspaceFileBridge.writeWorkspaceBytes(
+                absolutePath = workspacePath,
+                bytes = bytes,
+            ).onFailure { throwable ->
+                Log.e(TAG, "Failed to write Agent Mode screenshot to workspace: $workspacePath", throwable)
+            }
         }
         val displayId = shizukuDisplayId
         val state = _displayState.value
@@ -582,16 +612,26 @@ class AgentModeController(
             lastUpdatedMillis = System.currentTimeMillis(),
             status = "已捕获 Agent 模式截图。",
         )
+        // 空白占位图检测：如果截图 < 15KB，说明虚拟显示尚无实际内容渲染
+        val isBlankPlaceholder = bytes.size < 15_000
         return JSONObject().apply {
             put("ok", true)
             put("display_id", displayId)
             put("width", state.width)
             put("height", state.height)
-            put("screenshot_path", workspacePath)
-            put("preview_path", previewPath)
-            put("screenshot_mime_type", "image/png")
-            put("screenshot_base64", Base64.encodeToString(bytes, Base64.NO_WRAP))
-            put("stdout", "Captured Agent Mode screenshot: $workspacePath")
+            if (isBlankPlaceholder) {
+                put("blank", true)
+                put("stdout", "The virtual display has no rendered content yet — the app is still loading. " +
+                    "Wait 2-3 seconds and then use action=screenshot to check again. Do NOT repeat the launch action.")
+            } else {
+                put("screenshot_path", workspacePath)
+                put("preview_path", previewPath)
+                put("screenshot_mime_type", "image/jpeg")
+                val annotatedBytes = annotateScreenshotWithCoordinateRulers(bytes, state.width, state.height)
+                put("screenshot_base64", Base64.encodeToString(annotatedBytes, Base64.NO_WRAP))
+                put("coordinate_space", "0-1000 normalized on both axes; top-left=(0,0) bottom-right=(1000,1000); minor ticks every 50, major ticks with labels every 100")
+                put("stdout", "Captured Agent Mode screenshot (${state.width}x${state.height}). Use the red ruler marks on edges to estimate tap coordinates in the 0-1000 space.")
+            }
         }.toString()
     }
 
@@ -612,7 +652,8 @@ class AgentModeController(
             ) {
                 service.capturePngPipe(displayId).use { descriptor ->
                     ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
-                        input.readBytes()
+                        input.readBytes().takeIf { it.isNotEmpty() }
+                            ?: error("Agent Mode screenshot returned 0 bytes.")
                     }
                 }
             }
@@ -729,26 +770,22 @@ class AgentModeController(
     }
 
     private fun unbindShizukuUserService() {
-        val args = shizukuServiceArgs
-        val connection = shizukuServiceConnection
-        if (args == null || connection == null) {
-            Log.d(TAG, "Shizuku user service unbind skipped: service was not bound.")
-            shizukuServiceArgs = null
-            shizukuServiceConnection = null
+        val process = shizukuProcess
+        if (process == null) {
+            Log.d(TAG, "Shizuku app_process stop skipped: process was not started.")
             return
         }
-        runCatching { Shizuku.unbindUserService(args, connection, true) }
+        runCatching { process.destroy() }
             .onFailure { throwable ->
-                Log.w(TAG, "Failed to unbind Shizuku Agent Mode user service.", throwable)
+                Log.w(TAG, "Failed to stop Shizuku Agent Mode app_process.", throwable)
                 _displayState.value = _displayState.value.copy(
                     errorCode = "shizuku_unbind_failed",
-                    userMessage = "Shizuku 服务解绑时出现异常，可能仍有残留连接。",
+                    userMessage = "Shizuku Agent 模式进程停止时出现异常，可能仍有残留连接。",
                     suggestion = "如再次启动失败，请重启 Shizuku 后重试。",
                     lastUpdatedMillis = System.currentTimeMillis(),
                 )
             }
-        shizukuServiceArgs = null
-        shizukuServiceConnection = null
+        shizukuProcess = null
     }
 
     private fun captureAgentModeFailed(
@@ -912,9 +949,9 @@ class AgentModeController(
         }
     }
 
-    private suspend fun requireShizukuService(): IAetherAgentModeService {
+    private suspend fun requireShizukuService(): IAetherAgentModeService = withContext(Dispatchers.IO) {
         val existing = shizukuService
-        if (existing != null) return existing
+        if (existing != null) return@withContext existing
         if (isConnectingShizukuService) {
             throwAgentModeError(
                 code = "shizuku_service_connecting",
@@ -954,75 +991,133 @@ class AgentModeController(
             throwAgentModeError("shizuku_permission_missing", "Aether 尚未获得 Shizuku 授权。", "请在 Shizuku 中授权 Aether，或点击授权按钮重新发起请求。")
         }
         isConnectingShizukuService = true
-        val deferred = CompletableDeferred<IAetherAgentModeService>()
-        val args = Shizuku.UserServiceArgs(
-            ComponentName(context, AetherAgentModeShizukuService::class.java),
-        )
-            .processNameSuffix("agentmode")
-            .daemon(false)
-        val connection = object : ServiceConnection {
-            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-                val bound = IAetherAgentModeService.Stub.asInterface(service)
-                if (bound == null) {
-                    val error = AgentModeUserFacingError(
-                        code = "shizuku_service_null_binder",
-                        message = "Shizuku 服务已连接，但返回的服务对象为空。",
-                        suggestion = "请重启 Shizuku 后重试；如果仍失败，请检查设备系统兼容性。",
-                    )
-                    Log.e(TAG, "Shizuku user service connected with null binder: $name")
-                    if (!deferred.isCompleted) deferred.completeExceptionally(AgentModeException(error))
-                    return
-                }
-                shizukuService = bound
-                _authorizationState.value = AgentModeAuthorizationState(
-                    issue = AgentModeAuthorizationIssue.Ready,
-                    detail = "Shizuku Agent 模式服务已连接。",
-                    errorCode = "shizuku_ready",
+        try {
+            val binder = startShizukuAgentModeProcess()
+            val service = IAetherAgentModeService.Stub.asInterface(binder)
+                ?: throwAgentModeError(
+                    code = "shizuku_service_null_binder",
+                    message = "Shizuku Agent 模式进程已启动，但返回的服务对象为空。",
+                    suggestion = "请重启 Shizuku 后重试；如果仍失败，请切换到 Root 授权模式。",
                 )
-                if (!deferred.isCompleted) {
-                    deferred.complete(bound)
-                }
+            runCatching {
+                service.asBinder().linkToDeath({ handleShizukuServiceDeath() }, 0)
+            }.onFailure { throwable ->
+                Log.w(TAG, "Unable to observe Shizuku Agent Mode app_process binder death.", throwable)
             }
-
-            override fun onServiceDisconnected(name: ComponentName?) {
-                Log.w(TAG, "Shizuku Agent Mode user service disconnected: $name")
-                shizukuService = null
-                shizukuDisplayId = null
-                _displayState.value = _displayState.value.copy(
-                    isActive = false,
-                    isConnecting = false,
-                    displayId = null,
-                    status = "Shizuku Agent 模式服务已断开。",
-                    errorCode = "shizuku_service_disconnected",
-                    userMessage = "Shizuku 服务连接已断开，当前虚拟显示不可继续使用。",
-                    suggestion = "请确认 Shizuku 仍在运行，然后重新启动 Agent 模式。",
-                    lastUpdatedMillis = System.currentTimeMillis(),
-                )
+            shizukuService = service
+            _authorizationState.value = AgentModeAuthorizationState(
+                issue = AgentModeAuthorizationIssue.Ready,
+                detail = "Shizuku Agent 模式服务已连接。",
+                errorCode = "shizuku_ready",
+            )
+            return@withContext service
+        } catch (timeout: TimeoutException) {
+            val isMiui = isMiuiDevice()
+            val suggestion = if (isMiui) {
+                "当前设备为 MIUI/HyperOS 系统，已绕过 Shizuku UserService 启动器但 app_process 仍未返回服务连接。" +
+                    "请重启 Shizuku 后重试；若设备已 Root，切换到 Root 授权模式可继续绕过系统兼容性问题。"
+            } else {
+                "请检查 Shizuku 是否正在运行，重启 Shizuku 后再试。"
             }
-        }
-        return try {
-            shizukuServiceArgs = args
-            shizukuServiceConnection = connection
-            runCatching { Shizuku.bindUserService(args, connection) }.getOrElse { throwable ->
-                throwAgentModeError(
-                    code = "shizuku_bind_failed",
-                    message = "绑定 Shizuku Agent 模式服务失败。",
-                    suggestion = "请确认 Shizuku 正在运行且已授权 Aether；如果刚更新过应用，请重启 Shizuku 后重试。",
-                    developerDetail = throwable.message.orEmpty(),
-                    cause = throwable,
-                )
-            }
-            withTimeout(8_000) { deferred.await() }
-        } catch (timeout: TimeoutCancellationException) {
+            runCatching { shizukuProcess?.destroy() }
+            shizukuProcess = null
             throwAgentModeError(
-                code = "shizuku_bind_timeout",
-                message = "连接 Shizuku Agent 模式服务超时。",
-                suggestion = "请检查 Shizuku 是否正在运行，重启 Shizuku 后再试。",
+                code = if (isMiui) "shizuku_app_process_timeout_miui" else "shizuku_app_process_timeout",
+                message = "启动 Shizuku Agent 模式进程超时。",
+                suggestion = suggestion,
                 cause = timeout,
+            )
+        } catch (throwable: Throwable) {
+            if (throwable is AgentModeException) throw throwable
+            runCatching { shizukuProcess?.destroy() }
+            shizukuProcess = null
+            throwAgentModeError(
+                code = "shizuku_app_process_start_failed",
+                message = "启动 Shizuku Agent 模式进程失败。",
+                suggestion = "请确认 Shizuku 正在运行且已授权 Aether；如果刚更新过应用，请重启 Shizuku 后重试。",
+                developerDetail = throwable.message.orEmpty(),
+                cause = throwable,
             )
         } finally {
             isConnectingShizukuService = false
         }
+    }
+
+    /**
+     * 通过 Shizuku 的远程 app_process 能力启动 Agent Mode 进程并接收服务 Binder。
+     */
+    private fun startShizukuAgentModeProcess(): IBinder {
+        val token = UUID.randomUUID().toString()
+        val binderQueue = java.util.concurrent.ArrayBlockingQueue<IBinder>(1)
+        val workerThread = HandlerThread("aether-shizuku-agentmode-bind").apply { start() }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(receiverContext: Context?, intent: Intent?) {
+                if (intent?.action != AetherAgentModeProcessContract.ActionServiceStarted) return
+                if (intent.getStringExtra(AetherAgentModeProcessContract.ExtraToken) != token) return
+                val binder = intent.extras?.getBinder(AetherAgentModeProcessContract.ExtraBinder) ?: return
+                binderQueue.offer(binder)
+            }
+        }
+        try {
+            val filter = IntentFilter(AetherAgentModeProcessContract.ActionServiceStarted)
+            val handler = Handler(workerThread.looper)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, filter, null, handler, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                context.registerReceiver(receiver, filter, null, handler)
+            }
+            shizukuProcess = launchShizukuRemoteProcess(token)
+            return binderQueue.poll(15, TimeUnit.SECONDS)
+                ?: throw TimeoutException("Timed out waiting for Agent Mode app_process binder.")
+        } finally {
+            runCatching { context.unregisterReceiver(receiver) }
+            workerThread.quitSafely()
+        }
+    }
+
+    /**
+     * 反射调用 Shizuku.newProcess，直接运行 Aether 的 app_process 入口，避开 UserServiceStarter。
+     */
+    @SuppressLint("DiscouragedPrivateApi")
+    private fun launchShizukuRemoteProcess(token: String): Process {
+        val command = arrayOf(
+            "/system/bin/app_process",
+            "-Djava.class.path=${context.packageCodePath}",
+            "/system/bin",
+            AetherAgentModeProcessMain::class.java.name,
+            "--package=${context.packageName}",
+            "--token=$token",
+        )
+        val method = Shizuku::class.java.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java,
+        )
+        method.isAccessible = true
+        return method.invoke(null, command as Any, null, null) as? Process
+            ?: error("Shizuku.newProcess returned null.")
+    }
+
+    /**
+     * 处理 Shizuku app_process Binder 死亡，清理本地服务和虚拟显示状态。
+     */
+    private fun handleShizukuServiceDeath() {
+        Log.w(TAG, "Shizuku Agent Mode app_process binder died.")
+        shizukuService = null
+        shizukuProcess = null
+        shizukuDisplayId = null
+        _displayState.value = _displayState.value.copy(
+            isActive = false,
+            isConnecting = false,
+            displayId = null,
+            status = "Shizuku Agent 模式服务已断开。",
+            errorCode = "shizuku_service_disconnected",
+            userMessage = "Shizuku 服务连接已断开，当前虚拟显示不可继续使用。",
+            suggestion = "请确认 Shizuku 仍在运行，然后重新启动 Agent 模式。",
+            lastUpdatedMillis = System.currentTimeMillis(),
+        )
     }
 
     private suspend fun inspectAuthorization(settings: AppSettings): AgentModeAuthorizationState =
@@ -1213,6 +1308,62 @@ class AgentModeController(
     private fun normalizedY(value: Double): Int? =
         value.takeIf { !it.isNaN() }?.let { (it.coerceIn(0.0, 1000.0) * _displayState.value.height / 1000.0).toInt() }
 
+    /**
+     * 批量执行多个 Agent Mode 步骤，跳过中间截图，只在全部完成后统一截图一次。
+     * 每步之间插入短暂延迟确保 UI 响应。
+     */
+    private suspend fun executeSequence(
+        settings: AppSettings,
+        displayId: Int,
+        steps: org.json.JSONArray,
+    ) {
+        val service = requireAgentModeService(settings)
+        for (i in 0 until steps.length()) {
+            val step = steps.optJSONObject(i) ?: continue
+            val stepAction = step.optString("action").trim().lowercase()
+            val waitMs = step.optLong("wait_ms", step.optLong("waitMs", 0L))
+                .coerceIn(0L, 5_000L)
+            when (stepAction) {
+                "tap" -> {
+                    val x = normalizedX(step.optDouble("x", Double.NaN))
+                    val y = normalizedY(step.optDouble("y", Double.NaN))
+                    if (x != null && y != null) {
+                        service.tap(displayId, x, y)
+                    }
+                }
+                "swipe" -> {
+                    val x1 = normalizedX(step.optDouble("x1", Double.NaN))
+                    val y1 = normalizedY(step.optDouble("y1", Double.NaN))
+                    val x2 = normalizedX(step.optDouble("x2", Double.NaN))
+                    val y2 = normalizedY(step.optDouble("y2", Double.NaN))
+                    val dur = step.optInt("duration_ms", step.optInt("durationMs", 500))
+                        .coerceIn(50, 10_000)
+                    if (x1 != null && y1 != null && x2 != null && y2 != null) {
+                        service.swipe(displayId, x1, y1, x2, y2, dur)
+                    }
+                }
+                "key" -> {
+                    val key = step.optString("key").trim()
+                    if (key.isNotBlank()) service.key(displayId, key)
+                }
+                "text" -> {
+                    val text = step.optString("text")
+                    if (text.isNotBlank()) service.text(displayId, text)
+                }
+                "wait" -> {
+                    // wait_ms 在下方统一处理
+                }
+                "launch" -> {
+                    val target = step.optString("target").trim()
+                    if (target.isNotBlank()) launchTarget(settings, target)
+                }
+                else -> Log.w(TAG, "Sequence step $i: unsupported action '$stepAction', skipped.")
+            }
+            if (waitMs > 0) delay(waitMs)
+            else if (stepAction != "wait") delay(150L)
+        }
+    }
+
     private fun throwAgentModeError(
         code: String,
         message: String,
@@ -1358,22 +1509,100 @@ class AgentModeController(
         put("stdout", "${error.message}${if (error.suggestion.isBlank()) "" else " ${error.suggestion}"}")
     }.toString()
 
-    private fun currentDeviceDisplaySpec(): DisplaySpec {
-        val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
-        val size = Point()
-        @Suppress("DEPRECATION")
-        display?.getRealSize(size)
-        val metrics = context.resources.displayMetrics
-        return DisplaySpec(
-            width = (display?.mode?.physicalWidth ?: size.x).takeIf { it > 0 }
-                ?: metrics.widthPixels.takeIf { it > 0 }
-                ?: FallbackAgentDisplayWidth,
-            height = (display?.mode?.physicalHeight ?: size.y).takeIf { it > 0 }
-                ?: metrics.heightPixels.takeIf { it > 0 }
-                ?: FallbackAgentDisplayHeight,
-            densityDpi = metrics.densityDpi.takeIf { it > 0 } ?: FallbackAgentDisplayDensityDpi,
-        )
+    /**
+     * 在截图边缘绘制归一化坐标刻度标注（0-1000），帮助模型精确估算点击位置。
+     * 仅用于发送给模型的 base64 截图，用户预览不受影响。
+     */
+    private fun annotateScreenshotWithCoordinateRulers(
+        pngBytes: ByteArray,
+        displayWidth: Int,
+        displayHeight: Int,
+    ): ByteArray {
+        val source = runCatching { BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size) }
+            .getOrNull() ?: return pngBytes
+        val bitmapWidth = source.width
+        val bitmapHeight = source.height
+        val mutable = source.copy(Bitmap.Config.ARGB_8888, true)
+        source.recycle()
+        val canvas = Canvas(mutable)
+
+        val tickLength = (bitmapWidth * 0.012f).coerceIn(4f, 12f)
+        val fontSize = (bitmapWidth * 0.018f).coerceIn(7f, 16f)
+
+        val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(200, 255, 60, 60)
+            strokeWidth = 1.5f
+            style = Paint.Style.STROKE
+        }
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(220, 255, 60, 60)
+            textSize = fontSize
+            isFakeBoldText = true
+        }
+        val bgPaint = Paint().apply {
+            color = Color.argb(120, 0, 0, 0)
+            style = Paint.Style.FILL
+        }
+
+        val step = 50
+        val majorStep = 100
+        for (tick in 0..1000 step step) {
+            val px = tick.toFloat() / 1000f * bitmapWidth
+            val isMajor = tick % majorStep == 0
+            val len = if (isMajor) tickLength else tickLength * 0.6f
+            // 顶部刻度
+            canvas.drawLine(px, 0f, px, len, tickPaint)
+            // 底部刻度
+            canvas.drawLine(px, bitmapHeight.toFloat(), px, bitmapHeight - len, tickPaint)
+            // 标注数字（每 100 一个）
+            if (isMajor) {
+                val label = tick.toString()
+                val tw = textPaint.measureText(label)
+                val lx = (px - tw / 2).coerceIn(0f, bitmapWidth - tw)
+                canvas.drawRect(lx - 1f, 0f, lx + tw + 1f, fontSize + 2f, bgPaint)
+                canvas.drawText(label, lx, fontSize, textPaint)
+            }
+        }
+        for (tick in 0..1000 step step) {
+            val py = tick.toFloat() / 1000f * bitmapHeight
+            val isMajor = tick % majorStep == 0
+            val len = if (isMajor) tickLength else tickLength * 0.6f
+            // 左侧刻度
+            canvas.drawLine(0f, py, len, py, tickPaint)
+            // 右侧刻度
+            canvas.drawLine(bitmapWidth.toFloat(), py, bitmapWidth - len, py, tickPaint)
+            // 标注数字（每 100 一个）
+            if (isMajor) {
+                val label = tick.toString()
+                val tw = textPaint.measureText(label)
+                val ly = (py + fontSize / 2).coerceIn(fontSize, bitmapHeight.toFloat())
+                canvas.drawRect(0f, ly - fontSize, tw + 2f, ly + 2f, bgPaint)
+                canvas.drawText(label, 1f, ly, textPaint)
+            }
+        }
+
+        return try {
+            java.io.ByteArrayOutputStream().use { output ->
+                mutable.compress(Bitmap.CompressFormat.JPEG, 85, output)
+                output.toByteArray().takeIf { it.isNotEmpty() } ?: pngBytes
+            }
+        } catch (_: Throwable) {
+            pngBytes
+        } finally {
+            mutable.recycle()
+        }
     }
+
+    /**
+     * 返回 Agent Mode 虚拟显示规格。
+     * 固定使用 900×1600@360dpi，不跟随设备物理分辨率，
+     * 以保证截图图片大小可控、模型坐标估算精度一致。
+     */
+    private fun currentDeviceDisplaySpec(): DisplaySpec = DisplaySpec(
+        width = AgentDisplayWidth,
+        height = AgentDisplayHeight,
+        densityDpi = AgentDisplayDensityDpi,
+    )
 
     private data class DisplaySpec(
         val width: Int,
@@ -1392,5 +1621,20 @@ class AgentModeController(
             .map(String::trim)
             .filter(String::isNotEmpty)
             .joinToString("\n")
+    }
+
+    /**
+     * 检测当前设备是否为 MIUI/HyperOS 系统。
+     * MIUI 的 LoadedApk.makeApplicationInner 存在已知空指针 bug，
+     * 会导致 Shizuku UserService 进程在 Application 创建阶段崩溃。
+     */
+    @SuppressLint("PrivateApi")
+    private fun isMiuiDevice(): Boolean {
+        return runCatching {
+            val clazz = Class.forName("android.os.SystemProperties")
+            val get = clazz.getMethod("get", String::class.java, String::class.java)
+            val result = get.invoke(null, "ro.miui.ui.version.name", "") as? String
+            result.isNullOrBlank().not()
+        }.getOrDefault(false)
     }
 }
