@@ -2,10 +2,10 @@ package com.zhousl.aether.data
 
 import android.content.Context
 import android.net.Uri
-import android.util.Log
 import android.webkit.MimeTypeMap
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
+import com.zhousl.aether.util.AetherLog
 import java.io.ByteArrayOutputStream
 import java.net.URLDecoder
 import java.nio.file.Paths
@@ -282,9 +282,14 @@ class WorkspaceFileBridge(
             val startedAtMillis = System.currentTimeMillis()
             val pathBase64 = encodeBase64(absolutePath)
             val expectedBytes = bytes.size.toLong()
-            Log.i(
+            val targetPathSummary = AetherLog.summarizePath(absolutePath)
+            AetherLog.event(
                 WorkspaceFileBridgeLogTag,
-                "upload start target=$absolutePath source_bytes=$expectedBytes",
+                event = "workspace_upload_start",
+                fields = mapOf(
+                    "source_bytes" to expectedBytes,
+                    "target" to targetPathSummary,
+                ),
             )
 
             executeUploadCommand(
@@ -338,10 +343,15 @@ class WorkspaceFileBridge(
                         "expected=$expectedBytes actual=${finalStatus?.destinationSizeBytes ?: bytesWritten} exists=${finalStatus?.destinationExists ?: false}"
                 )
             }
-            Log.i(
+            AetherLog.event(
                 WorkspaceFileBridgeLogTag,
-                "upload success target=$absolutePath source_bytes=$expectedBytes bytes_written=$bytesWritten " +
-                    "elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+                event = "workspace_upload_success",
+                fields = mapOf(
+                    "bytes_written" to bytesWritten,
+                    "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                    "source_bytes" to expectedBytes,
+                    "target" to targetPathSummary,
+                ),
             )
             bytesWritten
         }
@@ -365,11 +375,21 @@ class WorkspaceFileBridge(
         val ok = rawResult.optBoolean("ok")
         val message = rawResult.optString("errmsg")
         val timedOut = message.contains("Timed out waiting for Termux", ignoreCase = true)
-        Log.d(
+        val targetPathSummary = AetherLog.summarizePath(absolutePath)
+        AetherLog.event(
             WorkspaceFileBridgeLogTag,
-            "upload command result stage=$stage target=$absolutePath ok=$ok exit=${rawResult.optInt("exit_code", -1)} " +
-                "err=${rawResult.optInt("err", -1)} timed_out=$timedOut duration_ms=${rawResult.optLong("duration_ms", -1)} " +
-                "elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+            event = "workspace_upload_command_result",
+            fields = mapOf(
+                "duration_ms" to rawResult.optLong("duration_ms", -1),
+                "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                "err" to rawResult.optInt("err", -1),
+                "exit" to rawResult.optInt("exit_code", -1),
+                "ok" to ok,
+                "stage" to stage,
+                "target" to targetPathSummary,
+                "timed_out" to timedOut,
+            ),
+            level = AetherLog.Level.Debug,
         )
         if (ok) return rawResult
 
@@ -379,10 +399,17 @@ class WorkspaceFileBridge(
                 timeoutMillis = WorkspaceUploadVerificationTimeoutMillis,
                 predicate = verifier,
             )
-            Log.w(
+            AetherLog.event(
                 WorkspaceFileBridgeLogTag,
-                "upload timeout compensation stage=$stage target=$absolutePath verified=${verifiedStatus != null} " +
-                    "status=${verifiedStatus?.toLogString().orEmpty()} elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+                event = "workspace_upload_timeout_compensation",
+                fields = mapOf(
+                    "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                    "stage" to stage,
+                    "status" to verifiedStatus?.toLogString().orEmpty(),
+                    "target" to targetPathSummary,
+                    "verified" to (verifiedStatus != null),
+                ),
+                level = AetherLog.Level.Warn,
             )
             if (verifiedStatus != null) {
                 return rawResult.apply {
@@ -413,20 +440,30 @@ class WorkspaceFileBridge(
             if (status != null) {
                 lastStatus = status
                 if (predicate(status)) {
-                    Log.d(
+                    AetherLog.event(
                         WorkspaceFileBridgeLogTag,
-                        "upload verify matched target=$absolutePath status=${status.toLogString()} " +
-                            "elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+                        event = "workspace_upload_verify_matched",
+                        fields = mapOf(
+                            "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                            "status" to status.toLogString(),
+                            "target" to AetherLog.summarizePath(absolutePath),
+                        ),
+                        level = AetherLog.Level.Debug,
                     )
                     return status
                 }
             }
             delay(WorkspaceUploadVerificationIntervalMillis)
         }
-        Log.w(
+        AetherLog.event(
             WorkspaceFileBridgeLogTag,
-            "upload verify timeout target=$absolutePath last_status=${lastStatus?.toLogString().orEmpty()} " +
-                "elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+            event = "workspace_upload_verify_timeout",
+            fields = mapOf(
+                "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                "last_status" to lastStatus?.toLogString().orEmpty(),
+                "target" to AetherLog.summarizePath(absolutePath),
+            ),
+            level = AetherLog.Level.Warn,
         )
         return null
     }
@@ -455,16 +492,26 @@ class WorkspaceFileBridge(
             tmpPathSizeBytes = values["tmp_path_size_bytes"]?.toLongOrNull() ?: -1L,
             probeDurationMillis = rawResult.optLong("duration_ms", -1L),
         ).also { status ->
-            Log.d(
+            AetherLog.event(
                 WorkspaceFileBridgeLogTag,
-                "upload status target=$absolutePath ${status.toLogString()}",
+                event = "workspace_upload_status",
+                fields = mapOf(
+                    "status" to status.toLogString(),
+                    "target" to AetherLog.summarizePath(absolutePath),
+                ),
+                level = AetherLog.Level.Debug,
             )
         }
     }.onFailure { throwable ->
-        Log.w(
+        AetherLog.event(
             WorkspaceFileBridgeLogTag,
-            "upload status probe failed target=$absolutePath message=${throwable.message.orEmpty()}",
-            throwable,
+            event = "workspace_upload_status_failed",
+            fields = mapOf(
+                "message" to throwable.message.orEmpty(),
+                "target" to AetherLog.summarizePath(absolutePath),
+            ),
+            level = AetherLog.Level.Warn,
+            throwable = throwable,
         )
     }
 

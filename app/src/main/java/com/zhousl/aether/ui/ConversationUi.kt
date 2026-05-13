@@ -43,6 +43,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -167,10 +168,145 @@ private val ChatGptMotionEasing = CubicBezierEasing(0.22f, 0.84f, 0.18f, 1f)
 private const val ImeInsetStabilizationMillis = 90L
 private val ImeStabilizationMinVisibleHeight = 24.dp
 
+data class ConversationScreenState(
+    val conversationStateKey: String,
+    val messages: List<ChatMessage>,
+    val workspaceDirectory: String,
+    val pendingToolInvocations: List<ChatToolInvocation>,
+    val pendingToolInvocationStateKey: String,
+    val pendingResponseBlocks: List<AssistantResponseBlock>,
+    val pendingAssistantText: String,
+    val pendingStatusText: String,
+    val pendingStatusDetail: String,
+    val pendingInputs: List<PendingSessionInput>,
+    val inputValue: String,
+    val draftAttachments: List<ChatAttachment>,
+    val draftAttachmentRevision: Long,
+    val modelOptions: List<ProviderModelOption>,
+    val selectedModelKey: String,
+    val availableSkills: List<InstalledSkill>,
+    val availableMcpServers: List<McpServerConfig>,
+    val selectedSkillIds: List<String>,
+    val selectedMcpServerIds: List<String>,
+    val agentModeAvailable: Boolean,
+    val agentModeSelected: Boolean,
+    val agentModeDisplayState: AgentModeDisplayState,
+    val allowRootImageRead: Boolean,
+    val isEditing: Boolean,
+    val termuxSetupState: TermuxSetupState,
+    val showResumeSetupBanner: Boolean,
+    val showStarterPromptHint: Boolean,
+    val showTermuxSetupNotice: Boolean,
+    val isSending: Boolean,
+)
+
+data class ConversationScreenActions(
+    val onInputChanged: (String) -> Unit,
+    val onModelSelected: (String) -> Unit,
+    val onRemoveDraftAttachment: (String) -> Unit,
+    val onSetSkillSelected: (String, Boolean) -> Unit,
+    val onSetMcpServerSelected: (String, Boolean) -> Unit,
+    val onSetAgentModeSelected: (Boolean) -> Unit,
+    val onCancelEdit: () -> Unit,
+    val onSend: () -> Unit,
+    val onQueueFollowUp: () -> Unit,
+    val onSteerFollowUp: () -> Unit,
+    val onMenu: () -> Unit,
+    val onNewChat: () -> Unit,
+    val onPickImages: () -> Unit,
+    val onPickFiles: () -> Unit,
+    val onSaveAttachment: (ChatAttachment) -> Unit,
+    val onOpenLink: (String) -> Unit,
+    val onEditMessage: (String) -> Unit,
+    val onDeleteMessage: (String) -> Unit,
+    val onRedoAgentMessage: (String) -> Unit,
+    val onRetryUserMessage: (String) -> Unit,
+    val onSwitchUserMessageBranch: (String, Int) -> Unit,
+    val onCopyMessage: (ChatMessage) -> Unit,
+    val onRequestTermuxPermission: () -> Unit,
+    val onOpenAppPermissions: () -> Unit,
+    val onOpenTermuxSettings: () -> Unit,
+    val onOpenTermux: () -> Unit,
+    val onInstallTermux: () -> Unit,
+    val onRefreshTermuxSetup: () -> Unit,
+    val onPauseGeneration: () -> Unit,
+    val onResumeOnboarding: () -> Unit,
+    val onDismissStarterPromptHint: () -> Unit,
+)
+
 /**
- * 监听 IME 高度并配合输入框聚焦状态做稳定化处理。
- *
- * 当 [focused] 为 true 且 IME 高度高于 [ImeStabilizationMinVisibleHeight] 时立即返回当前高度；
+ * 将聚合后的会话状态和动作转发到内部渲染实现。
+ */
+@Composable
+fun ConversationScreen(
+    state: ConversationScreenState,
+    actions: ConversationScreenActions,
+) {
+    ConversationScreen(
+        conversationStateKey = state.conversationStateKey,
+        messages = state.messages,
+        workspaceDirectory = state.workspaceDirectory,
+        pendingToolInvocations = state.pendingToolInvocations,
+        pendingToolInvocationStateKey = state.pendingToolInvocationStateKey,
+        pendingResponseBlocks = state.pendingResponseBlocks,
+        pendingAssistantText = state.pendingAssistantText,
+        pendingStatusText = state.pendingStatusText,
+        pendingStatusDetail = state.pendingStatusDetail,
+        pendingInputs = state.pendingInputs,
+        inputValue = state.inputValue,
+        draftAttachments = state.draftAttachments,
+        draftAttachmentRevision = state.draftAttachmentRevision,
+        modelOptions = state.modelOptions,
+        selectedModelKey = state.selectedModelKey,
+        availableSkills = state.availableSkills,
+        availableMcpServers = state.availableMcpServers,
+        selectedSkillIds = state.selectedSkillIds,
+        selectedMcpServerIds = state.selectedMcpServerIds,
+        agentModeAvailable = state.agentModeAvailable,
+        agentModeSelected = state.agentModeSelected,
+        agentModeDisplayState = state.agentModeDisplayState,
+        allowRootImageRead = state.allowRootImageRead,
+        isEditing = state.isEditing,
+        termuxSetupState = state.termuxSetupState,
+        showResumeSetupBanner = state.showResumeSetupBanner,
+        showStarterPromptHint = state.showStarterPromptHint,
+        showTermuxSetupNotice = state.showTermuxSetupNotice,
+        onInputChanged = actions.onInputChanged,
+        onModelSelected = actions.onModelSelected,
+        onRemoveDraftAttachment = actions.onRemoveDraftAttachment,
+        onSetSkillSelected = actions.onSetSkillSelected,
+        onSetMcpServerSelected = actions.onSetMcpServerSelected,
+        onSetAgentModeSelected = actions.onSetAgentModeSelected,
+        onCancelEdit = actions.onCancelEdit,
+        onSend = actions.onSend,
+        onQueueFollowUp = actions.onQueueFollowUp,
+        onSteerFollowUp = actions.onSteerFollowUp,
+        onMenu = actions.onMenu,
+        onNewChat = actions.onNewChat,
+        onPickImages = actions.onPickImages,
+        onPickFiles = actions.onPickFiles,
+        onSaveAttachment = actions.onSaveAttachment,
+        onOpenLink = actions.onOpenLink,
+        onEditMessage = actions.onEditMessage,
+        onDeleteMessage = actions.onDeleteMessage,
+        onRedoAgentMessage = actions.onRedoAgentMessage,
+        onRetryUserMessage = actions.onRetryUserMessage,
+        onSwitchUserMessageBranch = actions.onSwitchUserMessageBranch,
+        onCopyMessage = actions.onCopyMessage,
+        onRequestTermuxPermission = actions.onRequestTermuxPermission,
+        onOpenAppPermissions = actions.onOpenAppPermissions,
+        onOpenTermuxSettings = actions.onOpenTermuxSettings,
+        onOpenTermux = actions.onOpenTermux,
+        onInstallTermux = actions.onInstallTermux,
+        onRefreshTermuxSetup = actions.onRefreshTermuxSetup,
+        onPauseGeneration = actions.onPauseGeneration,
+        onResumeOnboarding = actions.onResumeOnboarding,
+        onDismissStarterPromptHint = actions.onDismissStarterPromptHint,
+        isSending = state.isSending,
+    )
+}
+
+/**
  * 否则延迟 [ImeInsetStabilizationMillis] 毫秒确认输入法确实已收起，再回落到 0.dp。
  * 该延迟用于过滤弹层切换造成的瞬时 IME 抖动。
  */
@@ -237,7 +373,7 @@ private fun topOverlayTailGradient(): Brush = Brush.verticalGradient(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun ConversationScreen(
+private fun ConversationScreen(
     conversationStateKey: String,
     messages: List<ChatMessage>,
     workspaceDirectory: String,
@@ -837,13 +973,16 @@ private fun ConversationModelSelector(
                             .padding(vertical = 2.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        Column(
+                        LazyColumn(
                             modifier = Modifier
-                                .heightIn(max = 360.dp)
-                                .verticalScroll(rememberScrollState()),
+                                .fillMaxWidth()
+                                .heightIn(max = 360.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
-                            options.forEachIndexed { index, option ->
+                            itemsIndexed(
+                                items = options,
+                                key = { _, option -> option.key },
+                            ) { index, option ->
                                 val isSelected = option.key == selectedOption?.key
                                 Box(
                                     modifier = Modifier
@@ -1413,6 +1552,8 @@ private fun ConversationComposerBar(
     val stableImeVisible = stableImeBottom > ImeStabilizationMinVisibleHeight
     val selectedSkillSet = remember(selectedSkillIds) { selectedSkillIds.toSet() }
     val selectedMcpServerSet = remember(selectedMcpServerIds) { selectedMcpServerIds.toSet() }
+    val allSkillsSelected = availableSkills.isNotEmpty() && availableSkills.all { selectedSkillSet.contains(it.id) }
+    val allMcpServersSelected = availableMcpServers.isNotEmpty() && availableMcpServers.all { selectedMcpServerSet.contains(it.id) }
     val selectedSkillActions = remember(availableSkills, selectedSkillSet) {
         availableSkills.filter { selectedSkillSet.contains(it.id) }
     }
@@ -1805,6 +1946,8 @@ private fun ConversationComposerBar(
                                     .shadow(20.dp, RoundedCornerShape(30.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
                                     .clip(RoundedCornerShape(30.dp))
                                     .background(AetherSurface)
+                                    .heightIn(max = 420.dp)
+                                    .verticalScroll(rememberScrollState())
                                     .padding(horizontal = 12.dp, vertical = 12.dp),
                                 verticalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
@@ -1844,6 +1987,25 @@ private fun ConversationComposerBar(
                                         },
                                     )
                                 }
+                                if (availableSkills.isNotEmpty()) {
+                                    ComposerPlusMenuRow(
+                                        title = if (allSkillsSelected) {
+                                            if (strings.appLanguage == AppLanguage.SimplifiedChinese) "清空技能选择" else "Clear selected skills"
+                                        } else {
+                                            if (strings.appLanguage == AppLanguage.SimplifiedChinese) "全选技能" else "Select all skills"
+                                        },
+                                        icon = Icons.Rounded.Check,
+                                        selected = allSkillsSelected,
+                                        iconTint = Color(0xFF9C6B2F),
+                                        iconContainerColor = AetherSurfaceHigh,
+                                        onClick = {
+                                            attachmentMenuExpanded = false
+                                            availableSkills.forEach { skill ->
+                                                onSetSkillSelected(skill.id, !allSkillsSelected)
+                                            }
+                                        },
+                                    )
+                                }
                                 availableSkills.forEach { skill ->
                                     val selected = selectedSkillSet.contains(skill.id)
                                     ComposerPlusMenuRow(
@@ -1855,6 +2017,25 @@ private fun ConversationComposerBar(
                                         onClick = {
                                             attachmentMenuExpanded = false
                                             onSetSkillSelected(skill.id, !selected)
+                                        },
+                                    )
+                                }
+                                if (availableMcpServers.isNotEmpty()) {
+                                    ComposerPlusMenuRow(
+                                        title = if (allMcpServersSelected) {
+                                            if (strings.appLanguage == AppLanguage.SimplifiedChinese) "清空 MCP 选择" else "Clear selected MCP"
+                                        } else {
+                                            if (strings.appLanguage == AppLanguage.SimplifiedChinese) "全选 MCP" else "Select all MCP"
+                                        },
+                                        icon = Icons.Rounded.Check,
+                                        selected = allMcpServersSelected,
+                                        iconTint = Color(0xFF2A9C9A),
+                                        iconContainerColor = AetherSurfaceHigh,
+                                        onClick = {
+                                            attachmentMenuExpanded = false
+                                            availableMcpServers.forEach { server ->
+                                                onSetMcpServerSelected(server.id, !allMcpServersSelected)
+                                            }
                                         },
                                     )
                                 }

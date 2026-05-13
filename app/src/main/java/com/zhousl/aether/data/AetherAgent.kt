@@ -3,8 +3,10 @@ package com.zhousl.aether.data
 import android.os.SystemClock
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxFilesystemTool
+import com.zhousl.aether.util.AetherLog
 import java.io.File
 import java.util.Base64
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -20,6 +22,9 @@ private const val MaxSkillResourceBytes = 1024 * 1024
 private const val DefaultSkillResourceMaxChars = 20_000
 private const val SkillMetadataContextBudgetChars = 8_000
 private const val MaxSleepDurationMillis = 10 * 60 * 1000L
+private const val AetherAgentLogTag = "AetherAgent"
+private const val MaxStockCandleOutputCount = 200
+private const val QuoteStockCandleOutputCount = 5
 
 class AetherAgent(
     private val client: OpenAiCompatibleClient,
@@ -73,6 +78,7 @@ class AetherAgent(
             buildAnalyzeImageToolDefinition(),
             buildFetchWebUrlToolDefinition(),
             buildTavilySearchToolDefinition(),
+            buildStockMarketDataToolDefinition(),
             if (agentModeEnabled) buildAgentModeToolDefinition() else null,
         ).filterNotNull()
         val hasMcpCatalog = mcpToolBindings.isNotEmpty() ||
@@ -432,6 +438,7 @@ class AetherAgent(
                 settings = settings,
                 argumentsJson = toolCall.arguments,
             )
+            "stock_market_data" -> executeStockMarketData(toolCall.arguments)
             "run_tool_batch" -> executeRunToolBatch(
                 argumentsJson = toolCall.arguments,
                 settings = settings,
@@ -693,6 +700,13 @@ class AetherAgent(
         var reconnectFailures = 0
         var reconnectStatusVisible = false
         var currentParallelToolCallsEnabled = parallelToolCallsEnabled
+        val reconnectFields = buildStreamReconnectFields(
+            settings = settings,
+            conversation = conversation,
+            tools = tools,
+            toolChoice = toolChoice,
+            parallelToolCallsEnabled = parallelToolCallsEnabled,
+        )
 
         while (true) {
             var receivedTextThisAttempt = false
@@ -729,6 +743,17 @@ class AetherAgent(
 
             val failure = result.exceptionOrNull() ?: error("Streaming request failed without an exception.")
             if (currentParallelToolCallsEnabled && isParallelToolCallsUnsupportedFailure(failure)) {
+                AetherLog.event(
+                    AetherAgentLogTag,
+                    event = "agent_stream_parallel_tool_calls_restart",
+                    fields = reconnectFields + buildReconnectFailureFields(
+                        failure = failure,
+                        attemptNumber = reconnectFailures + 1,
+                        delayMillis = 0L,
+                        receivedText = receivedTextThisAttempt,
+                    ),
+                    level = AetherLog.Level.Warn,
+                )
                 if (receivedTextThisAttempt) {
                     onTextReset()
                 }
@@ -736,6 +761,17 @@ class AetherAgent(
                 throw ParallelToolCallsUnsupportedRestart()
             }
             if (!shouldReconnectLlmRequest(failure) || reconnectFailures >= LlmReconnectDelayScheduleMillis.size) {
+                AetherLog.event(
+                    AetherAgentLogTag,
+                    event = "agent_stream_reconnect_give_up",
+                    fields = reconnectFields + buildReconnectFailureFields(
+                        failure = failure,
+                        attemptNumber = reconnectFailures + 1,
+                        delayMillis = 0L,
+                        receivedText = receivedTextThisAttempt,
+                    ),
+                    level = AetherLog.Level.Warn,
+                )
                 if (reconnectStatusVisible) {
                     reconnectStatusVisible = false
                     onStreamingStatus(null)
@@ -748,6 +784,17 @@ class AetherAgent(
             }
             val attemptNumber = reconnectFailures + 1
             val reconnectDelayMillis = resolveReconnectDelayMillis(failure, reconnectFailures)
+            AetherLog.event(
+                AetherAgentLogTag,
+                event = "agent_stream_reconnect_scheduled",
+                fields = reconnectFields + buildReconnectFailureFields(
+                    failure = failure,
+                    attemptNumber = attemptNumber,
+                    delayMillis = reconnectDelayMillis,
+                    receivedText = receivedTextThisAttempt,
+                ),
+                level = AetherLog.Level.Warn,
+            )
             reconnectStatusVisible = true
             onStreamingStatus(
                 StreamingStatus(
@@ -764,6 +811,42 @@ class AetherAgent(
             reconnectFailures += 1
         }
     }
+
+    /**
+     * 构建流式重连日志字段，不包含对话正文或系统提示词。
+     */
+    private fun buildStreamReconnectFields(
+        settings: AppSettings,
+        conversation: List<JSONObject>,
+        tools: List<JSONObject>,
+        toolChoice: String?,
+        parallelToolCallsEnabled: Boolean,
+    ): Map<String, Any?> = mapOf(
+        "conversation_count" to conversation.size,
+        "max_attempts" to LlmReconnectDelayScheduleMillis.size,
+        "model" to settings.modelId,
+        "parallel_tool_calls" to parallelToolCallsEnabled,
+        "provider" to settings.provider.storageValue,
+        "tool_choice" to toolChoice.orEmpty(),
+        "tool_count" to tools.size,
+    )
+
+    /**
+     * 构建重连失败日志字段，仅记录异常类型与状态码，不记录错误正文。
+     */
+    private fun buildReconnectFailureFields(
+        failure: Throwable,
+        attemptNumber: Int,
+        delayMillis: Long,
+        receivedText: Boolean,
+    ): Map<String, Any?> = mapOf(
+        "attempt" to attemptNumber,
+        "delay_ms" to delayMillis,
+        "error_type" to failure.javaClass.simpleName.ifBlank { "Throwable" },
+        "http_status" to ((failure as? LlmHttpException)?.statusCode ?: -1),
+        "received_text" to receivedText,
+        "retry_after_ms" to (preferredRetryDelayMillis(failure) ?: -1),
+    )
 
     private fun formatReconnectFailureDetail(
         throwable: Throwable,
@@ -1300,6 +1383,309 @@ class AetherAgent(
         return response.toString()
     }
 
+    private suspend fun executeStockMarketData(argumentsJson: String): String {
+        val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
+            ?: return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Arguments were not valid JSON.")
+            }.toString()
+
+        val action = arguments.stringValue("action").lowercase(Locale.US).ifBlank {
+            if (arguments.stringValue("query").isNotBlank() && arguments.stringValue("symbol").isBlank()) {
+                "search"
+            } else {
+                "quote"
+            }
+        }
+
+        return when (action) {
+            "search" -> executeStockSearch(arguments)
+            "quote",
+            "chart" -> executeStockChart(arguments, action)
+            else -> JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Unsupported stock action '$action'. Use search, quote, or chart.")
+            }.toString()
+        }
+    }
+
+    private suspend fun executeStockSearch(arguments: JSONObject): String {
+        val query = arguments.stringValue("query").ifBlank { arguments.stringValue("symbol") }
+        if (query.isBlank()) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Missing required 'query' argument for stock search.")
+            }.toString()
+        }
+
+        val maxResults = arguments.intValue("max_results", "maxResults") ?: 10
+        val response = webToolsClient.searchStocks(
+            StockSearchRequest(
+                query = query,
+                maxResults = maxResults,
+            ),
+        ).getOrElse { throwable ->
+            return toolFailureOutput(throwable, "Stock search failed.") {
+                put("query", query)
+            }
+        }
+
+        return buildStockSearchOutput(
+            query = query,
+            maxResults = maxResults,
+            response = response,
+        ).toString()
+    }
+
+    private suspend fun executeStockChart(
+        arguments: JSONObject,
+        action: String,
+    ): String {
+        val symbol = arguments.stringValue("symbol").uppercase(Locale.US)
+        if (symbol.isBlank()) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Missing required 'symbol' argument for stock $action.")
+            }.toString()
+        }
+
+        val range = arguments.stringValue("range").ifBlank {
+            if (action == "quote") "1d" else "1mo"
+        }
+        val interval = arguments.stringValue("interval").ifBlank {
+            if (action == "quote") "1m" else "1d"
+        }
+        val includePrePost = arguments.booleanValue("include_pre_post", "includePrePost") ?: false
+        val response = webToolsClient.fetchStockChart(
+            StockChartRequest(
+                symbol = symbol,
+                range = range,
+                interval = interval,
+                includePrePost = includePrePost,
+            ),
+        ).getOrElse { throwable ->
+            return toolFailureOutput(throwable, "Stock data request failed.") {
+                put("symbol", symbol)
+            }
+        }
+
+        return buildStockChartOutput(
+            action = action,
+            symbol = symbol,
+            range = range,
+            interval = interval,
+            includePrePost = includePrePost,
+            response = response,
+        ).toString()
+    }
+
+    private fun buildStockSearchOutput(
+        query: String,
+        maxResults: Int,
+        response: JSONObject,
+    ): JSONObject {
+        val quotes = response
+            .optJSONObject("QuotationCodeTable")
+            ?.optJSONArray("Data")
+            ?: JSONArray()
+        val normalizedQuotes = JSONArray()
+        val limit = minOf(maxResults.coerceIn(1, 25), quotes.length())
+        for (index in 0 until limit) {
+            val quote = quotes.optJSONObject(index) ?: continue
+            normalizedQuotes.put(
+                JSONObject().apply {
+                    put("symbol", quote.optString("Code"))
+                    put("name", quote.optString("Name"))
+                    put("quote_id", quote.optString("QuoteID"))
+                    put("exchange", quote.optString("JYS"))
+                    put("market", quote.optString("MktNum"))
+                    put("market_type", quote.optString("MarketType"))
+                    put("security_type", quote.optString("SecurityTypeName"))
+                    put("classify", quote.optString("Classify"))
+                    put("pinyin", quote.optString("PinYin"))
+                }
+            )
+        }
+
+        return JSONObject().apply {
+            put("ok", true)
+            put("source", "Eastmoney")
+            put("action", "search")
+            put("query", query)
+            put("quotes", normalizedQuotes)
+            put(
+                "stdout",
+                if (normalizedQuotes.length() == 0) {
+                    "No stock symbols found for $query."
+                } else {
+                    "Found ${normalizedQuotes.length()} stock symbol(s) for $query."
+                },
+            )
+        }
+    }
+
+    private fun buildStockChartOutput(
+        action: String,
+        symbol: String,
+        range: String,
+        interval: String,
+        includePrePost: Boolean,
+        response: JSONObject,
+    ): JSONObject {
+        val quoteData = response
+            .getJSONObject("quote")
+            .getJSONObject("data")
+        val market = response.optString("market").ifBlank {
+            quoteData.optString("f107")
+        }
+
+        val metaOutput = JSONObject().apply {
+            put("currency", eastmoneyCurrency(market))
+            put("symbol", quoteData.optString("f57").ifBlank { response.optString("resolved_symbol") })
+            put("name", quoteData.optString("f58"))
+            put("market", market)
+            put("secid", response.optString("secid"))
+            quoteData.optNumberAsDouble("f86")?.let { put("regularMarketTime", it.toLong()) }
+            quoteData.optEastmoneyPrice("f43", market)?.let { put("regularMarketPrice", it) }
+            quoteData.optEastmoneyPrice("f60", market)?.let { put("previousClose", it) }
+            quoteData.optEastmoneyPrice("f44", market)?.let { put("regularMarketDayHigh", it) }
+            quoteData.optEastmoneyPrice("f45", market)?.let { put("regularMarketDayLow", it) }
+            quoteData.optEastmoneyPrice("f46", market)?.let { put("regularMarketOpen", it) }
+            quoteData.optNumberAsDouble("f47")?.let { put("regularMarketVolume", it) }
+            quoteData.optNumberAsDouble("f48")?.let { put("regularMarketAmount", it) }
+            quoteData.optNumberAsDouble("f116")?.let { put("marketCap", it) }
+            val price = optNumberAsDouble("regularMarketPrice")
+            val previousClose = optNumberAsDouble("previousClose")
+            if (price != null && previousClose != null && previousClose != 0.0) {
+                val change = price - previousClose
+                put("regularMarketChange", change)
+                put("regularMarketChangePercent", change / previousClose * 100.0)
+            }
+        }
+
+        val candles = JSONArray()
+        val rawKlines = response
+            .optJSONObject("kline")
+            ?.optJSONObject("data")
+            ?.optJSONArray("klines")
+            ?: JSONArray()
+        val candleOutputLimit = if (action == "quote") {
+            QuoteStockCandleOutputCount
+        } else {
+            response
+                .optInt("kline_limit", defaultStockCandleOutputLimit(range, interval))
+                .coerceIn(1, MaxStockCandleOutputCount)
+        }
+        val startIndex = maxOf(0, rawKlines.length() - candleOutputLimit)
+        for (index in startIndex until rawKlines.length()) {
+            parseEastmoneyKline(rawKlines.optString(index))?.let(candles::put)
+        }
+
+        return JSONObject().apply {
+            put("ok", true)
+            put("source", "Eastmoney")
+            put("action", action)
+            put("symbol", symbol)
+            put("secid", response.optString("secid"))
+            put("range", range)
+            put("interval", interval)
+            put("include_pre_post", includePrePost)
+            put("kline_begin_date", response.optString("kline_begin_date"))
+            put("kline_end_date", response.optString("kline_end_date"))
+            put("meta", metaOutput)
+            put("candles", candles)
+            put("candle_output_limit", candleOutputLimit)
+            put("truncated", rawKlines.length() > candleOutputLimit)
+            response.optString("kline_error").takeIf(String::isNotBlank)?.let { put("kline_error", it) }
+            put("stdout", buildStockChartSummary(symbol, metaOutput, candles.length(), range, interval))
+        }
+    }
+
+    private fun defaultStockCandleOutputLimit(
+        range: String,
+        interval: String,
+    ): Int {
+        val normalizedInterval = interval.trim().lowercase(Locale.US).ifBlank { "1d" }
+        val normalizedRange = range.trim().lowercase(Locale.US).ifBlank { "1mo" }
+        if (normalizedInterval in setOf("1m", "1min", "5m", "5min", "15m", "15min", "30m", "30min", "60m", "60min", "1h")) {
+            return MaxStockCandleOutputCount
+        }
+        return when (normalizedRange) {
+            "1d" -> 1
+            "5d" -> 5
+            "1mo" -> 31
+            "3mo" -> 93
+            "6mo" -> 186
+            else -> MaxStockCandleOutputCount
+        }
+    }
+
+    private fun parseEastmoneyKline(rawValue: String): JSONObject? {
+        val parts = rawValue.split(',')
+        if (parts.size < 7) return null
+        return JSONObject().apply {
+            put("date", parts[0])
+            parts.getOrNull(1)?.toDoubleOrNull()?.let { put("open", it) }
+            parts.getOrNull(2)?.toDoubleOrNull()?.let { put("close", it) }
+            parts.getOrNull(3)?.toDoubleOrNull()?.let { put("high", it) }
+            parts.getOrNull(4)?.toDoubleOrNull()?.let { put("low", it) }
+            parts.getOrNull(5)?.toDoubleOrNull()?.let { put("volume", it) }
+            parts.getOrNull(6)?.toDoubleOrNull()?.let { put("amount", it) }
+            parts.getOrNull(7)?.toDoubleOrNull()?.let { put("amplitude_percent", it) }
+            parts.getOrNull(8)?.toDoubleOrNull()?.let { put("change_percent", it) }
+            parts.getOrNull(9)?.toDoubleOrNull()?.let { put("change", it) }
+            parts.getOrNull(10)?.toDoubleOrNull()?.let { put("turnover_percent", it) }
+        }
+    }
+
+    private fun eastmoneyCurrency(market: String): String = when (market) {
+        "0", "1" -> "CNY"
+        "105" -> "USD"
+        "116" -> "HKD"
+        else -> ""
+    }
+
+    private fun buildStockChartSummary(
+        requestedSymbol: String,
+        meta: JSONObject,
+        candleCount: Int,
+        range: String,
+        interval: String,
+    ): String {
+        val symbol = meta.optString("symbol").ifBlank { requestedSymbol }
+        val currency = meta.optString("currency")
+        val price = meta.optNumberAsDouble("regularMarketPrice")
+        val change = meta.optNumberAsDouble("regularMarketChange")
+        val changePercent = meta.optNumberAsDouble("regularMarketChangePercent")
+        return buildString {
+            append(symbol)
+            if (price != null) {
+                append(" ")
+                append(formatStockNumber(price))
+                if (currency.isNotBlank()) {
+                    append(" ")
+                    append(currency)
+                }
+            }
+            if (change != null && changePercent != null) {
+                append(" (")
+                append(if (change >= 0) "+" else "")
+                append(formatStockNumber(change))
+                append(", ")
+                append(if (changePercent >= 0) "+" else "")
+                append(formatStockNumber(changePercent))
+                append("%)")
+            }
+            append("; candles=")
+            append(candleCount)
+            append(", range=")
+            append(range)
+            append(", interval=")
+            append(interval)
+            append(". Data may be delayed.")
+        }
+    }
+
     private suspend fun executeSleep(argumentsJson: String): String {
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
             ?: return JSONObject().apply {
@@ -1442,6 +1828,8 @@ class AetherAgent(
                 "For Mermaid, use fenced blocks like ```mermaid {height=360 scroll=true show-all=false}\\ngraph TD\\nA-->B\\n``` and the same width/height/min-height/max-height/scroll/show-all attributes apply. Users can tap rendered images to enlarge them. " +
                 "Use fetch_web_url when you need the contents of a specific webpage or the user gives you a URL. " +
                 "Use tavily_search for public-web discovery and fresh online information. " +
+                "Use stock_market_data for stock, ETF, index, or crypto symbol lookup, quotes, and chart/OHLCV data before falling back to web search. " +
+                "Stock market data can be delayed; do not present it as financial advice. " +
                 "For tavily_search, prefer a simple query plus include_domains or max_results when useful. " +
                 "Use either time_range or start_date/end_date, never both. " +
                 "Only set country when you know Tavily supports that lowercase country value, such as china or united states; otherwise leave it null. " +
@@ -1711,6 +2099,31 @@ class AetherAgent(
             }
         }
     }
+
+    private fun JSONObject.optNumberAsDouble(key: String): Double? {
+        if (!has(key) || isNull(key)) return null
+        return when (val value = opt(key)) {
+            is Number -> value.toDouble()
+            is String -> value.toDoubleOrNull()
+            else -> null
+        }
+    }
+
+    private fun JSONObject.optEastmoneyPrice(
+        key: String,
+        market: String,
+    ): Double? {
+        val rawValue = optNumberAsDouble(key) ?: return null
+        if (rawValue <= 0.0) return null
+        val divisor = when {
+            market == "105" && rawValue >= 10_000.0 -> 1_000.0
+            else -> 100.0
+        }
+        return rawValue / divisor
+    }
+
+    private fun formatStockNumber(value: Double): String =
+        String.format(Locale.US, "%.2f", value)
 
     private fun JSONObject.stringValue(
         primaryKey: String,
@@ -2056,6 +2469,23 @@ class AetherAgent(
             put("end_date", stringProperty("Optional end date in YYYY-MM-DD format. Do not combine this with time_range."))
         },
         required = listOf("query"),
+    )
+
+    private fun buildStockMarketDataToolDefinition(): JSONObject = buildToolDefinition(
+        name = "stock_market_data",
+        description = "Search stock symbols or fetch current quote and historical OHLCV chart data from Eastmoney public market data endpoints. Supports A-shares and many HK/US symbols. Data may be delayed and is not financial advice.",
+        properties = JSONObject().apply {
+            put("action", stringProperty("One of: search, quote, chart. Defaults to search when query is provided without symbol, otherwise quote."))
+            put("query", stringProperty("Search text for action=search, such as Apple, 贵州茅台, or BTC."))
+            put("symbol", stringProperty("Stock symbol or Eastmoney QuoteID/secid for quote/chart, such as 001896.SZ, 600519.SH, 0.001896, 105.AAPL, AAPL, or 00700.HK."))
+            put("range", stringProperty("Optional chart range, such as 1d, 5d, 1mo, 6mo, 1y, 5y, max. Defaults to 1d for quote and 1mo for chart."))
+            put("interval", stringProperty("Optional chart interval, such as 1m, 5m, 15m, 1h, 1d, 1wk, 1mo. Defaults to 1m for quote and 1d for chart."))
+            put("include_pre_post", booleanProperty("Whether to include pre-market and post-market data when available."))
+            put("includePrePost", booleanProperty("Alias of include_pre_post."))
+            put("max_results", integerProperty("For action=search, maximum number of symbol matches to return, between 1 and 25."))
+            put("maxResults", integerProperty("Alias of max_results."))
+        },
+        required = emptyList(),
     )
 
     private fun buildRunToolBatchToolDefinition(): JSONObject = buildToolDefinition(

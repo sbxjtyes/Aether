@@ -4,8 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
-import android.util.Log
-import com.zhousl.aether.BuildConfig
+import com.zhousl.aether.util.AetherLog
 
 class TermuxResultReceiver : BroadcastReceiver() {
     override fun onReceive(
@@ -42,8 +41,9 @@ class TermuxResultReceiver : BroadcastReceiver() {
 private fun Bundle.findFirstBundle(): Bundle? =
     keySet().firstNotNullOfOrNull(::getBundle)
 
+/**
+ * 输出 Termux 广播接收器调试日志，并交由统一日志工具脱敏。
+ */
 private fun logTermuxReceiver(message: String) {
-    if (BuildConfig.DEBUG) {
-        Log.d("AetherTermux", "receiver $message")
-    }
+    AetherLog.d("AetherTermux", "receiver $message")
 }

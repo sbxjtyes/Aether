@@ -1,5 +1,6 @@
 package com.zhousl.aether.data
 
+import com.zhousl.aether.util.AetherLog
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -46,69 +47,104 @@ class OpenAiCompatibleClient(
         toolChoice: String? = null,
         parallelToolCalls: Boolean? = null,
         disableReasoning: Boolean = false,
-    ): Result<ChatCompletionResult> = try {
-        val request = when (settings.provider) {
-            LlmProvider.OpenAiResponses -> buildOpenAiResponsesRequest(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = tools,
-                toolChoice = toolChoice,
-                parallelToolCalls = parallelToolCalls,
-                disableReasoning = disableReasoning,
-            )
+    ): Result<ChatCompletionResult> {
+        val startedAtMillis = monotonicTimeMillis()
+        val requestFields = buildLlmRequestFields(
+            settings = settings,
+            conversation = conversation,
+            tools = tools,
+            toolChoice = toolChoice,
+            parallelToolCalls = parallelToolCalls,
+            stream = false,
+            disableReasoning = disableReasoning,
+        )
+        AetherLog.event(LlmLogTag, event = "llm_chat_completion_start", fields = requestFields)
+        return try {
+            val request = when (settings.provider) {
+                LlmProvider.OpenAiResponses -> buildOpenAiResponsesRequest(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = tools,
+                    toolChoice = toolChoice,
+                    parallelToolCalls = parallelToolCalls,
+                    disableReasoning = disableReasoning,
+                )
 
-            LlmProvider.OpenAiCompatible -> buildOpenAiRequest(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = tools,
-                toolChoice = toolChoice,
-                parallelToolCalls = parallelToolCalls,
-                disableReasoning = disableReasoning,
-            )
+                LlmProvider.OpenAiCompatible -> buildOpenAiRequest(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = tools,
+                    toolChoice = toolChoice,
+                    parallelToolCalls = parallelToolCalls,
+                    disableReasoning = disableReasoning,
+                )
 
-            LlmProvider.VertexExpress -> buildVertexRequest(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = tools,
-                toolChoice = toolChoice,
-            )
+                LlmProvider.VertexExpress -> buildVertexRequest(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = tools,
+                    toolChoice = toolChoice,
+                )
 
-            LlmProvider.AnthropicMessages -> buildAnthropicMessagesRequest(
-                settings = settings,
-                systemPrompt = systemPrompt,
-                conversation = conversation,
-                tools = tools,
-                toolChoice = toolChoice,
-            )
-        }
+                LlmProvider.AnthropicMessages -> buildAnthropicMessagesRequest(
+                    settings = settings,
+                    systemPrompt = systemPrompt,
+                    conversation = conversation,
+                    tools = tools,
+                    toolChoice = toolChoice,
+                )
+            }
 
-        val responsePayload = executeRequest(request)
-        val json = parseJsonObject(responsePayload.bodyString)
+            val responsePayload = executeRequest(request)
+            val json = parseJsonObject(responsePayload.bodyString)
 
-        if (!responsePayload.isSuccessful) {
-            val errorMessage = extractLlmErrorMessage(json, responsePayload)
-            throw buildLlmRequestException(responsePayload, errorMessage)
-        }
+            if (!responsePayload.isSuccessful) {
+                val errorMessage = extractLlmErrorMessage(json, responsePayload)
+                throw buildLlmRequestException(responsePayload, errorMessage)
+            }
 
-        if (json == null) {
-            error(buildUnexpectedResponseMessage(responsePayload))
-        }
+            if (json == null) {
+                error(buildUnexpectedResponseMessage(responsePayload))
+            }
 
-        Result.success(
-            when (settings.provider) {
+            val result = when (settings.provider) {
                 LlmProvider.OpenAiResponses -> parseOpenAiResponses(json)
                 LlmProvider.OpenAiCompatible -> parseOpenAiChatCompletion(json)
                 LlmProvider.VertexExpress -> parseVertexGenerateContent(json)
                 LlmProvider.AnthropicMessages -> parseAnthropicMessage(json)
             }
-        )
-    } catch (cancellationException: CancellationException) {
-        throw cancellationException
-    } catch (throwable: Throwable) {
-        Result.failure(throwable)
+            AetherLog.event(
+                LlmLogTag,
+                event = "llm_chat_completion_success",
+                fields = requestFields + mapOf(
+                    "elapsed_ms" to (monotonicTimeMillis() - startedAtMillis),
+                    "http_status" to responsePayload.code,
+                    "tool_call_count" to result.toolCalls.size,
+                ),
+            )
+            Result.success(result)
+        } catch (cancellationException: CancellationException) {
+            AetherLog.event(
+                LlmLogTag,
+                event = "llm_chat_completion_cancelled",
+                fields = requestFields + mapOf(
+                    "elapsed_ms" to (monotonicTimeMillis() - startedAtMillis),
+                ),
+                level = AetherLog.Level.Warn,
+            )
+            throw cancellationException
+        } catch (throwable: Throwable) {
+            AetherLog.event(
+                LlmLogTag,
+                event = "llm_chat_completion_failed",
+                fields = requestFields + buildLlmFailureFields(throwable, startedAtMillis),
+                level = AetherLog.Level.Warn,
+            )
+            Result.failure(throwable)
+        }
     }
 
     suspend fun streamChatCompletion(
@@ -122,9 +158,20 @@ class OpenAiCompatibleClient(
         onReasoningDelta: suspend (String) -> Unit = {},
         onReasoningSummaryDelta: suspend (String) -> Unit = {},
         onStreamActivity: suspend () -> Unit = {},
-    ): Result<ChatCompletionResult> = try {
-        Result.success(
-            when (settings.provider) {
+    ): Result<ChatCompletionResult> {
+        val startedAtMillis = monotonicTimeMillis()
+        val requestFields = buildLlmRequestFields(
+            settings = settings,
+            conversation = conversation,
+            tools = tools,
+            toolChoice = toolChoice,
+            parallelToolCalls = parallelToolCalls,
+            stream = true,
+            disableReasoning = false,
+        )
+        AetherLog.event(LlmLogTag, event = "llm_stream_completion_start", fields = requestFields)
+        return try {
+            val result = when (settings.provider) {
                 LlmProvider.OpenAiResponses -> streamOpenAiResponses(
                     settings = settings,
                     systemPrompt = systemPrompt,
@@ -169,11 +216,34 @@ class OpenAiCompatibleClient(
                     onStreamActivity = onStreamActivity,
                 )
             }
-        )
-    } catch (cancellationException: CancellationException) {
-        throw cancellationException
-    } catch (throwable: Throwable) {
-        Result.failure(throwable)
+            AetherLog.event(
+                LlmLogTag,
+                event = "llm_stream_completion_success",
+                fields = requestFields + mapOf(
+                    "elapsed_ms" to (monotonicTimeMillis() - startedAtMillis),
+                    "tool_call_count" to result.toolCalls.size,
+                ),
+            )
+            Result.success(result)
+        } catch (cancellationException: CancellationException) {
+            AetherLog.event(
+                LlmLogTag,
+                event = "llm_stream_completion_cancelled",
+                fields = requestFields + mapOf(
+                    "elapsed_ms" to (monotonicTimeMillis() - startedAtMillis),
+                ),
+                level = AetherLog.Level.Warn,
+            )
+            throw cancellationException
+        } catch (throwable: Throwable) {
+            AetherLog.event(
+                LlmLogTag,
+                event = "llm_stream_completion_failed",
+                fields = requestFields + buildLlmFailureFields(throwable, startedAtMillis),
+                level = AetherLog.Level.Warn,
+            )
+            Result.failure(throwable)
+        }
     }
 
     fun buildConversation(
@@ -1549,6 +1619,49 @@ class OpenAiCompatibleClient(
             .build()
             .toString()
 
+    /**
+     * 构建不含请求正文、响应正文和凭据的 LLM 请求日志字段。
+     */
+    private fun buildLlmRequestFields(
+        settings: AppSettings,
+        conversation: List<JSONObject>,
+        tools: List<JSONObject>,
+        toolChoice: String?,
+        parallelToolCalls: Boolean?,
+        stream: Boolean,
+        disableReasoning: Boolean,
+    ): Map<String, Any?> = mapOf(
+        "base_host" to summarizeBaseHost(settings.baseUrl),
+        "conversation_count" to conversation.size,
+        "disable_reasoning" to disableReasoning,
+        "model" to settings.modelId,
+        "parallel_tool_calls" to parallelToolCalls,
+        "provider" to settings.provider.storageValue,
+        "stream" to stream,
+        "tool_choice" to toolChoice.orEmpty(),
+        "tool_count" to tools.size,
+    )
+
+    /**
+     * 构建不包含服务端响应内容的 LLM 失败日志字段。
+     */
+    private fun buildLlmFailureFields(
+        throwable: Throwable,
+        startedAtMillis: Long,
+    ): Map<String, Any?> = mapOf(
+        "elapsed_ms" to (monotonicTimeMillis() - startedAtMillis),
+        "error_type" to throwable.javaClass.simpleName.ifBlank { "Throwable" },
+        "http_status" to ((throwable as? LlmHttpException)?.statusCode ?: -1),
+        "retry_after_ms" to ((throwable as? LlmHttpException)?.retryAfterMillis ?: -1),
+    )
+
+    /**
+     * 提取 Base URL 主机名作为日志元数据，避免记录完整 URL。
+     */
+    private fun summarizeBaseHost(baseUrl: String): String =
+        runCatching { URI(baseUrl.trim()).host.orEmpty() }
+            .getOrDefault("")
+
     private companion object {
         val JsonMediaType = "application/json".toMediaType()
     }
@@ -2523,3 +2636,4 @@ private const val DefaultStreamingWriteTimeoutMillis = 30_000L
 private const val DefaultAnthropicMaxTokens = 4096
 private const val AnthropicVersion = "2023-06-01"
 private const val OpenAiResponsesItemsKey = "aether_response_items"
+private const val LlmLogTag = "AetherLLM"

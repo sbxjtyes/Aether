@@ -744,19 +744,23 @@ private fun ProviderSetupStep(
                             enabled = canContinueFromCredentials && !isLoadingModels,
                             onClick = {
                                 formState.isFetchingModelsLocally = true
-                                onFetchModels(formState.buildConfig()) { models ->
-                                    val ordered = prioritizedModelOptions(
-                                        provider = provider,
-                                        baseUrl = formState.baseUrl,
-                                        cachedModels = models,
-                                    )
-                                    formState.cachedModels = ordered
-                                    formState.enabledModelIds = ordered
-                                    if (ordered.isNotEmpty()) {
-                                        formState.modelId = ordered.first()
+                                runCatching {
+                                    onFetchModels(formState.buildConfig()) { models ->
+                                        val ordered = prioritizedModelOptions(
+                                            provider = provider,
+                                            baseUrl = formState.baseUrl,
+                                            cachedModels = models,
+                                        )
+                                        formState.cachedModels = ordered
+                                        formState.enabledModelIds = ordered
+                                        if (ordered.isNotEmpty()) {
+                                            formState.modelId = ordered.first()
+                                        }
+                                        formState.isFetchingModelsLocally = false
+                                        stage = ProviderTourStage.Model
                                     }
+                                }.onFailure {
                                     formState.isFetchingModelsLocally = false
-                                    stage = ProviderTourStage.Model
                                 }
                             },
                             isLoading = isLoadingModels,

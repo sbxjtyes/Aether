@@ -4,7 +4,6 @@ import android.app.Application
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.core.net.toUri
-import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zhousl.aether.BuildConfig
@@ -59,7 +58,9 @@ import com.zhousl.aether.data.resolveModelSettings
 import com.zhousl.aether.data.resolveStoredOrAutomaticModelKey
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
+import com.zhousl.aether.util.AetherLog
 import java.net.URI
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -101,6 +102,7 @@ class AetherViewModel(
     private var didEvaluateStartupUpdateCheck = false
     private var lastTrackedTermuxDetectedIssue: TermuxSetupIssue? = null
     private var pendingTermuxSetupSource: String? = null
+    private val activeModelFetchCount = AtomicInteger(0)
     @Volatile
     private var lastTermuxCommandSuccessAtMillis: Long = 0L
     private val _uiState = MutableStateFlow(AetherUiState())
@@ -1510,15 +1512,78 @@ class AetherViewModel(
         config: LlmProviderConfig,
         onComplete: (List<String>) -> Unit,
     ) {
-        _uiState.update { it.copy(isFetchingModels = true) }
+        updateModelFetchState(delta = 1)
         viewModelScope.launch {
-            val result = LlmApiClient.fetchModels(config)
-            _uiState.update { it.copy(isFetchingModels = false) }
-            onComplete(result.models)
-            if (result.error != null) {
-                _transientMessages.emit("Failed to fetch models: ${result.error}")
+            val startedAtMillis = System.currentTimeMillis()
+            AetherLog.event(
+                AetherViewModelLogTag,
+                event = "provider_model_fetch_start",
+                fields = providerModelFetchFields(config),
+            )
+            try {
+                val result = LlmApiClient.fetchModels(config)
+                onComplete(result.models)
+                AetherLog.event(
+                    AetherViewModelLogTag,
+                    event = if (result.error == null) {
+                        "provider_model_fetch_success"
+                    } else {
+                        "provider_model_fetch_partial_failure"
+                    },
+                    fields = providerModelFetchFields(config) + mapOf(
+                        "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                        "model_count" to result.models.size,
+                    ),
+                    level = if (result.error == null) AetherLog.Level.Info else AetherLog.Level.Warn,
+                )
+                if (result.error != null) {
+                    _transientMessages.emit("Failed to fetch models: ${result.error}")
+                }
+            } catch (throwable: Throwable) {
+                AetherLog.event(
+                    AetherViewModelLogTag,
+                    event = "provider_model_fetch_failed",
+                    fields = providerModelFetchFields(config) + mapOf(
+                        "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                        "error_type" to throwable.javaClass.simpleName,
+                    ),
+                    level = AetherLog.Level.Warn,
+                )
+                throw throwable
+            } finally {
+                updateModelFetchState(delta = -1)
             }
         }
+    }
+
+    /**
+     * 构建模型列表拉取日志字段，不包含 API Key 或完整 Base URL。
+     */
+    private fun providerModelFetchFields(config: LlmProviderConfig): Map<String, Any?> =
+        mapOf(
+            "base_host" to summarizeProviderBaseHost(config.baseUrl),
+            "config_id" to config.id,
+            "provider" to config.providerType.storageValue,
+        )
+
+    /**
+     * 提取 Provider Base URL 主机名，避免日志记录完整地址。
+     */
+    private fun summarizeProviderBaseHost(baseUrl: String): String =
+        runCatching { URI(baseUrl.trim()).host.orEmpty() }
+            .getOrDefault("")
+
+    /**
+     * 通过计数方式维护全局模型加载状态，避免并发刷新时提前关闭 loading。
+     */
+    private fun updateModelFetchState(delta: Int) {
+        val activeCount = activeModelFetchCount
+            .addAndGet(delta)
+            .coerceAtLeast(0)
+        if (delta < 0 && activeCount == 0) {
+            activeModelFetchCount.set(0)
+        }
+        _uiState.update { it.copy(isFetchingModels = activeCount > 0) }
     }
 
     private fun mergeFetchedModels(
@@ -1531,8 +1596,10 @@ class AetherViewModel(
             .map(String::trim)
             .filter(String::isNotEmpty)
             .distinct()
+        if (normalizedFetched.isEmpty()) return normalizedCurrent
+        val enabledModelSet = normalizedCurrent.enabledModelIds.toSet()
         val enabledModels = normalizedFetched.filter { modelId ->
-            normalizedCurrent.enabledModelIds.contains(modelId) || !previousModels.contains(modelId)
+            enabledModelSet.contains(modelId) || !previousModels.contains(modelId)
         }
         return normalizeProviderConfig(
             normalizedCurrent.copy(
@@ -2275,10 +2342,16 @@ class AetherViewModel(
         sessionId: String,
     ) {
         val startedAtMillis = System.currentTimeMillis()
-        Log.i(
+        AetherLog.event(
             AetherViewModelLogTag,
-            "Importing attachment '${attachment.name}' (${attachment.uri}) into workspace session=$sessionId " +
-                "attachment_id=${attachment.id} source_size=${attachment.sizeBytes ?: -1}",
+            event = "attachment_import_start",
+            fields = mapOf(
+                "attachment_id" to attachment.id,
+                "name" to attachment.name,
+                "session" to sessionId,
+                "source_size" to (attachment.sizeBytes ?: -1),
+                "uri" to AetherLog.summarizeUri(attachment.uri),
+            ),
         )
         val importResult = workspaceFileBridge.importAttachmentToWorkspace(
             sourceUri = attachment.uri.toUri(),
@@ -2288,20 +2361,36 @@ class AetherViewModel(
         )
 
         importResult.onSuccess { importedFile ->
-            Log.i(
+            AetherLog.event(
                 AetherViewModelLogTag,
-                "Imported attachment '${attachment.name}' into workspace path=${importedFile.absolutePath} " +
-                    "bytes=${importedFile.bytesCopied} elapsed_ms=${System.currentTimeMillis() - startedAtMillis}",
+                event = "attachment_import_success",
+                fields = mapOf(
+                    "attachment_id" to attachment.id,
+                    "bytes" to importedFile.bytesCopied,
+                    "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                    "name" to attachment.name,
+                    "path" to AetherLog.summarizePath(importedFile.absolutePath),
+                    "session" to sessionId,
+                ),
             )
         }
 
         importResult.exceptionOrNull()?.let { throwable ->
             val message = throwable.userFacingMessage()
-            Log.w(
+            AetherLog.event(
                 AetherViewModelLogTag,
-                "Failed to import attachment '${attachment.name}' (${attachment.uri}) into workspace session=$sessionId " +
-                    "source_size=${attachment.sizeBytes ?: -1} elapsed_ms=${System.currentTimeMillis() - startedAtMillis}: $message",
-                throwable,
+                event = "attachment_import_failed",
+                fields = mapOf(
+                    "attachment_id" to attachment.id,
+                    "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                    "message" to message,
+                    "name" to attachment.name,
+                    "session" to sessionId,
+                    "source_size" to (attachment.sizeBytes ?: -1),
+                    "uri" to AetherLog.summarizeUri(attachment.uri),
+                ),
+                level = AetherLog.Level.Warn,
+                throwable = throwable,
             )
             emitTransientMessage(
                 if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
@@ -2353,13 +2442,20 @@ class AetherViewModel(
             val updatedAttachments = current.draftAttachments.toMutableList().apply {
                 set(attachmentIndex, updatedAttachment)
             }
-            Log.i(
+            AetherLog.event(
                 AetherViewModelLogTag,
-                "Attachment import UI state update session=$sessionId attachment_id=${attachment.id} " +
-                    "index=$attachmentIndex success=${importResult.isSuccess} " +
-                    "state=${updatedAttachment.workspaceState} workspace_path=${updatedAttachment.workspacePath} " +
-                    "current_session=${current.currentSessionId} draft_workspace=${current.draftWorkspaceId} " +
-                    "editing_session=${current.editingSessionId}",
+                event = "attachment_import_ui_state_update",
+                fields = mapOf(
+                    "attachment_id" to attachment.id,
+                    "current_session" to current.currentSessionId,
+                    "draft_workspace" to current.draftWorkspaceId,
+                    "editing_session" to current.editingSessionId,
+                    "index" to attachmentIndex,
+                    "session" to sessionId,
+                    "state" to updatedAttachment.workspaceState,
+                    "success" to importResult.isSuccess,
+                    "workspace_path" to AetherLog.summarizePath(updatedAttachment.workspacePath),
+                ),
             )
             if (importResult.isSuccess) {
                 lastTermuxCommandSuccessAtMillis = System.currentTimeMillis()
@@ -2378,12 +2474,20 @@ class AetherViewModel(
 
         if (!didUpdateDraftAttachment) {
             val snapshot = _uiState.value
-            Log.w(
+            AetherLog.event(
                 AetherViewModelLogTag,
-                "Attachment import finished but draft attachment was not present for UI update " +
-                    "session=$sessionId attachment_id=${attachment.id} uri=${attachment.uri} success=${importResult.isSuccess} " +
-                    "current_session=${snapshot.currentSessionId} draft_workspace=${snapshot.draftWorkspaceId} " +
-                    "editing_session=${snapshot.editingSessionId} draft_count=${snapshot.draftAttachments.size}",
+                event = "attachment_import_missing_draft",
+                fields = mapOf(
+                    "attachment_id" to attachment.id,
+                    "current_session" to snapshot.currentSessionId,
+                    "draft_count" to snapshot.draftAttachments.size,
+                    "draft_workspace" to snapshot.draftWorkspaceId,
+                    "editing_session" to snapshot.editingSessionId,
+                    "session" to sessionId,
+                    "success" to importResult.isSuccess,
+                    "uri" to AetherLog.summarizeUri(attachment.uri),
+                ),
+                level = AetherLog.Level.Warn,
             )
         } else if (importResult.isSuccess) {
             emitTransientMessage(
@@ -2558,7 +2662,7 @@ class AetherViewModel(
             viewModelScope.launch(Dispatchers.IO) {
                 workspaceFileBridge.deleteWorkspace(sessionId)
                     .onFailure { throwable ->
-                        Log.w(
+                        AetherLog.w(
                             AetherViewModelLogTag,
                             "Failed to delete Termux workspace for session=$sessionId: ${throwable.message.orEmpty()}",
                             throwable,
@@ -2952,9 +3056,20 @@ class AetherViewModel(
         settings: AppSettings,
     ) {
         val titleInput = buildTitleGenerationInput(seedMessage)
-        if (titleInput.isBlank()) return
+        if (titleInput.isBlank()) {
+            AetherLog.event(
+                AetherViewModelLogTag,
+                event = "session_title_generation_skipped",
+                fields = mapOf(
+                    "reason" to "blank_input",
+                    "session" to sessionId,
+                ),
+            )
+            return
+        }
 
         viewModelScope.launch {
+            val startedAtMillis = System.currentTimeMillis()
             val providerConfigs = _uiState.value.providerConfigs
             val titleSettings = resolveModelSettings(
                 baseSettings = settings,
@@ -2963,33 +3078,106 @@ class AetherViewModel(
                 fallbackModelKey = resolveDefaultChatModelKey(settings, providerConfigs),
             )
             if (!isProviderSetupValid(titleSettings.provider, titleSettings.apiKey, titleSettings.baseUrl, titleSettings.modelId)) {
+                AetherLog.event(
+                    AetherViewModelLogTag,
+                    event = "session_title_generation_skipped",
+                    fields = sessionTitleGenerationFields(
+                        sessionId = sessionId,
+                        settings = titleSettings,
+                    ) + mapOf("reason" to "invalid_provider_setup"),
+                    level = AetherLog.Level.Warn,
+                )
                 return@launch
             }
+            AetherLog.event(
+                AetherViewModelLogTag,
+                event = "session_title_generation_start",
+                fields = sessionTitleGenerationFields(
+                    sessionId = sessionId,
+                    settings = titleSettings,
+                ) + mapOf(
+                    "attachment_count" to seedMessage.attachments.size,
+                    "input_chars" to titleInput.length,
+                ),
+            )
             val titleResult = client.createChatCompletion(
                 settings = titleSettings,
                 systemPrompt = SessionTitleSystemPrompt,
                 conversation = listOf(buildProviderUserMessage(titleSettings, titleInput)),
             )
+            titleResult.exceptionOrNull()?.let { throwable ->
+                AetherLog.event(
+                    AetherViewModelLogTag,
+                    event = "session_title_generation_failed",
+                    fields = sessionTitleGenerationFields(
+                        sessionId = sessionId,
+                        settings = titleSettings,
+                    ) + mapOf(
+                        "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                        "error_type" to throwable.javaClass.simpleName.ifBlank { "Throwable" },
+                    ),
+                    level = AetherLog.Level.Warn,
+                )
+                return@launch
+            }
             val title = titleResult.getOrNull()
                 ?.assistantText
                 ?.sanitizeGeneratedSessionTitle()
                 .orEmpty()
 
-            if (title.isBlank()) return@launch
+            if (title.isBlank()) {
+                AetherLog.event(
+                    AetherViewModelLogTag,
+                    event = "session_title_generation_empty",
+                    fields = sessionTitleGenerationFields(
+                        sessionId = sessionId,
+                        settings = titleSettings,
+                    ) + mapOf("elapsed_ms" to (System.currentTimeMillis() - startedAtMillis)),
+                    level = AetherLog.Level.Warn,
+                )
+                return@launch
+            }
 
+            var didApplyTitle = false
             updateSession(sessionId) { session ->
                 val firstUserMessage = session.messages.firstOrNull { it.author == MessageAuthor.User }
                 if (firstUserMessage?.id != seedMessage.id) {
                     null
                 } else {
+                    didApplyTitle = true
                     session.copy(
                         title = title,
                         hasCustomTitle = true,
                     )
                 }
             }
+            AetherLog.event(
+                AetherViewModelLogTag,
+                event = "session_title_generation_success",
+                fields = sessionTitleGenerationFields(
+                    sessionId = sessionId,
+                    settings = titleSettings,
+                ) + mapOf(
+                    "applied" to didApplyTitle,
+                    "elapsed_ms" to (System.currentTimeMillis() - startedAtMillis),
+                    "title_chars" to title.length,
+                ),
+            )
         }
     }
+
+    /**
+     * 构建会话标题生成日志字段，不包含用户消息正文或生成标题内容。
+     */
+    private fun sessionTitleGenerationFields(
+        sessionId: String,
+        settings: AppSettings,
+    ): Map<String, Any?> = mapOf(
+        "base_host" to summarizeProviderBaseHost(settings.baseUrl),
+        "model" to settings.modelId,
+        "provider" to settings.provider.storageValue,
+        "session" to sessionId,
+    )
 
     private fun buildTitleGenerationInput(
         message: ChatMessage,
@@ -3303,8 +3491,11 @@ class AetherViewModel(
         appendLine("rootReady=${snapshot.rootSetupState.isReady}")
         appendLine("agentModeAuthorized=${snapshot.agentModeAuthorizationState.isReady}")
         appendLine()
+        appendLine("recentAppLogs:")
+        appendLine(AetherLog.recentLogsForExport())
+        appendLine()
         appendLine("logcat:")
-        append(readLogcatDump())
+        append(AetherLog.sanitizeForExport(readLogcatDump()))
     }
 
     private fun readLogcatDump(): String {

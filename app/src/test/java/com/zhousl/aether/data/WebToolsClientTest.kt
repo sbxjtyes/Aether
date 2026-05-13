@@ -107,4 +107,131 @@ class WebToolsClientTest {
             server.shutdown()
         }
     }
+
+    @Test
+    fun stockSearchUsesEastmoneySuggestEndpoint() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "QuotationCodeTable": {
+                        "Data": [
+                          {
+                            "Code": "001896",
+                            "Name": "豫能控股",
+                            "QuoteID": "0.001896"
+                          }
+                        ],
+                        "Status": 0
+                      }
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.start()
+
+        try {
+            val client = WebToolsClient(stockBaseUrl = server.url("/").toString())
+            val response = client.searchStocks(
+                StockSearchRequest(
+                    query = "豫能控股",
+                    maxResults = 3,
+                ),
+            ).getOrThrow()
+
+            assertEquals(
+                "001896",
+                response.getJSONObject("QuotationCodeTable").getJSONArray("Data").getJSONObject(0).getString("Code"),
+            )
+
+            val request = server.takeRequest()
+            assertEquals("/api/suggest/get", request.requestUrl?.encodedPath)
+            assertEquals("豫能控股", request.requestUrl?.queryParameter("input"))
+            assertEquals("14", request.requestUrl?.queryParameter("type"))
+            assertEquals("3", request.requestUrl?.queryParameter("count"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun stockChartUsesEastmoneyQuoteAndKlineEndpoints() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "rc": 0,
+                      "data": {
+                        "f43": 1776,
+                        "f44": 1867,
+                        "f45": 1680,
+                        "f46": 1698,
+                        "f47": 2419721,
+                        "f48": 4328468428.5,
+                        "f57": "001896",
+                        "f58": "豫能控股",
+                        "f60": 1698,
+                        "f86": 1778657670,
+                        "f107": 0
+                      }
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "rc": 0,
+                      "data": {
+                        "code": "001896",
+                        "market": 0,
+                        "name": "豫能控股",
+                        "klines": [
+                          "2026-05-13,16.98,17.76,18.67,16.80,2419721,4328468428.50,11.01,4.59,0.78,15.86"
+                        ]
+                      }
+                    }
+                    """.trimIndent(),
+                ),
+        )
+        server.start()
+
+        try {
+            val client = WebToolsClient(stockBaseUrl = server.url("/").toString())
+            val response = client.fetchStockChart(
+                StockChartRequest(
+                    symbol = "001896.SZ",
+                    range = "1mo",
+                    interval = "1d",
+                ),
+            ).getOrThrow()
+
+            assertEquals("0.001896", response.getString("secid"))
+            assertEquals("001896", response.getJSONObject("quote").getJSONObject("data").getString("f57"))
+            assertEquals(31, response.getInt("kline_limit"))
+
+            val quoteRequest = server.takeRequest()
+            assertEquals("/api/qt/stock/get", quoteRequest.requestUrl?.encodedPath)
+            assertEquals("0.001896", quoteRequest.requestUrl?.queryParameter("secid"))
+
+            val klineRequest = server.takeRequest()
+            assertEquals("/api/qt/stock/kline/get", klineRequest.requestUrl?.encodedPath)
+            assertEquals("0.001896", klineRequest.requestUrl?.queryParameter("secid"))
+            assertEquals("101", klineRequest.requestUrl?.queryParameter("klt"))
+            assertEquals("31", klineRequest.requestUrl?.queryParameter("lmt"))
+            assertEquals(response.getString("kline_begin_date"), klineRequest.requestUrl?.queryParameter("beg"))
+            assertEquals(response.getString("kline_end_date"), klineRequest.requestUrl?.queryParameter("end"))
+        } finally {
+            server.shutdown()
+        }
+    }
 }

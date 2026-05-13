@@ -22,7 +22,6 @@ import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.util.Base64
 import android.view.Display
-import android.util.Log
 import androidx.core.content.getSystemService
 import com.rosan.app_process.AppProcess
 import com.zhousl.aether.agentmode.AetherAgentModeProcessContract
@@ -30,6 +29,7 @@ import com.zhousl.aether.agentmode.AetherAgentModeProcessMain
 import com.zhousl.aether.agentmode.AetherAgentModeShizukuService
 import com.zhousl.aether.agentmode.IAetherAgentModeService
 import com.zhousl.aether.termux.TermuxBashTool
+import com.zhousl.aether.util.AetherLog
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -166,7 +166,7 @@ class AgentModeController(
             }
         }
     private val shizukuBinderDeadListener = Shizuku.OnBinderDeadListener {
-        Log.w(TAG, "Shizuku binder died while Agent Mode was active.")
+        AetherLog.w(TAG, "Shizuku binder died while Agent Mode was active.")
         if (_authorizationState.value.issue != AgentModeAuthorizationIssue.Disabled) {
             _authorizationState.value = AgentModeAuthorizationState(
                 issue = AgentModeAuthorizationIssue.ShizukuNotRunning,
@@ -356,7 +356,7 @@ class AgentModeController(
             }
         }.getOrElse { throwable ->
             val userError = throwable.toAgentModeUserError(settings, action.ifBlank { "unknown" })
-            Log.e(TAG, "Agent Mode action '${action.ifBlank { "unknown" }}' failed: ${userError.developerDetail.ifBlank { throwable.message }}", throwable)
+            AetherLog.e(TAG, "Agent Mode action '${action.ifBlank { "unknown" }}' failed: ${userError.developerDetail.ifBlank { throwable.message }}", throwable)
             captureAgentModeFailed(
                 settings = settings,
                 action = action.ifBlank { "unknown" },
@@ -416,7 +416,7 @@ class AgentModeController(
                     "error" to (throwable.message ?: throwable.javaClass.simpleName),
                 ),
             )
-            Log.e(TAG, "Failed to request Shizuku permission.", throwable)
+            AetherLog.e(TAG, "Failed to request Shizuku permission.", throwable)
             AgentModeAuthorizationState(
                 issue = AgentModeAuthorizationIssue.Error,
                 detail = "无法拉起 Shizuku 授权请求。",
@@ -499,7 +499,7 @@ class AgentModeController(
         val displays = runCatching { currentDisplays(settings, state.displayId) }
             .onFailure { throwable ->
                 val userError = throwable.toAgentModeUserError(settings, "status")
-                Log.w(TAG, "Failed to refresh Agent Mode displays: ${userError.developerDetail}", throwable)
+                AetherLog.w(TAG, "Failed to refresh Agent Mode displays: ${userError.developerDetail}", throwable)
                 updateDisplayFailure(userError)
             }
             .getOrElse { currentDisplaysLocal(state.displayId) }
@@ -577,7 +577,7 @@ class AgentModeController(
         val previewPath = File(cacheDirectory, "$captureId.jpg").absolutePath
         runCatching { File(previewPath).writeBytes(bytes) }
             .onFailure { throwable ->
-                Log.e(TAG, "Failed to write Agent Mode preview image to $previewPath", throwable)
+                AetherLog.e(TAG, "Failed to write Agent Mode preview image to ${AetherLog.summarizePath(previewPath)}", throwable)
                 throwAgentModeError(
                     code = "preview_write_failed",
                     message = "截图已生成，但无法保存本地预览文件。",
@@ -587,7 +587,7 @@ class AgentModeController(
                 )
             }
         runCatching { File(cacheDirectory, "latest.jpg").writeBytes(bytes) }
-            .onFailure { throwable -> Log.w(TAG, "Failed to update latest Agent Mode preview cache.", throwable) }
+            .onFailure { throwable -> AetherLog.w(TAG, "Failed to update latest Agent Mode preview cache.", throwable) }
         val workspacePath = "$workspaceDirectory/agent-mode/$captureId.jpg"
         // 异步写入工作区文件，不阻塞截图响应返回给模型
         kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
@@ -595,7 +595,7 @@ class AgentModeController(
                 absolutePath = workspacePath,
                 bytes = bytes,
             ).onFailure { throwable ->
-                Log.e(TAG, "Failed to write Agent Mode screenshot to workspace: $workspacePath", throwable)
+                AetherLog.e(TAG, "Failed to write Agent Mode screenshot to workspace: ${AetherLog.summarizePath(workspacePath)}", throwable)
             }
         }
         val displayId = shizukuDisplayId
@@ -664,7 +664,7 @@ class AgentModeController(
     }
 
     private fun clearDeadAgentModeService(settings: AppSettings, cause: Throwable? = null) {
-        Log.w(TAG, "Agent Mode service connection is no longer usable.", cause)
+        AetherLog.w(TAG, "Agent Mode service connection is no longer usable.", cause)
         when (settings.agentModeAuthorizationMethod) {
             AgentModeAuthorizationMethod.Shizuku -> {
                 shizukuService = null
@@ -673,7 +673,7 @@ class AgentModeController(
             AgentModeAuthorizationMethod.Root -> {
                 rootService = null
                 runCatching { rootProcess?.close() }
-                    .onFailure { throwable -> Log.w(TAG, "Failed to close Root Agent Mode process after service death.", throwable) }
+                    .onFailure { throwable -> AetherLog.w(TAG, "Failed to close Root Agent Mode process after service death.", throwable) }
                 rootProcess = null
             }
         }
@@ -695,7 +695,7 @@ class AgentModeController(
         val displays = runCatching { currentDisplays(settings, state.displayId) }
             .onFailure { throwable ->
                 val userError = throwable.toAgentModeUserError(settings, "status")
-                Log.w(TAG, "Failed to query Agent Mode display status: ${userError.developerDetail}", throwable)
+                AetherLog.w(TAG, "Failed to query Agent Mode display status: ${userError.developerDetail}", throwable)
                 updateDisplayFailure(userError)
             }
             .getOrElse { currentDisplaysLocal(state.displayId) }
@@ -738,7 +738,7 @@ class AgentModeController(
     private fun releaseDisplay() {
         val displayId = shizukuDisplayId
         if (displayId == null) {
-            Log.i(TAG, "releaseDisplay ignored because no Agent Mode display is active.")
+            AetherLog.i(TAG, "releaseDisplay ignored because no Agent Mode display is active.")
             _displayState.value = _displayState.value.copy(
                 isActive = false,
                 isConnecting = false,
@@ -753,8 +753,8 @@ class AgentModeController(
         }
         val shizukuReleaseFailure = runCatching { shizukuService?.releaseDisplay(displayId) }.exceptionOrNull()
         val rootReleaseFailure = runCatching { rootService?.releaseDisplay(displayId) }.exceptionOrNull()
-        shizukuReleaseFailure?.let { Log.w(TAG, "Failed to release Shizuku Agent Mode display $displayId.", it) }
-        rootReleaseFailure?.let { Log.w(TAG, "Failed to release Root Agent Mode display $displayId.", it) }
+        shizukuReleaseFailure?.let { AetherLog.w(TAG, "Failed to release Shizuku Agent Mode display $displayId.", it) }
+        rootReleaseFailure?.let { AetherLog.w(TAG, "Failed to release Root Agent Mode display $displayId.", it) }
         shizukuDisplayId = null
         val releaseError = shizukuReleaseFailure ?: rootReleaseFailure
         _displayState.value = AgentModeDisplayState(
@@ -772,12 +772,12 @@ class AgentModeController(
     private fun unbindShizukuUserService() {
         val process = shizukuProcess
         if (process == null) {
-            Log.d(TAG, "Shizuku app_process stop skipped: process was not started.")
+            AetherLog.d(TAG, "Shizuku app_process stop skipped: process was not started.")
             return
         }
         runCatching { process.destroy() }
             .onFailure { throwable ->
-                Log.w(TAG, "Failed to stop Shizuku Agent Mode app_process.", throwable)
+                AetherLog.w(TAG, "Failed to stop Shizuku Agent Mode app_process.", throwable)
                 _displayState.value = _displayState.value.copy(
                     errorCode = "shizuku_unbind_failed",
                     userMessage = "Shizuku Agent 模式进程停止时出现异常，可能仍有残留连接。",
@@ -823,7 +823,7 @@ class AgentModeController(
                 parseDisplays(service.listDisplaysJson(), aetherDisplayId)
             }
         } catch (throwable: Throwable) {
-            Log.w(TAG, "Falling back to local display list because privileged display query failed.", throwable)
+            AetherLog.w(TAG, "Falling back to local display list because privileged display query failed.", throwable)
             currentDisplaysLocal(aetherDisplayId)
         }
     }
@@ -969,7 +969,7 @@ class AgentModeController(
             throwAgentModeError("shizuku_not_installed", "未安装 Shizuku，无法使用 Shizuku Agent 模式。", "请安装并启动 Shizuku，或切换到 Root 模式。")
         }
         val binderRunning = runCatching { Shizuku.pingBinder() }.getOrElse { throwable ->
-            Log.w(TAG, "Shizuku pingBinder failed.", throwable)
+            AetherLog.w(TAG, "Shizuku pingBinder failed.", throwable)
             false
         }
         if (!binderRunning) {
@@ -1002,7 +1002,7 @@ class AgentModeController(
             runCatching {
                 service.asBinder().linkToDeath({ handleShizukuServiceDeath() }, 0)
             }.onFailure { throwable ->
-                Log.w(TAG, "Unable to observe Shizuku Agent Mode app_process binder death.", throwable)
+                AetherLog.w(TAG, "Unable to observe Shizuku Agent Mode app_process binder death.", throwable)
             }
             shizukuService = service
             _authorizationState.value = AgentModeAuthorizationState(
@@ -1104,7 +1104,7 @@ class AgentModeController(
      * 处理 Shizuku app_process Binder 死亡，清理本地服务和虚拟显示状态。
      */
     private fun handleShizukuServiceDeath() {
-        Log.w(TAG, "Shizuku Agent Mode app_process binder died.")
+        AetherLog.w(TAG, "Shizuku Agent Mode app_process binder died.")
         shizukuService = null
         shizukuProcess = null
         shizukuDisplayId = null
@@ -1196,7 +1196,7 @@ class AgentModeController(
             )
         }
         val isRunning = runCatching { Shizuku.pingBinder() }
-            .onFailure { throwable -> Log.w(TAG, "Unable to ping Shizuku binder while inspecting authorization.", throwable) }
+            .onFailure { throwable -> AetherLog.w(TAG, "Unable to ping Shizuku binder while inspecting authorization.", throwable) }
             .getOrDefault(false)
         if (!isRunning) {
             return AgentModeAuthorizationState(
@@ -1222,7 +1222,7 @@ class AgentModeController(
                 )
             }
         }.getOrElse { throwable ->
-            Log.w(TAG, "Unable to inspect Shizuku permission.", throwable)
+            AetherLog.w(TAG, "Unable to inspect Shizuku permission.", throwable)
             AgentModeAuthorizationState(
                 issue = AgentModeAuthorizationIssue.Error,
                 detail = "无法读取 Shizuku 授权状态。",
@@ -1357,7 +1357,7 @@ class AgentModeController(
                     val target = step.optString("target").trim()
                     if (target.isNotBlank()) launchTarget(settings, target)
                 }
-                else -> Log.w(TAG, "Sequence step $i: unsupported action '$stepAction', skipped.")
+                else -> AetherLog.w(TAG, "Sequence step $i: unsupported action '$stepAction', skipped.")
             }
             if (waitMs > 0) delay(waitMs)
             else if (stepAction != "wait") delay(150L)

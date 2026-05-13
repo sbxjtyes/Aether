@@ -538,119 +538,123 @@ private fun AetherAppContent(
                     )
 
                     AppScreen.Chat -> ConversationScreen(
-                    conversationStateKey = uiState.currentSessionId,
-                    messages = currentMessages,
-                    workspaceDirectory = currentWorkspaceDirectory,
-                    pendingToolInvocations = pendingToolInvocations,
-                    pendingToolInvocationStateKey = "pending-tools-${uiState.currentSessionId}",
-                    pendingResponseBlocks = pendingResponseBlocks,
-                    pendingAssistantText = pendingAssistantText,
-                    pendingStatusText = currentSessionExecution?.pendingStatusText.orEmpty(),
-                    pendingStatusDetail = currentSessionExecution?.pendingStatusDetail.orEmpty(),
-                    pendingInputs = pendingInputs,
-                    inputValue = uiState.draftInput,
-                    draftAttachments = uiState.draftAttachments,
-                    draftAttachmentRevision = uiState.draftAttachmentRevision,
-                    modelOptions = conversationModelOptions,
-                    selectedModelKey = selectedConversationModelKey,
-                    availableSkills = uiState.installedSkills.filter { it.isEnabled },
-                    availableMcpServers = uiState.mcpServers.filter { it.isEnabled },
-                    selectedSkillIds = selectedSkillIds,
-                    selectedMcpServerIds = selectedMcpServerIds,
-                    agentModeAvailable = uiState.settings.agentModeAuthorizationEnabled,
-                    agentModeSelected = agentModeSelected,
-                    agentModeDisplayState = uiState.agentModeDisplayState,
-                    allowRootImageRead = uiState.rootSetupState.isReady ||
-                        (
-                            uiState.settings.agentModeAuthorizationEnabled &&
-                                uiState.settings.agentModeAuthorizationMethod == AgentModeAuthorizationMethod.Root &&
-                                uiState.agentModeAuthorizationState.isReady
+                        state = ConversationScreenState(
+                            conversationStateKey = uiState.currentSessionId,
+                            messages = currentMessages,
+                            workspaceDirectory = currentWorkspaceDirectory,
+                            pendingToolInvocations = pendingToolInvocations,
+                            pendingToolInvocationStateKey = "pending-tools-${uiState.currentSessionId}",
+                            pendingResponseBlocks = pendingResponseBlocks,
+                            pendingAssistantText = pendingAssistantText,
+                            pendingStatusText = currentSessionExecution?.pendingStatusText.orEmpty(),
+                            pendingStatusDetail = currentSessionExecution?.pendingStatusDetail.orEmpty(),
+                            pendingInputs = pendingInputs,
+                            inputValue = uiState.draftInput,
+                            draftAttachments = uiState.draftAttachments,
+                            draftAttachmentRevision = uiState.draftAttachmentRevision,
+                            modelOptions = conversationModelOptions,
+                            selectedModelKey = selectedConversationModelKey,
+                            availableSkills = uiState.installedSkills.filter { it.isEnabled },
+                            availableMcpServers = uiState.mcpServers.filter { it.isEnabled },
+                            selectedSkillIds = selectedSkillIds,
+                            selectedMcpServerIds = selectedMcpServerIds,
+                            agentModeAvailable = uiState.settings.agentModeAuthorizationEnabled,
+                            agentModeSelected = agentModeSelected,
+                            agentModeDisplayState = uiState.agentModeDisplayState,
+                            allowRootImageRead = uiState.rootSetupState.isReady ||
+                                (
+                                    uiState.settings.agentModeAuthorizationEnabled &&
+                                        uiState.settings.agentModeAuthorizationMethod == AgentModeAuthorizationMethod.Root &&
+                                        uiState.agentModeAuthorizationState.isReady
+                                    ),
+                            isEditing = uiState.editingMessageId != null,
+                            termuxSetupState = uiState.termuxSetupState,
+                            showResumeSetupBanner = shouldShowResumeSetupBanner(
+                                settings = uiState.settings,
+                                messageCount = currentMessages.size,
+                                draftInput = uiState.draftInput,
+                                hasDraftAttachments = uiState.draftAttachments.isNotEmpty(),
                             ),
-                    isEditing = uiState.editingMessageId != null,
-                    termuxSetupState = uiState.termuxSetupState,
-                    showResumeSetupBanner = shouldShowResumeSetupBanner(
-                        settings = uiState.settings,
-                        messageCount = currentMessages.size,
-                        draftInput = uiState.draftInput,
-                        hasDraftAttachments = uiState.draftAttachments.isNotEmpty(),
-                    ),
-                    showStarterPromptHint = uiState.showStarterPromptHint,
-                    showTermuxSetupNotice = !uiState.awaitingFollowUpTour && !uiState.showFollowUpTourCard,
-                    onInputChanged = viewModel::updateDraftInput,
-                    onModelSelected = viewModel::setCurrentChatModelSelection,
-                    onRemoveDraftAttachment = viewModel::removeDraftAttachment,
-                    onSetSkillSelected = viewModel::setComposerSkillSelected,
-                    onSetMcpServerSelected = viewModel::setComposerMcpServerSelected,
-                    onSetAgentModeSelected = viewModel::setComposerAgentModeSelected,
-                    onCancelEdit = viewModel::cancelMessageEdit,
-                    onSend = viewModel::sendCurrentMessage,
-                    onQueueFollowUp = viewModel::queueCurrentMessage,
-                    onSteerFollowUp = viewModel::steerCurrentMessage,
-                    onMenu = { scope.launch { drawerState.open() } },
-                    onNewChat = viewModel::startNewChat,
-                    onPickImages = {
-                        imagePicker.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                        )
-                    },
-                    onPickFiles = { filePicker.launch(arrayOf("*/*")) },
-                    onSaveAttachment = { attachment ->
-                        pendingSaveTarget = PendingSaveTarget.Attachment(attachment)
-                        saveAttachmentLauncher.launch(attachment.name)
-                    },
-                    onOpenLink = { rawLink ->
-                        scope.launch {
-                            handleAssistantLink(
-                                context = context,
-                                workspaceFileBridge = workspaceFileBridge,
-                                rawLink = rawLink,
-                                onSaveWorkspaceFile = {
-                                    pendingSaveTarget = PendingSaveTarget.WorkspaceFile(rawLink)
-                                    saveAttachmentLauncher.launch(
-                                        workspaceFileBridge.resolveWorkspaceDownloadName(rawLink)
+                            showStarterPromptHint = uiState.showStarterPromptHint,
+                            showTermuxSetupNotice = !uiState.awaitingFollowUpTour && !uiState.showFollowUpTourCard,
+                            isSending = isCurrentSessionRunning,
+                        ),
+                        actions = ConversationScreenActions(
+                            onInputChanged = viewModel::updateDraftInput,
+                            onModelSelected = viewModel::setCurrentChatModelSelection,
+                            onRemoveDraftAttachment = viewModel::removeDraftAttachment,
+                            onSetSkillSelected = viewModel::setComposerSkillSelected,
+                            onSetMcpServerSelected = viewModel::setComposerMcpServerSelected,
+                            onSetAgentModeSelected = viewModel::setComposerAgentModeSelected,
+                            onCancelEdit = viewModel::cancelMessageEdit,
+                            onSend = viewModel::sendCurrentMessage,
+                            onQueueFollowUp = viewModel::queueCurrentMessage,
+                            onSteerFollowUp = viewModel::steerCurrentMessage,
+                            onMenu = { scope.launch { drawerState.open() } },
+                            onNewChat = viewModel::startNewChat,
+                            onPickImages = {
+                                imagePicker.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            },
+                            onPickFiles = { filePicker.launch(arrayOf("*/*")) },
+                            onSaveAttachment = { attachment ->
+                                pendingSaveTarget = PendingSaveTarget.Attachment(attachment)
+                                saveAttachmentLauncher.launch(attachment.name)
+                            },
+                            onOpenLink = { rawLink ->
+                                scope.launch {
+                                    handleAssistantLink(
+                                        context = context,
+                                        workspaceFileBridge = workspaceFileBridge,
+                                        rawLink = rawLink,
+                                        onSaveWorkspaceFile = {
+                                            pendingSaveTarget = PendingSaveTarget.WorkspaceFile(rawLink)
+                                            saveAttachmentLauncher.launch(
+                                                workspaceFileBridge.resolveWorkspaceDownloadName(rawLink)
+                                            )
+                                        },
                                     )
-                                },
-                            )
-                        }
-                    },
-                    onEditMessage = { messageId ->
-                        activeSession?.let { viewModel.startEditingUserMessage(it.id, messageId) }
-                    },
-                    onDeleteMessage = { messageId ->
-                        activeSession?.let { viewModel.deleteMessage(it.id, messageId) }
-                    },
-                    onRedoAgentMessage = { messageId ->
-                        activeSession?.let { viewModel.redoAgentMessage(it.id, messageId) }
-                    },
-                    onRetryUserMessage = { messageId ->
-                        activeSession?.let { viewModel.retryUserMessage(it.id, messageId) }
-                    },
-                    onSwitchUserMessageBranch = { messageId, delta ->
-                        activeSession?.let { viewModel.switchUserMessageBranch(it.id, messageId, delta) }
-                    },
-                    onCopyMessage = { message ->
-                        clipboardManager.setText(AnnotatedString(message.text))
-                        Toast.makeText(context, strings.replyCopied, Toast.LENGTH_SHORT).show()
-                    },
-                    onRequestTermuxPermission = { requestTermuxPermission("chat_termux_permission") },
-                    onOpenAppPermissions = {
-                        startTermuxSetupAction("chat_app_permissions") { openAppPermissionSettings(context) }
-                    },
-                    onOpenTermuxSettings = {
-                        startTermuxSetupAction("chat_termux_settings") { openTermuxSettings(context) }
-                    },
-                    onOpenTermux = {
-                        startTermuxSetupAction("chat_open_termux") { openTermux(context) }
-                    },
-                    onInstallTermux = {
-                        startTermuxSetupAction("chat_install_termux") { openTermuxInstallPage(context) }
-                    },
-                    onRefreshTermuxSetup = viewModel::refreshTermuxSetup,
-                    onPauseGeneration = viewModel::pauseGeneration,
-                    onResumeOnboarding = viewModel::resumeOnboarding,
-                    onDismissStarterPromptHint = viewModel::dismissStarterPromptHint,
-                    isSending = isCurrentSessionRunning,
-                )
+                                }
+                            },
+                            onEditMessage = { messageId ->
+                                activeSession?.let { viewModel.startEditingUserMessage(it.id, messageId) }
+                            },
+                            onDeleteMessage = { messageId ->
+                                activeSession?.let { viewModel.deleteMessage(it.id, messageId) }
+                            },
+                            onRedoAgentMessage = { messageId ->
+                                activeSession?.let { viewModel.redoAgentMessage(it.id, messageId) }
+                            },
+                            onRetryUserMessage = { messageId ->
+                                activeSession?.let { viewModel.retryUserMessage(it.id, messageId) }
+                            },
+                            onSwitchUserMessageBranch = { messageId, delta ->
+                                activeSession?.let { viewModel.switchUserMessageBranch(it.id, messageId, delta) }
+                            },
+                            onCopyMessage = { message ->
+                                clipboardManager.setText(AnnotatedString(message.text))
+                                Toast.makeText(context, strings.replyCopied, Toast.LENGTH_SHORT).show()
+                            },
+                            onRequestTermuxPermission = { requestTermuxPermission("chat_termux_permission") },
+                            onOpenAppPermissions = {
+                                startTermuxSetupAction("chat_app_permissions") { openAppPermissionSettings(context) }
+                            },
+                            onOpenTermuxSettings = {
+                                startTermuxSetupAction("chat_termux_settings") { openTermuxSettings(context) }
+                            },
+                            onOpenTermux = {
+                                startTermuxSetupAction("chat_open_termux") { openTermux(context) }
+                            },
+                            onInstallTermux = {
+                                startTermuxSetupAction("chat_install_termux") { openTermuxInstallPage(context) }
+                            },
+                            onRefreshTermuxSetup = viewModel::refreshTermuxSetup,
+                            onPauseGeneration = viewModel::pauseGeneration,
+                            onResumeOnboarding = viewModel::resumeOnboarding,
+                            onDismissStarterPromptHint = viewModel::dismissStarterPromptHint,
+                        ),
+                    )
 
                     AppScreen.Settings -> SettingsScreen(
                     provider = uiState.settings.provider,

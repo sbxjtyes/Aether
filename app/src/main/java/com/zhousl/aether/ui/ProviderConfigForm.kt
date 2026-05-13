@@ -5,13 +5,17 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
@@ -19,6 +23,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -40,12 +46,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.LlmProvider
 import com.zhousl.aether.data.LlmProviderConfig
 import com.zhousl.aether.data.isProviderSetupValid
@@ -54,6 +64,7 @@ import com.zhousl.aether.data.requiresApiKey
 import com.zhousl.aether.data.sanitizeProviderId
 import com.zhousl.aether.ui.theme.AetherOnSurface
 import com.zhousl.aether.ui.theme.AetherOnSurfaceVariant
+import com.zhousl.aether.ui.theme.AetherSurface
 import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import java.util.UUID
 
@@ -167,38 +178,68 @@ class ProviderFormState internal constructor(
         }
     }
 
+    /**
+     * 批量更新当前可见模型的启用状态，避免逐项写入造成重复重组。
+     */
+    fun setAllModelsEnabled(
+        models: List<String>,
+        enabled: Boolean,
+    ) {
+        val normalizedModels = models
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .distinct()
+        enabledModelIds = if (enabled) {
+            normalizedModels
+        } else {
+            emptyList()
+        }
+    }
+
+    /**
+     * 应用远端拉取的模型列表，并在空结果时保留当前本地模型配置。
+     */
     fun applyFetchedModels(models: List<String>) {
         val normalizedCurrent = allModels.toSet()
         val normalizedModels = models
             .map(String::trim)
             .filter(String::isNotEmpty)
             .distinct()
+        if (normalizedModels.isEmpty()) return
+        val previouslyEnabledModels = enabledModelIds.toSet()
         cachedModels = normalizedModels
         enabledModelIds = normalizedModels.filter { model ->
-            enabledModelIds.contains(model) || !normalizedCurrent.contains(model)
+            previouslyEnabledModels.contains(model) || !normalizedCurrent.contains(model)
         }
-        if (modelId.trim().isBlank() || modelId !in (normalizedModels + modelId)) {
+        if (normalizedModels.isNotEmpty() && (modelId.trim().isBlank() || normalizedModels.none { it == modelId.trim() })) {
             modelId = normalizedModels.firstOrNull().orEmpty()
         }
     }
 
-    fun buildConfig(): LlmProviderConfig = LlmProviderConfig(
-        id = existingConfig?.id ?: UUID.randomUUID().toString(),
-        providerId = normalizedProviderId,
-        name = name.trim().ifBlank { selectedProvider.displayName },
-        providerType = selectedProvider,
-        apiKey = apiKey.trim(),
-        baseUrl = baseUrl.trim(),
-        modelId = effectiveModelId.ifBlank { selectedProvider.defaultModelId },
-        cachedModels = allModels,
-        enabledModelIds = enabledModelIds
-            .map(String::trim)
-            .filter { it.isNotEmpty() && allModels.contains(it) }
-            .distinct(),
-        isEnabled = existingConfig?.isEnabled ?: true,
-        basicFunctionCallingCompatibilityMode = basicFunctionCallingCompatibilityMode,
-        createdAtMillis = existingConfig?.createdAtMillis ?: System.currentTimeMillis(),
-    )
+    /**
+     * 构建可持久化的 Provider 配置，并复用模型集合以减少重复列表扫描。
+     */
+    fun buildConfig(): LlmProviderConfig {
+        val normalizedModels = allModels
+        val normalizedModelSet = normalizedModels.toSet()
+        return LlmProviderConfig(
+            id = existingConfig?.id ?: UUID.randomUUID().toString(),
+            providerId = normalizedProviderId,
+            name = name.trim().ifBlank { selectedProvider.displayName },
+            providerType = selectedProvider,
+            apiKey = apiKey.trim(),
+            baseUrl = baseUrl.trim(),
+            modelId = effectiveModelId.ifBlank { selectedProvider.defaultModelId },
+            cachedModels = normalizedModels,
+            enabledModelIds = enabledModelIds
+                .map(String::trim)
+                .filter { it.isNotEmpty() && normalizedModelSet.contains(it) }
+                .distinct(),
+            isEnabled = existingConfig?.isEnabled ?: true,
+            basicFunctionCallingCompatibilityMode = basicFunctionCallingCompatibilityMode,
+            createdAtMillis = existingConfig?.createdAtMillis ?: System.currentTimeMillis(),
+        )
+    }
 
     val normalizedProviderId: String
         get() = providerId.trim().sanitizeProviderId()
@@ -258,17 +299,19 @@ fun ProviderConfigurationForm(
     modifier: Modifier = Modifier,
     cardColor: Color = AetherSurfaceHigh,
 ) {
+    val strings = rememberAetherStrings()
     val selectedProvider = state.selectedProvider
     val normalizedProviderId = state.normalizedProviderId
     val existingProviderId = state.existingProviderId
     val normalizedExistingProviderIds = existingProviderIds.map { it.trim().sanitizeProviderId() }.toSet()
     val providerIdAlreadyUsed = normalizedProviderId in (normalizedExistingProviderIds - setOf(existingProviderId))
     val providerIdError = when {
-        normalizedProviderId.isBlank() -> "Provider ID is required."
-        !isValidProviderId(normalizedProviderId) -> "Use lowercase letters, numbers, and underscores only."
-        providerIdAlreadyUsed -> "This provider ID is already in use."
+        normalizedProviderId.isBlank() -> providerFormTr(strings, "Provider ID is required.", "Provider ID 不能为空。")
+        !isValidProviderId(normalizedProviderId) -> providerFormTr(strings, "Use lowercase letters, numbers, and underscores only.", "仅可使用小写字母、数字和下划线。")
+        providerIdAlreadyUsed -> providerFormTr(strings, "This provider ID is already in use.", "此 Provider ID 已被使用。")
         else -> ""
     }
+    var apiKeyVisible by rememberSaveable { mutableStateOf(false) }
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -276,7 +319,7 @@ fun ProviderConfigurationForm(
     ) {
         ProviderFormCard(cardColor = cardColor) {
             ProviderFormTextField(
-                label = "Provider name",
+                label = providerFormTr(strings, "Provider name", "Provider 名称"),
                 value = state.name,
                 onValueChange = state::updateName,
             )
@@ -299,7 +342,7 @@ fun ProviderConfigurationForm(
 
         ProviderFormCard(cardColor = cardColor) {
             ProviderFormDropdownField(
-                label = "Request format",
+                label = providerFormTr(strings, "Request format", "请求格式"),
                 selectedValue = selectedProvider.displayName,
                 options = LlmProvider.entries,
                 onSelected = state::applyProviderDefaults,
@@ -308,10 +351,10 @@ fun ProviderConfigurationForm(
 
         Text(
             text = when (selectedProvider) {
-                LlmProvider.OpenAiResponses -> "Use OpenAI-compatible /responses endpoints."
-                LlmProvider.OpenAiCompatible -> "Use OpenAI-compatible /chat/completions endpoints."
-                LlmProvider.VertexExpress -> "Use Vertex AI Express Mode generateContent."
-                LlmProvider.AnthropicMessages -> "Use Anthropic-compatible /messages endpoints."
+                LlmProvider.OpenAiResponses -> providerFormTr(strings, "Use OpenAI-compatible /responses endpoints.", "使用 OpenAI 兼容的 /responses 端点。")
+                LlmProvider.OpenAiCompatible -> providerFormTr(strings, "Use OpenAI-compatible /chat/completions endpoints.", "使用 OpenAI 兼容的 /chat/completions 端点。")
+                LlmProvider.VertexExpress -> providerFormTr(strings, "Use Vertex AI Express Mode generateContent.", "使用 Vertex AI Express Mode generateContent。")
+                LlmProvider.AnthropicMessages -> providerFormTr(strings, "Use Anthropic-compatible /messages endpoints.", "使用 Anthropic 兼容的 /messages 端点。")
             },
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
@@ -326,7 +369,11 @@ fun ProviderConfigurationForm(
         }
 
         Text(
-            text = "Compatibility mode uses basic function calling and disables parallel or batch tool features for providers with limited tool support.",
+            text = providerFormTr(
+                strings,
+                "Compatibility mode uses basic function calling and disables parallel or batch tool features for providers with limited tool support.",
+                "兼容模式会使用基础函数调用，并为工具支持有限的 Provider 禁用并行或批量工具功能。",
+            ),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -337,6 +384,21 @@ fun ProviderConfigurationForm(
                 label = "API Key",
                 value = state.apiKey,
                 onValueChange = { state.apiKey = it },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingContent = {
+                    IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
+                        Icon(
+                            imageVector = if (apiKeyVisible) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                            contentDescription = if (apiKeyVisible) {
+                                providerFormTr(strings, "Hide API key", "隐藏 API Key")
+                            } else {
+                                providerFormTr(strings, "Show API key", "显示 API Key")
+                            },
+                            tint = AetherOnSurfaceVariant,
+                        )
+                    }
+                },
             )
             ProviderFormDivider()
             ProviderFormTextField(
@@ -347,7 +409,7 @@ fun ProviderConfigurationForm(
             )
             ProviderFormDivider()
             ProviderFormTextField(
-                label = "Manual model ID",
+                label = providerFormTr(strings, "Manual model ID", "手动模型 ID"),
                 value = state.modelId,
                 onValueChange = { state.modelId = it },
             )
@@ -357,10 +419,17 @@ fun ProviderConfigurationForm(
                 enabledModelIds = state.enabledModelIds,
                 isFetchingModels = state.isFetchingModelsLocally || isFetchingModels,
                 onToggleModel = state::setModelEnabled,
+                onToggleAllModels = { enabled ->
+                    state.setAllModelsEnabled(state.allModels, enabled)
+                },
                 onFetchModels = {
                     state.isFetchingModelsLocally = true
-                    onFetchModels(state.buildConfig()) { models ->
-                        state.applyFetchedModels(models)
+                    runCatching {
+                        onFetchModels(state.buildConfig()) { models ->
+                            state.applyFetchedModels(models)
+                            state.isFetchingModelsLocally = false
+                        }
+                    }.onFailure {
                         state.isFetchingModelsLocally = false
                     }
                 },
@@ -369,9 +438,9 @@ fun ProviderConfigurationForm(
 
         Text(
             text = if (selectedProvider.requiresApiKey(state.baseUrl)) {
-                "Enabled models appear in the chat model picker. This request format requires an API key."
+                providerFormTr(strings, "Enabled models appear in the chat model picker. This request format requires an API key.", "已启用模型会显示在聊天模型选择器中。此请求格式需要 API Key。")
             } else {
-                "Enabled models appear in the chat model picker. Refresh loads models from the provider API."
+                providerFormTr(strings, "Enabled models appear in the chat model picker. Refresh loads models from the provider API.", "已启用模型会显示在聊天模型选择器中。刷新会从 Provider API 加载模型。")
             },
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
@@ -419,11 +488,18 @@ private fun providerFormStateSaver(
     },
 )
 
+/**
+ * 根据当前应用语言返回 Provider 表单文案。
+ */
+private fun providerFormTr(strings: AetherStrings, english: String, chinese: String): String =
+    if (strings.appLanguage == AppLanguage.SimplifiedChinese) chinese else english
+
 @Composable
 private fun ProviderCompatibilityModeField(
     enabled: Boolean,
     onEnabledChange: (Boolean) -> Unit,
 ) {
+    val strings = rememberAetherStrings()
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -434,13 +510,13 @@ private fun ProviderCompatibilityModeField(
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = "Basic tool compatibility",
+                text = providerFormTr(strings, "Basic tool compatibility", "基础工具兼容"),
                 style = MaterialTheme.typography.bodyLarge,
                 color = AetherOnSurface,
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = if (enabled) "On" else "Off",
+                text = if (enabled) providerFormTr(strings, "On", "开启") else providerFormTr(strings, "Off", "关闭"),
                 style = MaterialTheme.typography.bodySmall,
                 color = AetherOnSurfaceVariant,
             )
@@ -478,6 +554,8 @@ private fun ProviderFormTextField(
     onValueChange: (String) -> Unit,
     modifier: Modifier = Modifier,
     keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
+    trailingContent: (@Composable () -> Unit)? = null,
 ) {
     var fieldValue by rememberSaveable(label, stateSaver = TextFieldValue.Saver) {
         mutableStateOf(TextFieldValue(value, selection = TextRange(value.length)))
@@ -510,16 +588,23 @@ private fun ProviderFormTextField(
             textStyle = MaterialTheme.typography.bodyLarge.copy(color = AetherOnSurface),
             cursorBrush = SolidColor(ProviderFormPrimary),
             keyboardOptions = keyboardOptions,
+            visualTransformation = visualTransformation,
             decorationBox = { innerTextField ->
-                Box {
-                    if (fieldValue.text.isEmpty()) {
-                        Text(
-                            text = label,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = AetherOnSurfaceVariant.copy(alpha = 0.5f),
-                        )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        if (fieldValue.text.isEmpty()) {
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = AetherOnSurfaceVariant.copy(alpha = 0.5f),
+                            )
+                        }
+                        innerTextField()
                     }
-                    innerTextField()
+                    trailingContent?.invoke()
                 }
             },
         )
@@ -533,6 +618,7 @@ private fun ProviderFormDropdownField(
     options: List<LlmProvider>,
     onSelected: (LlmProvider) -> Unit,
 ) {
+    val strings = rememberAetherStrings()
     var expanded by remember { mutableStateOf(false) }
 
     Column(
@@ -559,14 +645,14 @@ private fun ProviderFormDropdownField(
             )
             Icon(
                 imageVector = Icons.Rounded.ArrowDropDown,
-                contentDescription = "Choose provider",
+                contentDescription = providerFormTr(strings, "Choose provider", "选择 Provider"),
                 tint = AetherOnSurfaceVariant,
             )
         }
         DropdownMenu(
             expanded = expanded,
             onDismissRequest = { expanded = false },
-            modifier = Modifier.background(Color.White),
+            modifier = Modifier.background(AetherSurface),
         ) {
             options.forEach { option ->
                 DropdownMenuItem(
@@ -592,8 +678,16 @@ private fun ProviderModelListField(
     enabledModelIds: List<String>,
     isFetchingModels: Boolean,
     onToggleModel: (String, Boolean) -> Unit,
+    onToggleAllModels: (Boolean) -> Unit,
     onFetchModels: () -> Unit,
 ) {
+    val strings = rememberAetherStrings()
+    val enabledModelIdSet = remember(enabledModelIds) { enabledModelIds.toSet() }
+    val enabledVisibleModelCount = remember(models, enabledModelIdSet) {
+        models.count(enabledModelIdSet::contains)
+    }
+    val allModelsEnabled = models.isNotEmpty() && enabledVisibleModelCount == models.size
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -606,16 +700,16 @@ private fun ProviderModelListField(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Model list",
+                    text = providerFormTr(strings, "Model list", "模型列表"),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     text = if (models.isEmpty()) {
-                        "No models loaded yet."
+                        providerFormTr(strings, "No models loaded yet.", "尚未加载模型。")
                     } else {
-                        "${enabledModelIds.size}/${models.size} enabled"
+                        providerFormTr(strings, "$enabledVisibleModelCount/${models.size} enabled", "已启用 $enabledVisibleModelCount/${models.size}")
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = AetherOnSurface,
@@ -631,7 +725,7 @@ private fun ProviderModelListField(
                 IconButton(onClick = onFetchModels) {
                     Icon(
                         imageVector = Icons.Rounded.Refresh,
-                        contentDescription = "Fetch models",
+                        contentDescription = providerFormTr(strings, "Fetch models", "获取模型"),
                         tint = ProviderFormPrimary,
                     )
                 }
@@ -640,17 +734,47 @@ private fun ProviderModelListField(
 
         if (models.isNotEmpty()) {
             Spacer(modifier = Modifier.height(10.dp))
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                models.forEach { model ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .clickable { onToggleAllModels(!allModelsEnabled) }
+                    .padding(horizontal = 2.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Checkbox(
+                    checked = allModelsEnabled,
+                    onCheckedChange = { checked -> onToggleAllModels(checked) },
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (allModelsEnabled) {
+                        providerFormTr(strings, "Clear all models", "清空全部模型")
+                    } else {
+                        providerFormTr(strings, "Select all models", "选择全部模型")
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = AetherOnSurface,
+                )
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 320.dp),
+                contentPadding = PaddingValues(vertical = 2.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                items(models, key = { it }) { model ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onToggleModel(model, !enabledModelIds.contains(model)) }
+                            .clickable { onToggleModel(model, !enabledModelIdSet.contains(model)) }
                             .padding(vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Checkbox(
-                            checked = enabledModelIds.contains(model),
+                            checked = enabledModelIdSet.contains(model),
                             onCheckedChange = { checked -> onToggleModel(model, checked) },
                         )
                         Spacer(modifier = Modifier.width(8.dp))

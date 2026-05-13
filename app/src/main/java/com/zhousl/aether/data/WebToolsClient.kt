@@ -1,6 +1,9 @@
 package com.zhousl.aether.data
 
 import com.vladsch.flexmark.html2md.converter.FlexmarkHtmlConverter
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -21,6 +24,12 @@ private const val MaxFetchMarkdownChars = 100_000
 private const val DefaultUserAgent =
     "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36"
 private const val DefaultTavilyBaseUrl = "https://api.tavily.com/"
+private const val DefaultStockSearchBaseUrl = "https://searchapi.eastmoney.com/"
+private const val DefaultStockQuoteBaseUrl = "https://push2delay.eastmoney.com/"
+private const val DefaultStockKlineBaseUrl = "https://push2his.eastmoney.com/"
+private const val EastmoneySuggestToken = "D43BF722C8E33BDC906FB84D85E326E8"
+private const val EastmoneyQuoteFields =
+    "f43,f44,f45,f46,f47,f48,f49,f57,f58,f60,f84,f85,f86,f107,f116,f117,f152"
 
 data class FetchedWebPage(
     val requestUrl: String,
@@ -47,6 +56,18 @@ data class TavilySearchRequest(
     val endDate: String? = null,
 )
 
+data class StockSearchRequest(
+    val query: String,
+    val maxResults: Int = 10,
+)
+
+data class StockChartRequest(
+    val symbol: String,
+    val range: String = "1d",
+    val interval: String = "1m",
+    val includePrePost: Boolean = false,
+)
+
 class WebToolsClient(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -57,6 +78,10 @@ class WebToolsClient(
         .followSslRedirects(true)
         .build(),
     private val tavilyBaseUrl: String = DefaultTavilyBaseUrl,
+    private val stockBaseUrl: String = "",
+    private val stockSearchBaseUrl: String = DefaultStockSearchBaseUrl,
+    private val stockQuoteBaseUrl: String = DefaultStockQuoteBaseUrl,
+    private val stockKlineBaseUrl: String = DefaultStockKlineBaseUrl,
 ) {
     private val htmlToMarkdownConverter = FlexmarkHtmlConverter.builder().build()
 
@@ -163,6 +188,188 @@ class WebToolsClient(
         }
     }
 
+    suspend fun searchStocks(
+        request: StockSearchRequest,
+    ): Result<JSONObject> = runCatching {
+        withContext(Dispatchers.IO) {
+            val query = request.query.trim()
+            if (query.isBlank()) {
+                error("Stock search query is required.")
+            }
+
+            val endpoint = buildStockEndpoint(resolveStockBaseUrl(stockSearchBaseUrl), "api", "suggest", "get") {
+                addQueryParameter("input", query)
+                addQueryParameter("type", "14")
+                addQueryParameter("token", EastmoneySuggestToken)
+                addQueryParameter("count", request.maxResults.coerceIn(1, 25).toString())
+            }
+            executeJsonGet(endpoint, "stock search")
+        }
+    }
+
+    suspend fun fetchStockChart(
+        request: StockChartRequest,
+    ): Result<JSONObject> = runCatching {
+        withContext(Dispatchers.IO) {
+            val symbol = request.symbol.trim()
+            if (symbol.isBlank()) {
+                error("Stock symbol is required.")
+            }
+
+            val resolvedSymbol = resolveEastmoneySecid(symbol)
+            val quoteEndpoint = buildStockEndpoint(resolveStockBaseUrl(stockQuoteBaseUrl), "api", "qt", "stock", "get") {
+                addQueryParameter("secid", resolvedSymbol.secid)
+                addQueryParameter("fields", EastmoneyQuoteFields)
+            }
+            val quoteJson = executeJsonGet(quoteEndpoint, "stock quote")
+            if (quoteJson.optInt("rc", -1) != 0 || quoteJson.optJSONObject("data") == null) {
+                error("Stock quote response did not include usable data for ${resolvedSymbol.secid}.")
+            }
+
+            val klineConfig = buildEastmoneyKlineConfig(request.range, request.interval)
+            val klineEndpoint = buildStockEndpoint(resolveStockBaseUrl(stockKlineBaseUrl), "api", "qt", "stock", "kline", "get") {
+                addQueryParameter("secid", resolvedSymbol.secid)
+                addQueryParameter("fields1", "f1,f2,f3,f4,f5,f6")
+                addQueryParameter("fields2", "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61")
+                addQueryParameter("klt", klineConfig.klt)
+                addQueryParameter("fqt", "1")
+                addQueryParameter("beg", klineConfig.beginDate)
+                addQueryParameter("end", klineConfig.endDate)
+                addQueryParameter("lmt", klineConfig.limit.toString())
+            }
+            val klineResult = runCatching { executeJsonGet(klineEndpoint, "stock kline") }
+
+            JSONObject().apply {
+                put("source", "Eastmoney")
+                put("resolved_symbol", resolvedSymbol.symbol)
+                put("secid", resolvedSymbol.secid)
+                put("market", resolvedSymbol.market)
+                put("range", request.range)
+                put("interval", request.interval)
+                put("klt", klineConfig.klt)
+                put("kline_limit", klineConfig.limit)
+                put("kline_begin_date", klineConfig.beginDate)
+                put("kline_end_date", klineConfig.endDate)
+                put("quote", quoteJson)
+                klineResult
+                    .onSuccess { put("kline", it) }
+                    .onFailure { throwable ->
+                        put("kline_error", throwable.message ?: "Stock kline request failed.")
+                    }
+            }
+        }
+    }
+
+    private fun resolveStockBaseUrl(defaultBaseUrl: String): String =
+        stockBaseUrl.trim().ifBlank { defaultBaseUrl }
+
+    private fun resolveEastmoneySecid(symbol: String): EastmoneySecid {
+        val normalized = symbol.trim().uppercase(Locale.US)
+        val directSecid = Regex("^(0|1|100|105|116)\\.([A-Z0-9.-]+)$").matchEntire(normalized)
+        if (directSecid != null) {
+            val market = directSecid.groupValues[1]
+            val code = directSecid.groupValues[2]
+            return EastmoneySecid(
+                symbol = code,
+                market = market,
+                secid = "$market.$code",
+            )
+        }
+
+        val code = normalized.substringBefore('.')
+        val suffix = normalized.substringAfter('.', "")
+
+        val market = when {
+            suffix in setOf("SZ", "XSHE") -> "0"
+            suffix in setOf("SS", "SH", "XSHG") -> "1"
+            suffix == "HK" -> "116"
+            suffix == "US" -> "105"
+            normalized.startsWith("^") -> "100"
+            normalized.matches(Regex("^6\\d{5}$")) -> "1"
+            normalized.matches(Regex("^[038]\\d{5}$")) -> "0"
+            normalized.matches(Regex("^\\d{5}$")) -> "116"
+            normalized.matches(Regex("^[A-Z][A-Z0-9.-]{0,9}$")) -> "105"
+            else -> ""
+        }
+
+        if (market.isBlank()) {
+            error("Unable to infer stock market for '$symbol'. Use search first, then pass the returned QuoteID/secid.")
+        }
+
+        return EastmoneySecid(
+            symbol = code,
+            market = market,
+            secid = "$market.$code",
+        )
+    }
+
+    private fun buildEastmoneyKlineConfig(
+        range: String,
+        interval: String,
+    ): EastmoneyKlineConfig {
+        val normalizedInterval = interval.trim().lowercase(Locale.US).ifBlank { "1d" }
+        val klt = when (normalizedInterval) {
+            "1m", "1min" -> "1"
+            "5m", "5min" -> "5"
+            "15m", "15min" -> "15"
+            "30m", "30min" -> "30"
+            "60m", "1h", "60min" -> "60"
+            "1wk", "1w", "week" -> "102"
+            "1mo", "1mon", "month" -> "103"
+            else -> "101"
+        }
+        val normalizedRange = range.trim().lowercase(Locale.US).ifBlank { "1mo" }
+        val today = LocalDate.now()
+        val beginDate = when (normalizedRange) {
+            "1d" -> today.minusDays(1)
+            "5d" -> today.minusDays(10)
+            "1mo" -> today.minusMonths(1)
+            "3mo" -> today.minusMonths(3)
+            "6mo" -> today.minusMonths(6)
+            "1y" -> today.minusYears(1)
+            "2y" -> today.minusYears(2)
+            "5y" -> today.minusYears(5)
+            "10y" -> today.minusYears(10)
+            "max" -> LocalDate.of(1990, 1, 1)
+            else -> today.minusMonths(6)
+        }.format(DateTimeFormatter.BASIC_ISO_DATE)
+        val limit = when {
+            klt in setOf("1", "5", "15", "30", "60") -> when (normalizedRange) {
+                "1d" -> 300
+                "5d" -> 1_500
+                "1mo" -> 2_000
+                else -> 2_000
+            }
+            normalizedRange == "5d" -> 5
+            normalizedRange == "1mo" -> 31
+            normalizedRange == "3mo" -> 93
+            normalizedRange == "6mo" -> 186
+            normalizedRange == "1y" -> 366
+            normalizedRange == "5y" -> 1_830
+            normalizedRange == "max" -> 10_000
+            else -> 200
+        }
+        return EastmoneyKlineConfig(
+            klt = klt,
+            limit = limit,
+            beginDate = beginDate,
+            endDate = today.format(DateTimeFormatter.BASIC_ISO_DATE),
+        )
+    }
+
+    private data class EastmoneySecid(
+        val symbol: String,
+        val market: String,
+        val secid: String,
+    )
+
+    private data class EastmoneyKlineConfig(
+        val klt: String,
+        val limit: Int,
+        val beginDate: String,
+        val endDate: String,
+    )
+
     private fun buildEndpoint(pathSegment: String): String {
         val baseUrl = tavilyBaseUrl.trim().toHttpUrlOrNull()
             ?: error("Tavily base URL is invalid.")
@@ -170,6 +377,45 @@ class WebToolsClient(
             .addPathSegments(pathSegment)
             .build()
             .toString()
+    }
+
+    private fun buildStockEndpoint(
+        baseUrlValue: String,
+        vararg pathSegments: String,
+        configure: okhttp3.HttpUrl.Builder.() -> Unit,
+    ): String {
+        val baseUrl = baseUrlValue.trim().toHttpUrlOrNull()
+            ?: error("Stock data base URL is invalid.")
+        return baseUrl.newBuilder()
+            .apply {
+                pathSegments.forEach { addPathSegment(it) }
+                configure()
+            }
+            .build()
+            .toString()
+    }
+
+    private fun executeJsonGet(
+        url: String,
+        label: String,
+    ): JSONObject {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", DefaultUserAgent)
+            .header("Accept", "application/json,text/plain,*/*")
+            .build()
+
+        httpClient.newCall(request).execute().use { response ->
+            val bodyString = response.body?.string().orEmpty()
+            val json = bodyString.toJsonObjectOrNull()
+            if (!response.isSuccessful) {
+                val detail = json?.optString("message").orEmpty()
+                    .ifBlank { json?.optString("description").orEmpty() }
+                    .ifBlank { "HTTP ${response.code} from $label endpoint." }
+                error(detail)
+            }
+            return json ?: error("$label endpoint returned non-JSON content.")
+        }
     }
 
     private fun normalizeUrl(url: String): String {

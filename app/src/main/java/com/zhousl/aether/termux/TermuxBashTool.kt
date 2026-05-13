@@ -5,9 +5,9 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.util.Log
 import androidx.core.content.ContextCompat
 import com.zhousl.aether.BuildConfig
+import com.zhousl.aether.util.AetherLog
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
@@ -1019,9 +1019,12 @@ class TermuxBashTool(
             .replace(Regex("\\s+"), " ")
             .take(120)
 
+/**
+ * 输出 Termux 命令调试日志，并交由统一日志工具脱敏。
+ */
 private fun logTermux(message: String) {
     if (EnableTermuxLogging) {
-        Log.d(TermuxLogTag, message)
+        AetherLog.d(TermuxLogTag, message)
     }
 }
 }

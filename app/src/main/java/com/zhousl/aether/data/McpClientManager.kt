@@ -1,8 +1,8 @@
 package com.zhousl.aether.data
 
-import android.util.Log
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
+import com.zhousl.aether.util.AetherLog
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -1177,9 +1177,12 @@ private fun validateMcpServerConfig(server: McpServerConfig) {
     }
 }
 
+/**
+ * 输出 MCP 调试日志，并交由统一日志工具脱敏。
+ */
 private fun logMcp(message: String) {
     if (EnableMcpLogging) {
-        Log.d(McpLogTag, message)
+        AetherLog.d(McpLogTag, message)
     }
 }
 
