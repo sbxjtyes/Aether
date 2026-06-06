@@ -10,7 +10,7 @@ import okhttp3.Request
 import org.json.JSONObject
 
 private const val GithubLatestReleaseUrl =
-    "https://api.github.com/repos/Zhou-Shilin/Aether/releases/latest"
+    "https://api.github.com/repos/sbxjtyes/Aether/releases/latest"
 private const val ApkMimeType = "application/vnd.android.package-archive"
 
 data class AppUpdateRelease(

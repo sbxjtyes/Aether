@@ -3523,7 +3523,7 @@ private fun AboutPage(
         Spacer(Modifier.height(24.dp))
 
         SettingsCardGroup {
-            AboutInfoRow(label = tr(strings, "Author", "作者"), value = "Zhou-Shilin")
+            AboutInfoRow(label = tr(strings, "Author", "作者"), value = "sbxjtyes")
             CardDivider()
             AboutInfoRow(label = tr(strings, "Version", "版本"), value = releaseLabel)
             CardDivider()

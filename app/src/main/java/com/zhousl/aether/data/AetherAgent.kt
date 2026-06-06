@@ -1,9 +1,12 @@
 package com.zhousl.aether.data
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.SystemClock
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxFilesystemTool
 import com.zhousl.aether.util.AetherLog
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Base64
 import java.util.Locale
@@ -1220,29 +1223,77 @@ class AetherAgent(
             }.toString()
         }
 
-        val payload = workspaceFileBridge.readWorkspaceFile(
+        // Try to read within the size limit. If the file is too large, fall back to
+        // an oversized read (up to 32 MB) and then compress the image on-device before
+        // passing it to the model.
+        val oversizedReadLimit = 32 * 1024 * 1024
+        val rawPayloadResult = workspaceFileBridge.readWorkspaceFile(
             path = path,
             workingDirectory = workingDirectory,
             byteLimit = MaxAnalyzeImageBytes,
-        ).getOrElse { throwable ->
-            return toolFailureOutput(throwable, "Couldn't read the image from the workspace.") {
-                put("path", workspaceFileBridge.resolveTermuxPath(path, workingDirectory))
+        )
+
+        val (imageBytes, usedMimeType, wasCompressed) = if (rawPayloadResult.isSuccess) {
+            val p = rawPayloadResult.getOrThrow()
+            val mime = guessImageMimeType(p.absolutePath)
+                ?: return JSONObject().apply {
+                    put("ok", false)
+                    put("path", p.absolutePath)
+                    put("errmsg", "The selected file does not look like a supported image.")
+                }.toString()
+            if (p.bytes.isEmpty()) {
+                return JSONObject().apply {
+                    put("ok", false)
+                    put("path", p.absolutePath)
+                    put("errmsg", "The selected image is empty.")
+                }.toString()
             }
+            Triple(p.bytes, mime, false)
+        } else {
+            val err = rawPayloadResult.exceptionOrNull()
+            val isTooBig = err?.message?.contains("larger than", ignoreCase = true) == true
+            if (!isTooBig) {
+                return toolFailureOutput(
+                    err ?: Exception("Couldn't read the image from the workspace."),
+                    "Couldn't read the image from the workspace.",
+                ) {
+                    put("path", workspaceFileBridge.resolveTermuxPath(path, workingDirectory))
+                }
+            }
+            // Image is larger than MaxAnalyzeImageBytes — try oversized read then compress.
+            val oversizedPayload = workspaceFileBridge.readWorkspaceFile(
+                path = path,
+                workingDirectory = workingDirectory,
+                byteLimit = oversizedReadLimit,
+            ).getOrElse { throwable ->
+                return toolFailureOutput(throwable, "Couldn't read the image from the workspace.") {
+                    put("path", workspaceFileBridge.resolveTermuxPath(path, workingDirectory))
+                }
+            }
+            val mime = guessImageMimeType(oversizedPayload.absolutePath)
+                ?: return JSONObject().apply {
+                    put("ok", false)
+                    put("path", oversizedPayload.absolutePath)
+                    put("errmsg", "The selected file does not look like a supported image.")
+                }.toString()
+            if (oversizedPayload.bytes.isEmpty()) {
+                return JSONObject().apply {
+                    put("ok", false)
+                    put("path", oversizedPayload.absolutePath)
+                    put("errmsg", "The selected image is empty.")
+                }.toString()
+            }
+            val compressed = compressImageBytes(oversizedPayload.bytes, MaxAnalyzeImageBytes)
+                ?: return JSONObject().apply {
+                    put("ok", false)
+                    put("path", oversizedPayload.absolutePath)
+                    put("errmsg", "Image is too large to analyze (over ${oversizedReadLimit / 1024 / 1024} MB) and could not be compressed.")
+                    put("size_bytes", oversizedPayload.sizeBytes)
+                }.toString()
+            Triple(compressed, "image/jpeg", true)
         }
 
-        val mimeType = guessImageMimeType(payload.absolutePath)
-            ?: return JSONObject().apply {
-                put("ok", false)
-                put("path", payload.absolutePath)
-                put("errmsg", "The selected file does not look like a supported image.")
-            }.toString()
-        if (payload.bytes.isEmpty()) {
-            return JSONObject().apply {
-                put("ok", false)
-                put("path", payload.absolutePath)
-                put("errmsg", "The selected image is empty.")
-            }.toString()
-        }
+        val absolutePath = workspaceFileBridge.resolveTermuxPath(path, workingDirectory)
 
         val response = client.createChatCompletion(
             settings = settings,
@@ -1255,8 +1306,8 @@ class AetherAgent(
                         contentParts = listOf(
                             LlmTextPart(prompt),
                             LlmImagePart(
-                                mimeType = mimeType,
-                                base64Data = Base64.getEncoder().encodeToString(payload.bytes),
+                                mimeType = usedMimeType,
+                                base64Data = Base64.getEncoder().encodeToString(imageBytes),
                             ),
                         ),
                     ),
@@ -1264,17 +1315,72 @@ class AetherAgent(
             ),
         ).getOrElse { throwable ->
             return toolFailureOutput(throwable, "Image analysis request failed.") {
-                put("path", payload.absolutePath)
+                put("path", absolutePath)
             }
         }
 
         return JSONObject().apply {
             put("ok", true)
-            put("path", payload.absolutePath)
+            put("path", absolutePath)
             put("prompt", prompt)
             put("analysis", response.assistantText)
             put("stdout", response.assistantText)
+            if (wasCompressed) {
+                put("note", "Image was automatically compressed before analysis because it exceeded the 5 MB size limit.")
+            }
         }.toString()
+    }
+
+    /**
+     * Compress [bytes] (any image format) to JPEG so that the output is at most [targetBytes].
+     * Returns null only if the image cannot be decoded at all.
+     * Progressively reduces resolution and quality until the target is met or a minimum
+     * quality / dimension floor is hit.
+     */
+    private fun compressImageBytes(bytes: ByteArray, targetBytes: Int): ByteArray? {
+        val original = runCatching {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }.getOrNull() ?: return null
+
+        var bitmap = original
+        var quality = 85
+
+        // First pass: try compressing at original size with decreasing quality
+        while (quality >= 40) {
+            val out = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            val compressed = out.toByteArray()
+            if (compressed.size <= targetBytes) {
+                if (bitmap !== original) bitmap.recycle()
+                return compressed
+            }
+            quality -= 15
+        }
+
+        // Second pass: progressively scale down the image
+        var scale = 0.75f
+        while (scale >= 0.15f) {
+            val newWidth = (original.width * scale).toInt().coerceAtLeast(64)
+            val newHeight = (original.height * scale).toInt().coerceAtLeast(64)
+            val scaled = runCatching {
+                Bitmap.createScaledBitmap(original, newWidth, newHeight, true)
+            }.getOrNull() ?: break
+
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 72, out)
+            val compressed = out.toByteArray()
+            scaled.recycle()
+            if (compressed.size <= targetBytes) {
+                if (bitmap !== original) bitmap.recycle()
+                original.recycle()
+                return compressed
+            }
+            scale -= 0.15f
+        }
+
+        if (bitmap !== original) bitmap.recycle()
+        original.recycle()
+        return null
     }
 
     private suspend fun executeFetchWebUrl(argumentsJson: String): String {
