@@ -295,6 +295,7 @@ fun ConversationDrawer(
                             DrawerCompactSearchField(
                                 value = searchQuery,
                                 onValueChange = { searchQuery = it },
+                                onClear = { searchQuery = "" },
                             )
                         }
                     }
@@ -398,9 +399,19 @@ private fun String.toSearchSnippet(query: String, radius: Int = 42): String {
 private fun DrawerCompactSearchField(
     value: String,
     onValueChange: (String) -> Unit,
+    onClear: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val strings = rememberAetherStrings()
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    LaunchedEffect(Unit) {
+        delay(120)
+        focusRequester.requestFocus()
+        keyboardController?.show()
+    }
+
     Row(
         modifier = modifier
             .shadow(12.dp, RoundedCornerShape(24.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
@@ -422,7 +433,7 @@ private fun DrawerCompactSearchField(
         ) {
             if (value.isBlank()) {
                 Text(
-                    text = strings.search,
+                    text = strings.searchChats,
                     style = MaterialTheme.typography.bodyMedium,
                     color = AetherOnSurfaceVariant,
                 )
@@ -433,8 +444,31 @@ private fun DrawerCompactSearchField(
                 singleLine = true,
                 textStyle = MaterialTheme.typography.bodyMedium.copy(color = AetherOnSurface),
                 cursorBrush = SolidColor(AetherOnSurface),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focusRequester),
             )
+        }
+        AnimatedVisibility(visible = value.isNotBlank()) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(AetherSurfaceHigh)
+                    .clickable(onClick = onClear),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = LucideIcons.X,
+                    contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                        "清除搜索"
+                    } else {
+                        "Clear search"
+                    },
+                    tint = AetherOnSurfaceVariant,
+                    modifier = Modifier.size(15.dp),
+                )
+            }
         }
     }
 }

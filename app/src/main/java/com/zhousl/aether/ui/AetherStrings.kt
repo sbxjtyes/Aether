@@ -470,6 +470,34 @@ fun AetherStrings.toolInvocationTitleLabel(
         subject = arguments?.optString("url").orEmpty(),
         fallback = if (isChinese) "网页" else "web page",
     )
+    "stock_market_data" -> {
+        val action = arguments?.optString("action").orEmpty().lowercase()
+        val symbol = arguments?.optString("symbol").orEmpty().trim()
+        val query = arguments?.optString("query").orEmpty().trim()
+        when (action) {
+            "search" -> formatArgumentDrivenTitle(
+                isRunning = isRunning,
+                progressiveVerb = if (isChinese) "正在搜索股票" else "Searching stocks",
+                completedVerb = if (isChinese) "已搜索股票" else "Searched stocks",
+                subject = query,
+                fallback = if (isChinese) "股票" else "stocks",
+            )
+            "chart" -> formatArgumentDrivenTitle(
+                isRunning = isRunning,
+                progressiveVerb = if (isChinese) "正在获取行情图" else "Fetching chart",
+                completedVerb = if (isChinese) "已获取行情图" else "Fetched chart",
+                subject = symbol,
+                fallback = if (isChinese) "股票图表" else "stock chart",
+            )
+            else -> formatArgumentDrivenTitle(
+                isRunning = isRunning,
+                progressiveVerb = if (isChinese) "正在获取行情" else "Fetching quote",
+                completedVerb = if (isChinese) "已获取行情" else "Fetched quote",
+                subject = symbol.ifBlank { query },
+                fallback = if (isChinese) "股票行情" else "stock quote",
+            )
+        }
+    }
     "agent_display" -> formatAgentDisplayTitle(isRunning, arguments)
     else -> if (isChinese) {
         if (isRunning) "正在使用 $toolName" else "已使用 $toolName"
@@ -504,6 +532,21 @@ fun AetherStrings.toolInvocationCommandLabel(toolName: String, arguments: JSONOb
             "抓取 ${arguments.optString("url").trim()}".trim()
         } else {
             "fetch ${arguments.optString("url").trim()}".trim()
+        }
+        "stock_market_data" -> {
+            val action = arguments.optString("action").lowercase().ifBlank { "quote" }
+            val symbol = arguments.optString("symbol").trim()
+            val query = arguments.optString("query").trim()
+            val range = arguments.optString("range").trim()
+            val interval = arguments.optString("interval").trim()
+            buildString {
+                append("stock_market_data")
+                if (symbol.isNotBlank()) { append(" "); append(symbol) }
+                else if (query.isNotBlank()) { append(" "); append(query) }
+                if (action.isNotBlank() && action != "quote") { append(" action=$action") }
+                if (range.isNotBlank()) { append(" range=$range") }
+                if (interval.isNotBlank()) { append(" interval=$interval") }
+            }
         }
         "agent_display" -> summarizeAgentDisplayCommand(arguments)
         else -> toolName

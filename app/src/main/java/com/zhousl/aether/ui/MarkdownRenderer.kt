@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
+import android.util.LruCache
 import androidx.core.net.toUri
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -107,9 +108,11 @@ private const val DefaultTextBlockMinHeightDp = 24
 private const val DefaultTextBlockMaxHeightDp = 2048
 private const val PreviewDialogMinHeightDp = 320
 private const val PreviewDialogMaxHeightDp = 820
+private const val MarkdownBlockCacheMaxEntries = 96
 private val MarkdownTableMinColumnWidth = 128.dp
 private val MarkdownTableDescriptionMinColumnWidth = 160.dp
 private val MarkdownTableScrollableColumnWidth = 148.dp
+private val MarkdownBlockCache = LruCache<String, List<MarkdownBlock>>(MarkdownBlockCacheMaxEntries)
 private val MarkdownImageHttpClient: OkHttpClient by lazy {
     OkHttpClient.Builder()
         .followRedirects(true)
@@ -195,8 +198,8 @@ fun MarkdownContent(
     onLinkClick: (String) -> Unit = {},
     fadeSpan: MarkdownFadeSpan? = null,
 ) {
-    val normalizedMarkdown = remember(markdown) { markdown.replace("\r\n", "\n") }
-    val blocks = remember(normalizedMarkdown) { parseMarkdown(normalizedMarkdown) }
+    val normalizedMarkdown = remember(markdown) { normalizeMarkdownSource(markdown) }
+    val blocks = remember(normalizedMarkdown) { parseMarkdownCached(normalizedMarkdown) }
 
     Column(
         modifier = modifier,
@@ -683,13 +686,44 @@ private fun MarkdownHtmlBlock(
     backgroundColor: Color = AetherSurface,
     onTap: (() -> Unit)? = null,
     onLinkClick: ((String) -> Unit)? = null,
+    allowInternalScroll: Boolean = false,
 ) {
     val resolvedMinHeightDp = layout.minHeightDp ?: defaultMinHeightDp
     val resolvedMaxHeightDp = layout.maxHeightDp ?: defaultMaxHeightDp
-    val scrollViewportHeightDp = if (layout.scroll) {
+    val internalScrollEnabled = allowInternalScroll && layout.scroll && !layout.showAll
+    val scrollViewportHeightDp = if (internalScrollEnabled) {
         (layout.heightDp ?: resolvedMaxHeightDp).coerceAtLeast(1)
     } else {
         null
+    }
+    val context = LocalContext.current
+    val gestureDetector = remember(context, onTap) {
+        GestureDetector(
+            context,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onSingleTapConfirmed(event: MotionEvent): Boolean {
+                    onTap?.invoke()
+                    return false
+                }
+            },
+        )
+    }
+
+    fun WebView.applyMarkdownHtmlTouchHandling() {
+        setOnTouchListener { view, event ->
+            if (internalScrollEnabled) {
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN,
+                    MotionEvent.ACTION_MOVE -> view.parent?.requestDisallowInterceptTouchEvent(true)
+                    MotionEvent.ACTION_UP,
+                    MotionEvent.ACTION_CANCEL -> view.parent?.requestDisallowInterceptTouchEvent(false)
+                }
+            } else {
+                view.parent?.requestDisallowInterceptTouchEvent(false)
+            }
+            gestureDetector.onTouchEvent(event)
+            false
+        }
     }
     var measuredHeightDp by remember(html) { mutableIntStateOf(resolvedMinHeightDp.coerceAtLeast(1)) }
     var hasMeasuredContent by remember(html) { mutableStateOf(false) }
@@ -709,17 +743,8 @@ private fun MarkdownHtmlBlock(
 
     AndroidView(
         modifier = modifier.height(appliedHeightDp.dp),
-        factory = { context ->
-            val gestureDetector = GestureDetector(
-                context,
-                object : GestureDetector.SimpleOnGestureListener() {
-                    override fun onSingleTapConfirmed(event: MotionEvent): Boolean {
-                        onTap?.invoke()
-                        return false
-                    }
-                },
-            )
-            WebView(context).apply {
+        factory = { viewContext ->
+            WebView(viewContext).apply {
                 setBackgroundColor(backgroundColor.toArgb())
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
@@ -728,11 +753,12 @@ private fun MarkdownHtmlBlock(
                 settings.allowContentAccess = true
                 settings.useWideViewPort = true
                 settings.loadWithOverviewMode = true
-                isVerticalScrollBarEnabled = layout.scroll && !layout.showAll
-                isHorizontalScrollBarEnabled = layout.scroll && !layout.showAll
-                isFocusable = true
-                isFocusableInTouchMode = true
-                ViewCompat.setNestedScrollingEnabled(this, layout.scroll && !layout.showAll)
+                isVerticalScrollBarEnabled = internalScrollEnabled
+                isHorizontalScrollBarEnabled = internalScrollEnabled
+                isFocusable = internalScrollEnabled
+                isFocusableInTouchMode = internalScrollEnabled
+                overScrollMode = android.view.View.OVER_SCROLL_NEVER
+                ViewCompat.setNestedScrollingEnabled(this, internalScrollEnabled)
                 webChromeClient = WebChromeClient()
                 addJavascriptInterface(
                     MarkdownHtmlBridge(
@@ -745,18 +771,7 @@ private fun MarkdownHtmlBlock(
                     ),
                     MarkdownHtmlBridgeName,
                 )
-                setOnTouchListener { view, event ->
-                    if (layout.scroll && !layout.showAll) {
-                        when (event.actionMasked) {
-                            MotionEvent.ACTION_DOWN,
-                            MotionEvent.ACTION_MOVE -> view.parent?.requestDisallowInterceptTouchEvent(true)
-                            MotionEvent.ACTION_UP,
-                            MotionEvent.ACTION_CANCEL -> view.parent?.requestDisallowInterceptTouchEvent(false)
-                        }
-                    }
-                    gestureDetector.onTouchEvent(event)
-                    false
-                }
+                applyMarkdownHtmlTouchHandling()
                 setOnClickListener { onTap?.invoke() }
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(
@@ -780,9 +795,12 @@ private fun MarkdownHtmlBlock(
             }
         },
         update = { webView ->
-            webView.isVerticalScrollBarEnabled = layout.scroll && !layout.showAll
-            webView.isHorizontalScrollBarEnabled = layout.scroll && !layout.showAll
-            ViewCompat.setNestedScrollingEnabled(webView, layout.scroll && !layout.showAll)
+            webView.isVerticalScrollBarEnabled = internalScrollEnabled
+            webView.isHorizontalScrollBarEnabled = internalScrollEnabled
+            webView.isFocusable = internalScrollEnabled
+            webView.isFocusableInTouchMode = internalScrollEnabled
+            ViewCompat.setNestedScrollingEnabled(webView, internalScrollEnabled)
+            webView.applyMarkdownHtmlTouchHandling()
             if (webView.tag != html) {
                 webView.tag = html
                 webView.loadDataWithBaseURL(
@@ -822,29 +840,15 @@ private fun MarkdownBitmapImageBlock(
             explicitHeight != null -> explicitHeight
             else -> naturalHeight.coerceAtMost(resolvedMaxHeight).coerceAtLeast(1.dp)
         }
-        val needsVerticalScroll = !layout.showAll && layout.scroll && naturalHeight > containerHeight
 
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(containerHeight)
                 .padding(12.dp),
-            contentAlignment = if (needsVerticalScroll) Alignment.TopCenter else Alignment.Center,
+            contentAlignment = Alignment.Center,
         ) {
             when {
-                needsVerticalScroll -> Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .verticalScroll(rememberScrollState()),
-                ) {
-                    Image(
-                        bitmap = bitmap,
-                        contentDescription = altText.takeIf { it.isNotBlank() },
-                        modifier = Modifier.fillMaxWidth(),
-                        contentScale = contentScale,
-                    )
-                }
-
                 explicitHeight != null || (!layout.showAll && naturalHeight > containerHeight) -> Image(
                     bitmap = bitmap,
                     contentDescription = altText.takeIf { it.isNotBlank() },
@@ -926,6 +930,7 @@ private fun MarkdownImagePreviewDialog(
                     .clip(RoundedCornerShape(24.dp))
                     .background(AetherSurfaceHigh),
                 backgroundColor = AetherSurfaceHigh,
+                allowInternalScroll = true,
             )
 
             else -> Text(
@@ -970,8 +975,14 @@ private fun MarkdownMermaidPreviewDialog(
                 .clip(RoundedCornerShape(24.dp))
                 .background(Color.White),
             backgroundColor = Color.White,
+            allowInternalScroll = true,
         )
     }
+}
+
+internal fun prewarmMarkdownContent(markdown: String) {
+    if (markdown.isBlank()) return
+    parseMarkdownCached(normalizeMarkdownSource(markdown))
 }
 
 @Composable
@@ -1184,6 +1195,16 @@ private sealed interface MarkdownBlock {
     ) : MarkdownBlock
     data class CodeFence(val code: MarkdownSourceText) : MarkdownBlock
     data object Rule : MarkdownBlock
+}
+
+private fun normalizeMarkdownSource(markdown: String): String =
+    markdown.replace("\r\n", "\n")
+
+private fun parseMarkdownCached(normalizedMarkdown: String): List<MarkdownBlock> {
+    MarkdownBlockCache.get(normalizedMarkdown)?.let { return it }
+    return parseMarkdown(normalizedMarkdown).also { blocks ->
+        MarkdownBlockCache.put(normalizedMarkdown, blocks)
+    }
 }
 
 private fun parseMarkdown(markdown: String): List<MarkdownBlock> {

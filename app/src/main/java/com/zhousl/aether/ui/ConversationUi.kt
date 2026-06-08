@@ -1,6 +1,7 @@
 package com.zhousl.aether.ui
 
 import android.graphics.BitmapFactory
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -17,6 +18,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
@@ -39,11 +41,14 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -54,13 +59,22 @@ import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.AttachFile
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Brush
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Cloud
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Extension
 import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
+import androidx.compose.material.icons.rounded.Lightbulb
 import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.Public
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material.icons.rounded.TravelExplore
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -69,6 +83,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
@@ -76,6 +91,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.State
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -90,20 +106,29 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -116,6 +141,7 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
 import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AgentModeDisplayState
@@ -136,17 +162,23 @@ import com.zhousl.aether.ui.theme.AetherScrim
 import com.zhousl.aether.ui.theme.AetherSurface
 import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import com.zhousl.aether.ui.theme.AetherSurfaceHigher
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 private sealed interface ConversationListItem {
     val key: String
+    val contentType: String
 
     data class Message(
         val message: ChatMessage,
     ) : ConversationListItem {
         override val key: String = message.id
+        override val contentType: String = when (message.author) {
+            MessageAuthor.User -> "conversation-message-user"
+            MessageAuthor.Agent -> "conversation-message-agent"
+        }
     }
 
     data class AssistantGroup(
@@ -155,17 +187,20 @@ private sealed interface ConversationListItem {
         override val key: String = messages.firstOrNull()?.responseGroupId
             ?: messages.firstOrNull()?.id
             ?: "assistant-group"
+        override val contentType: String = "conversation-assistant-group"
     }
 }
 
 private val ConversationTopFadeHeight = 42.dp
 private val ComposerCardShape = RoundedCornerShape(26.dp)
 private val ComposerFocusedCardShape = RoundedCornerShape(28.dp)
+private val ChatGptPromptShape = RoundedCornerShape(30.dp)
 private val ChatGptControlShadow = Color(0x14000000)
 private val ChatGptComposerShadow = Color(0x18000000)
-private val ChatGptPurple = Color(0xFF9B5CFF)
 private val ChatGptMotionEasing = CubicBezierEasing(0.22f, 0.84f, 0.18f, 1f)
-private const val ImeInsetStabilizationMillis = 90L
+private const val ComposerFocusTransitionMillis = 160
+private const val ImeInsetStabilizationMillis = 24L
+private const val ConversationMarkdownPrewarmWindow = 4
 private val ImeStabilizationMinVisibleHeight = 24.dp
 
 data class ConversationScreenState(
@@ -436,6 +471,7 @@ private fun ConversationScreen(
     isSending: Boolean,
 ) {
     val listState = remember(conversationStateKey) { LazyListState() }
+    val coroutineScope = rememberCoroutineScope()
     val conversationItems = remember(messages) { buildConversationListItems(messages) }
     var previewAttachment by remember { mutableStateOf<ChatAttachment?>(null) }
     var shouldAutoFollow by rememberSaveable(conversationStateKey) { mutableStateOf(true) }
@@ -443,6 +479,8 @@ private fun ConversationScreen(
     var composerBodyHeightPx by remember { mutableIntStateOf(0) }
     var pendingGenerationHeightPx by remember { mutableIntStateOf(0) }
     var composerFocused by remember { mutableStateOf(false) }
+    var userScrollSessionActive by remember { mutableStateOf(false) }
+    var hasUnseenLatestContent by rememberSaveable(conversationStateKey) { mutableStateOf(false) }
     val density = LocalDensity.current
     val fallbackTopBarBodyHeight = with(density) {
         WindowInsets.statusBars.getTop(this).toDp() + 68.dp
@@ -454,31 +492,51 @@ private fun ConversationScreen(
         if (composerBodyHeightPx > 0) composerBodyHeightPx.toDp() else 112.dp
     }
     val conversationBottomClearance = composerBodyHeight + 72.dp
-    val stableImeBottom by rememberStableImeBottom(focused = composerFocused)
-    val animatedImeBottom by animateDpAsState(
-        targetValue = stableImeBottom,
-        animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
-        label = "conversation_empty_ime_bottom",
-    )
-    val animatedImeBottomPx = with(density) { animatedImeBottom.roundToPx() }
+    val synchronizedImeOffsetPx = WindowInsets.ime.getBottom(density).coerceAtLeast(0)
+
+    fun startUserScrollSession() {
+        userScrollSessionActive = true
+        shouldAutoFollow = false
+    }
+
+    fun finishUserScrollSession() {
+        userScrollSessionActive = false
+        shouldAutoFollow = listState.isAtConversationBottom()
+    }
+
     val conversationScrollConnection = remember(listState) {
         object : NestedScrollConnection {
+            override fun onPreScroll(
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                if (source == NestedScrollSource.UserInput && available.y != 0f) {
+                    startUserScrollSession()
+                }
+                return Offset.Zero
+            }
+
             override fun onPostScroll(
                 consumed: Offset,
                 available: Offset,
                 source: NestedScrollSource,
             ): Offset {
-                if (source == NestedScrollSource.UserInput) {
-                    shouldAutoFollow = listState.isAtConversationBottom()
+                if (source == NestedScrollSource.UserInput && (consumed.y != 0f || available.y != 0f)) {
+                    startUserScrollSession()
                 }
                 return Offset.Zero
             }
 
             override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
-                shouldAutoFollow = listState.isAtConversationBottom()
+                finishUserScrollSession()
                 return Velocity.Zero
             }
         }
+    }
+
+    fun dispatchComposerDragToConversation(dragAmountPx: Float) {
+        startUserScrollSession()
+        listState.dispatchRawDelta(-dragAmountPx)
     }
 
     suspend fun scrollToConversationBottom() {
@@ -488,8 +546,62 @@ private fun ConversationScreen(
         }
     }
 
-    LaunchedEffect(listState, shouldAutoFollow, animatedImeBottomPx, composerBodyHeightPx) {
-        if (!shouldAutoFollow) return@LaunchedEffect
+    fun jumpToConversationBottom() {
+        shouldAutoFollow = true
+        userScrollSessionActive = false
+        hasUnseenLatestContent = false
+        coroutineScope.launch {
+            scrollToConversationBottom()
+        }
+    }
+
+    LaunchedEffect(conversationItems, listState) {
+        snapshotFlow {
+            val visibleMessageIndices = listState.layoutInfo.visibleItemsInfo.mapNotNull { itemInfo ->
+                itemInfo.index.takeIf { it in conversationItems.indices }
+            }
+            if (visibleMessageIndices.isEmpty()) {
+                null
+            } else {
+                visibleMessageIndices.minOrNull()!! to visibleMessageIndices.maxOrNull()!!
+            }
+        }
+            .distinctUntilChanged()
+            .collectLatest { visibleRange ->
+                if (listState.isScrollInProgress) return@collectLatest
+                val (firstVisible, lastVisible) = visibleRange ?: return@collectLatest
+                val startIndex = (firstVisible - ConversationMarkdownPrewarmWindow).coerceAtLeast(0)
+                val endIndex = (lastVisible + ConversationMarkdownPrewarmWindow)
+                    .coerceAtMost(conversationItems.lastIndex)
+                if (startIndex > endIndex) return@collectLatest
+
+                val markdowns = conversationItems
+                    .subList(startIndex, endIndex + 1)
+                    .flatMap { it.markdownsForPrewarm() }
+                if (markdowns.isEmpty()) return@collectLatest
+
+                withContext(Dispatchers.Default) {
+                    markdowns.forEach(::prewarmMarkdownContent)
+                }
+            }
+    }
+
+    LaunchedEffect(listState) {
+        snapshotFlow {
+            !listState.isScrollInProgress && listState.isAtConversationBottom()
+        }
+            .distinctUntilChanged()
+            .collect { isIdleAtBottom ->
+                if (isIdleAtBottom) {
+                    userScrollSessionActive = false
+                    shouldAutoFollow = true
+                    hasUnseenLatestContent = false
+                }
+            }
+    }
+
+    LaunchedEffect(listState, shouldAutoFollow, composerBodyHeightPx, userScrollSessionActive) {
+        if (!shouldAutoFollow || userScrollSessionActive) return@LaunchedEffect
         snapshotFlow {
             val layoutInfo = listState.layoutInfo
             val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()
@@ -504,6 +616,7 @@ private fun ConversationScreen(
             .collect {
                 if (
                     shouldAutoFollow &&
+                    !userScrollSessionActive &&
                     !listState.isScrollInProgress &&
                     listState.layoutInfo.totalItemsCount > 0
                 ) {
@@ -571,17 +684,35 @@ private fun ConversationScreen(
             append(isSending)
         }
     }
+    LaunchedEffect(autoFollowContentKey) {
+        if (listState.layoutInfo.totalItemsCount == 0) {
+            hasUnseenLatestContent = false
+        } else if (!shouldAutoFollow && !listState.isAtConversationBottom()) {
+            hasUnseenLatestContent = true
+        }
+    }
     LaunchedEffect(
         autoFollowContentKey,
         pendingGenerationHeightPx,
-        animatedImeBottomPx,
         composerBodyHeightPx,
         shouldAutoFollow,
+        userScrollSessionActive,
     ) {
-        if (!shouldAutoFollow || listState.layoutInfo.totalItemsCount == 0) return@LaunchedEffect
+        if (
+            !shouldAutoFollow ||
+            userScrollSessionActive ||
+            listState.layoutInfo.totalItemsCount == 0
+        ) return@LaunchedEffect
         withFrameNanos { }
-        if (shouldAutoFollow && !listState.isScrollInProgress) {
+        if (shouldAutoFollow && !userScrollSessionActive && !listState.isScrollInProgress) {
             scrollToConversationBottom()
+        }
+    }
+    val showScrollToLatestButton by remember(messages, listState) {
+        derivedStateOf {
+            messages.isNotEmpty() &&
+                listState.layoutInfo.totalItemsCount > 0 &&
+                !listState.isAtConversationBottom()
         }
     }
 
@@ -600,131 +731,207 @@ private fun ConversationScreen(
                 )
                 .padding(innerPadding)
         ) {
-            if (messages.isEmpty()) {
-                ConversationEmptyState(
-                    modifier = Modifier.padding(
-                        top = topBarBodyHeight + 20.dp,
-                        bottom = conversationBottomClearance + animatedImeBottom,
-                    ),
-                    inputFocused = composerFocused,
-                    showResumeSetupBanner = showResumeSetupBanner,
-                    onResumeOnboarding = onResumeOnboarding,
-                    onStarterPromptSelected = onInputChanged,
-                )
-            } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .nestedScroll(conversationScrollConnection),
-                    contentPadding = PaddingValues(
-                        start = 20.dp,
-                        end = 20.dp,
-                        top = topBarBodyHeight + 10.dp,
-                        bottom = conversationBottomClearance + animatedImeBottom,
-                    ),
-                    verticalArrangement = Arrangement.spacedBy(22.dp),
-                ) {
-                    items(conversationItems, key = { it.key }) { item ->
-                        when (item) {
-                            is ConversationListItem.Message -> {
-                                val message = item.message
-                                ConversationMessageBubble(
-                                    message = message,
-                                    actionsEnabled = !isSending,
-                                    workspaceDirectory = workspaceDirectory,
-                                    allowRootImageRead = allowRootImageRead,
-                                    onOpenAttachment = { previewAttachment = it },
-                                    onOpenLink = onOpenLink,
-                                    onEdit = { onEditMessage(message.id) },
-                                    onDelete = { onDeleteMessage(message.id) },
-                                    onCopy = { onCopyMessage(message) },
-                                    onRedo = { onRedoAgentMessage(message.id) },
-                                    onRetry = { onRetryUserMessage(message.id) },
-                                    onSwitchBranch = { delta -> onSwitchUserMessageBranch(message.id, delta) },
-                                )
-                            }
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        translationY = -synchronizedImeOffsetPx.toFloat()
+                    },
+            ) {
+                if (messages.isEmpty()) {
+                    ConversationEmptyState(
+                        modifier = Modifier.padding(
+                            top = topBarBodyHeight + 20.dp,
+                            bottom = conversationBottomClearance,
+                        ),
+                        inputFocused = composerFocused,
+                        showResumeSetupBanner = showResumeSetupBanner,
+                        onResumeOnboarding = onResumeOnboarding,
+                        onStarterPromptSelected = onInputChanged,
+                    )
+                } else {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .nestedScroll(conversationScrollConnection),
+                        contentPadding = PaddingValues(
+                            start = 20.dp,
+                            end = 20.dp,
+                            top = topBarBodyHeight + 10.dp,
+                            bottom = conversationBottomClearance,
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(22.dp),
+                    ) {
+                        items(
+                            items = conversationItems,
+                            key = { it.key },
+                            contentType = { it.contentType },
+                        ) { item ->
+                            // Defer the read of `isSending` so that its changes only
+                            // invalidate the smallest subtree (the enabled state of action
+                            // buttons) rather than recomposing every item in the list.
+                            val actionsEnabled by remember { derivedStateOf { !isSending } }
+                            when (item) {
+                                is ConversationListItem.Message -> {
+                                    val message = item.message
+                                    ConversationMessageBubble(
+                                        message = message,
+                                        actionsEnabled = actionsEnabled,
+                                        workspaceDirectory = workspaceDirectory,
+                                        allowRootImageRead = allowRootImageRead,
+                                        onOpenAttachment = { previewAttachment = it },
+                                        onOpenLink = onOpenLink,
+                                        onEdit = { onEditMessage(message.id) },
+                                        onDelete = { onDeleteMessage(message.id) },
+                                        onCopy = { onCopyMessage(message) },
+                                        onRedo = { onRedoAgentMessage(message.id) },
+                                        onRetry = { onRetryUserMessage(message.id) },
+                                        onSwitchBranch = { delta -> onSwitchUserMessageBranch(message.id, delta) },
+                                    )
+                                }
 
-                            is ConversationListItem.AssistantGroup -> {
-                                val lastMessage = item.messages.last()
-                                ConversationAssistantGroupBubble(
-                                    messages = item.messages,
-                                    actionsEnabled = !isSending,
-                                    workspaceDirectory = workspaceDirectory,
-                                    allowRootImageRead = allowRootImageRead,
-                                    onOpenAttachment = { previewAttachment = it },
-                                    onOpenLink = onOpenLink,
-                                    onCopy = {
-                                        onCopyMessage(
-                                            lastMessage.copy(
-                                                text = item.messages.joinToString("\n\n") { message -> message.text }
-                                                    .trim(),
+                                is ConversationListItem.AssistantGroup -> {
+                                    val lastMessage = item.messages.last()
+                                    ConversationAssistantGroupBubble(
+                                        messages = item.messages,
+                                        actionsEnabled = actionsEnabled,
+                                        workspaceDirectory = workspaceDirectory,
+                                        allowRootImageRead = allowRootImageRead,
+                                        onOpenAttachment = { previewAttachment = it },
+                                        onOpenLink = onOpenLink,
+                                        onCopy = {
+                                            onCopyMessage(
+                                                lastMessage.copy(
+                                                    text = item.messages.joinToString("\n\n") { message -> message.text }
+                                                        .trim(),
+                                                )
                                             )
-                                        )
-                                    },
-                                    onRedo = { onRedoAgentMessage(lastMessage.id) },
-                                    onDelete = { onDeleteMessage(lastMessage.id) },
-                                )
-                            }
-                        }
-                    }
-                    if (pendingResponseBlocks.isNotEmpty() || pendingToolInvocations.isNotEmpty() || isSending) {
-                        item(key = "pending-generation-block") {
-                            val indicator = pendingGenerationIndicator(
-                                isSending = isSending,
-                                pendingAssistantText = pendingAssistantText,
-                                pendingStatusText = pendingStatusText,
-                                hasVisiblePendingReasoning = pendingResponseBlocks.any {
-                                    it is AssistantResponseBlock.Reasoning &&
-                                        hasVisibleReasoningStatus(it.trace)
-                                },
-                            )
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .onSizeChanged { pendingGenerationHeightPx = it.height }
-                                    .animateContentSize(),
-                                verticalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                PendingAssistantTimeline(
-                                    blocks = pendingResponseBlocks,
-                                    workspaceDirectory = workspaceDirectory,
-                                    allowRootImageRead = allowRootImageRead,
-                                    onOpenLink = onOpenLink,
-                                    pendingToolInvocationStateKey = pendingToolInvocationStateKey,
-                                    pendingToolInvocations = pendingToolInvocations,
-                                    agentModeSelected = agentModeSelected,
-                                    agentModeDisplayState = agentModeDisplayState,
-                                )
-                                when (indicator) {
-                                    PendingGenerationIndicator.Thinking -> {
-                                        ConversationThinkingIndicator()
-                                    }
-
-                                    PendingGenerationIndicator.Status -> {
-                                        ReconnectingStatusCard(
-                                            text = pendingStatusText,
-                                            detail = pendingStatusDetail,
-                                            modifier = Modifier.padding(top = 6.dp),
-                                        )
-                                    }
-
-                                    PendingGenerationIndicator.None -> Unit
+                                        },
+                                        onRedo = { onRedoAgentMessage(lastMessage.id) },
+                                        onDelete = { onDeleteMessage(lastMessage.id) },
+                                    )
                                 }
                             }
                         }
-                    }
-                    items(pendingInputs, key = { it.id }) { pendingInput ->
-                        PendingSessionInputBubble(pendingInput = pendingInput)
-                    }
-                    item(key = "conversation-bottom-anchor") {
-                        Spacer(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(1.dp)
-                        )
+                        if (pendingResponseBlocks.isNotEmpty() || pendingToolInvocations.isNotEmpty() || isSending) {
+                            item(
+                                key = "pending-generation-block",
+                                contentType = "pending-generation-block",
+                            ) {
+                                val indicator = pendingGenerationIndicator(
+                                    isSending = isSending,
+                                    pendingAssistantText = pendingAssistantText,
+                                    pendingStatusText = pendingStatusText,
+                                    hasVisiblePendingReasoning = pendingResponseBlocks.any {
+                                        it is AssistantResponseBlock.Reasoning &&
+                                            hasVisibleReasoningStatus(it.trace)
+                                    },
+                                )
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .onSizeChanged { pendingGenerationHeightPx = it.height },
+                                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                                ) {
+                                    PendingAssistantTimeline(
+                                        blocks = pendingResponseBlocks,
+                                        workspaceDirectory = workspaceDirectory,
+                                        allowRootImageRead = allowRootImageRead,
+                                        onOpenLink = onOpenLink,
+                                        pendingToolInvocationStateKey = pendingToolInvocationStateKey,
+                                        pendingToolInvocations = pendingToolInvocations,
+                                        agentModeSelected = agentModeSelected,
+                                        agentModeDisplayState = agentModeDisplayState,
+                                    )
+                                    when (indicator) {
+                                        PendingGenerationIndicator.Thinking -> {
+                                            ConversationThinkingIndicator()
+                                        }
+
+                                        PendingGenerationIndicator.Status -> {
+                                            ReconnectingStatusCard(
+                                                text = pendingStatusText,
+                                                detail = pendingStatusDetail,
+                                                modifier = Modifier.padding(top = 6.dp),
+                                            )
+                                        }
+
+                                        PendingGenerationIndicator.None -> Unit
+                                    }
+                                }
+                            }
+                        }
+                        items(
+                            items = pendingInputs,
+                            key = { it.id },
+                            contentType = { "pending-input" },
+                        ) { pendingInput ->
+                            PendingSessionInputBubble(pendingInput = pendingInput)
+                        }
+                        item(
+                            key = "conversation-bottom-anchor",
+                            contentType = "conversation-bottom-anchor",
+                        ) {
+                            Spacer(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(1.dp)
+                            )
+                        }
                     }
                 }
+
+                ScrollToLatestButton(
+                    visible = showScrollToLatestButton,
+                    hasNewContent = hasUnseenLatestContent,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = composerBodyHeight + 18.dp),
+                    onClick = ::jumpToConversationBottom,
+                )
+
+                ConversationComposerOverlay(
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                    onBodyHeightChanged = { composerBodyHeightPx = it },
+                    onUserScrollStarted = ::startUserScrollSession,
+                    onUserScrollFinished = ::finishUserScrollSession,
+                    onVerticalDrag = ::dispatchComposerDragToConversation,
+                    value = inputValue,
+                    attachments = draftAttachments,
+                    attachmentRevision = draftAttachmentRevision,
+                    availableSkills = availableSkills,
+                    availableMcpServers = availableMcpServers,
+                    selectedSkillIds = selectedSkillIds,
+                    selectedMcpServerIds = selectedMcpServerIds,
+                    agentModeAvailable = agentModeAvailable,
+                    agentModeSelected = agentModeSelected,
+                    isEditing = isEditing,
+                    termuxSetupState = termuxSetupState,
+                    isSending = isSending,
+                    showStarterPromptHint = showStarterPromptHint,
+                    showTermuxSetupNotice = showTermuxSetupNotice,
+                    onValueChange = onInputChanged,
+                    onRemoveAttachment = onRemoveDraftAttachment,
+                    onSetSkillSelected = onSetSkillSelected,
+                    onSetMcpServerSelected = onSetMcpServerSelected,
+                    onSetAgentModeSelected = onSetAgentModeSelected,
+                    onCancelEdit = onCancelEdit,
+                    onPickImages = onPickImages,
+                    onPickFiles = onPickFiles,
+                    onRequestTermuxPermission = onRequestTermuxPermission,
+                    onOpenAppPermissions = onOpenAppPermissions,
+                    onOpenTermuxSettings = onOpenTermuxSettings,
+                    onOpenTermux = onOpenTermux,
+                    onInstallTermux = onInstallTermux,
+                    onRefreshTermuxSetup = onRefreshTermuxSetup,
+                    onPauseGeneration = onPauseGeneration,
+                    onDismissStarterPromptHint = onDismissStarterPromptHint,
+                    onFocusChanged = { composerFocused = it },
+                    onSend = onSend,
+                    onQueueFollowUp = onQueueFollowUp,
+                    onSteerFollowUp = onSteerFollowUp,
+                )
             }
 
             ConversationTopOverlay(
@@ -735,46 +942,6 @@ private fun ConversationScreen(
                 onMenu = onMenu,
                 onModelSelected = onModelSelected,
                 onNewChat = onNewChat,
-            )
-
-            ConversationComposerOverlay(
-                modifier = Modifier.align(Alignment.BottomCenter),
-                onBodyHeightChanged = { composerBodyHeightPx = it },
-                imeBottomPadding = animatedImeBottom,
-                value = inputValue,
-                attachments = draftAttachments,
-                attachmentRevision = draftAttachmentRevision,
-                availableSkills = availableSkills,
-                availableMcpServers = availableMcpServers,
-                selectedSkillIds = selectedSkillIds,
-                selectedMcpServerIds = selectedMcpServerIds,
-                agentModeAvailable = agentModeAvailable,
-                agentModeSelected = agentModeSelected,
-                isEditing = isEditing,
-                termuxSetupState = termuxSetupState,
-                isSending = isSending,
-                showStarterPromptHint = showStarterPromptHint,
-                showTermuxSetupNotice = showTermuxSetupNotice,
-                onValueChange = onInputChanged,
-                onRemoveAttachment = onRemoveDraftAttachment,
-                onSetSkillSelected = onSetSkillSelected,
-                onSetMcpServerSelected = onSetMcpServerSelected,
-                onSetAgentModeSelected = onSetAgentModeSelected,
-                onCancelEdit = onCancelEdit,
-                onPickImages = onPickImages,
-                onPickFiles = onPickFiles,
-                onRequestTermuxPermission = onRequestTermuxPermission,
-                onOpenAppPermissions = onOpenAppPermissions,
-                onOpenTermuxSettings = onOpenTermuxSettings,
-                onOpenTermux = onOpenTermux,
-                onInstallTermux = onInstallTermux,
-                onRefreshTermuxSetup = onRefreshTermuxSetup,
-                onPauseGeneration = onPauseGeneration,
-                onDismissStarterPromptHint = onDismissStarterPromptHint,
-                onFocusChanged = { composerFocused = it },
-                onSend = onSend,
-                onQueueFollowUp = onQueueFollowUp,
-                onSteerFollowUp = onSteerFollowUp,
             )
 
             previewAttachment?.let { attachment ->
@@ -795,6 +962,64 @@ private fun LazyListState.isAtConversationBottom(): Boolean {
     val isLastItemVisible = lastVisibleItem.index == layoutInfo.totalItemsCount - 1
     val distanceFromBottom = layoutInfo.viewportEndOffset - (lastVisibleItem.offset + lastVisibleItem.size)
     return isLastItemVisible && distanceFromBottom >= -32
+}
+
+@Composable
+private fun ScrollToLatestButton(
+    visible: Boolean,
+    hasNewContent: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    val label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "新消息" else "New"
+    val contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+        if (hasNewContent) "查看新消息" else "跳到最新消息"
+    } else {
+        if (hasNewContent) "View new messages" else "Jump to latest"
+    }
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = fadeIn(animationSpec = tween(durationMillis = 160, easing = ChatGptMotionEasing)) +
+            scaleIn(
+                initialScale = 0.86f,
+                animationSpec = tween(durationMillis = 180, easing = ChatGptMotionEasing),
+            ),
+        exit = fadeOut(animationSpec = tween(durationMillis = 120, easing = ChatGptMotionEasing)) +
+            scaleOut(
+                targetScale = 0.92f,
+                animationSpec = tween(durationMillis = 120, easing = ChatGptMotionEasing),
+            ),
+    ) {
+        Row(
+            modifier = Modifier
+                .shadow(14.dp, CircleShape, ambientColor = AetherScrim, spotColor = AetherScrim)
+                .clip(CircleShape)
+                .background(AetherSurface.copy(alpha = 0.96f))
+                .clickable(onClick = onClick)
+                .animateContentSize(animationSpec = tween(durationMillis = 180, easing = ChatGptMotionEasing))
+                .height(42.dp)
+                .padding(start = if (hasNewContent) 12.dp else 10.dp, end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(if (hasNewContent) 6.dp else 0.dp),
+        ) {
+            if (hasNewContent) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                    color = AetherOnSurface,
+                    maxLines = 1,
+                )
+            }
+            Icon(
+                imageVector = Icons.Rounded.KeyboardArrowDown,
+                contentDescription = contentDescription,
+                tint = AetherOnSurface,
+                modifier = Modifier.size(26.dp),
+            )
+        }
+    }
 }
 
 @Composable
@@ -843,6 +1068,7 @@ private fun ConversationTopBar(
     onNewChat: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
+    val focusManager = LocalFocusManager.current
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -853,7 +1079,10 @@ private fun ConversationTopBar(
         HeaderCircleButton(
             icon = Icons.Rounded.Menu,
             contentDescription = strings.menu,
-            onClick = onMenu,
+            onClick = {
+                focusManager.clearFocus(force = true)
+                onMenu()
+            },
             size = 44.dp,
             containerColor = AetherSurface.copy(alpha = 0.96f),
         )
@@ -1087,47 +1316,73 @@ private fun ConversationEmptyState(
         Text(
             text = strings.whatCanIHelpWith,
             style = MaterialTheme.typography.titleLarge.copy(
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 24.sp,
-                lineHeight = 30.sp,
-                letterSpacing = (-0.2).sp,
+                fontWeight = FontWeight.Normal,
+                fontSize = 34.sp,
+                lineHeight = 40.sp,
+                letterSpacing = 0.sp,
             ),
             color = AetherOnSurface,
         )
-        Spacer(modifier = Modifier.height(26.dp))
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                EmptyStateChip(
-                    icon = Icons.Rounded.Image,
-                    label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "分析图片" else "Analyze image",
-                    iconTint = Color(0xFF38A961),
-                    onClick = { onStarterPromptSelected("Analyze this image and describe the important details.") },
+        Spacer(modifier = Modifier.height(48.dp))
+        StarterPromptChips(
+            strings = strings,
+            onStarterPromptSelected = onStarterPromptSelected,
+        )
+    }
+}
+
+@Composable
+@OptIn(ExperimentalLayoutApi::class)
+private fun StarterPromptChips(
+    strings: AetherStrings,
+    onStarterPromptSelected: (String) -> Unit,
+) {
+    val isChinese = strings.appLanguage == AppLanguage.SimplifiedChinese
+    FlowRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        EmptyStateChip(
+            icon = Icons.Rounded.Image,
+            label = strings.analyzeImageChip,
+            iconTint = Color(0xFF38A961),
+            onClick = {
+                onStarterPromptSelected(
+                    if (isChinese) "分析这张图片，并描述其中的重要细节。" else "Analyze this image and describe the important details."
                 )
-                EmptyStateChip(
-                    icon = Icons.Rounded.Terminal,
-                    label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "代码" else "Code",
-                    iconTint = Color(0xFF7D70DD),
-                    onClick = { onStarterPromptSelected("Help me write or debug this code: ") },
+            },
+        )
+        EmptyStateChip(
+            icon = Icons.Rounded.Terminal,
+            label = strings.codeChip,
+            iconTint = Color(0xFF5E76D8),
+            onClick = {
+                onStarterPromptSelected(
+                    if (isChinese) "帮我编写或调试这段代码：" else "Help me write or debug this code: "
                 )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                EmptyStateChip(
-                    icon = Icons.Rounded.AutoAwesome,
-                    label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "帮我写" else "Help me write",
-                    iconTint = Color(0xFFE48AAE),
-                    onClick = { onStarterPromptSelected("Help me write a clear, polished message about ") },
+            },
+        )
+        EmptyStateChip(
+            icon = Icons.Rounded.AutoAwesome,
+            label = strings.helpMeWriteChip,
+            iconTint = Color(0xFFE48AAE),
+            onClick = {
+                onStarterPromptSelected(
+                    if (isChinese) "帮我写一段清晰、得体的内容，主题是：" else "Help me write a clear, polished message about "
                 )
-                EmptyStateChip(
-                    icon = Icons.Rounded.AttachFile,
-                    label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "总结文件" else "Summarize file",
-                    iconTint = Color(0xFF66C7D4),
-                    onClick = { onStarterPromptSelected("Summarize this file and list the key points.") },
+            },
+        )
+        EmptyStateChip(
+            icon = Icons.Rounded.AttachFile,
+            label = strings.summarizeFileChip,
+            iconTint = Color(0xFF38A6B8),
+            onClick = {
+                onStarterPromptSelected(
+                    if (isChinese) "总结这个文件，并列出关键要点。" else "Summarize this file and list the key points."
                 )
-            }
-        }
+            },
+        )
     }
 }
 
@@ -1138,10 +1393,10 @@ private fun EmptyStateChip(
     iconTint: Color,
     onClick: () -> Unit,
 ) {
-    val strings = rememberAetherStrings()
     Row(
         modifier = Modifier
-            .shadow(6.dp, RoundedCornerShape(999.dp), ambientColor = ChatGptControlShadow, spotColor = ChatGptControlShadow)
+            .heightIn(min = 40.dp)
+            .shadow(4.dp, RoundedCornerShape(999.dp), ambientColor = ChatGptControlShadow, spotColor = ChatGptControlShadow)
             .clip(RoundedCornerShape(999.dp))
             .background(AetherSurface.copy(alpha = 0.98f))
             .clickable(onClick = onClick)
@@ -1327,6 +1582,18 @@ private fun buildConversationListItems(
     }
 }
 
+private fun ConversationListItem.markdownsForPrewarm(): List<String> = when (this) {
+    is ConversationListItem.Message -> message.markdownsForPrewarm()
+    is ConversationListItem.AssistantGroup -> messages.flatMap { it.markdownsForPrewarm() }
+}
+
+private fun ChatMessage.markdownsForPrewarm(): List<String> =
+    if (author == MessageAuthor.Agent && text.isNotBlank()) {
+        listOf(text)
+    } else {
+        emptyList()
+    }
+
 private fun isLegacyAssistantGroupStart(
     messages: List<ChatMessage>,
     index: Int,
@@ -1405,7 +1672,9 @@ private fun PendingSessionInputBubble(
 private fun ConversationComposerOverlay(
     modifier: Modifier = Modifier,
     onBodyHeightChanged: (Int) -> Unit,
-    imeBottomPadding: Dp,
+    onUserScrollStarted: () -> Unit,
+    onUserScrollFinished: () -> Unit,
+    onVerticalDrag: (Float) -> Unit,
     value: String,
     attachments: List<ChatAttachment>,
     attachmentRevision: Long,
@@ -1441,23 +1710,29 @@ private fun ConversationComposerOverlay(
     onQueueFollowUp: () -> Unit,
     onSteerFollowUp: () -> Unit,
 ) {
-    val bottomLift by animateDpAsState(
-        targetValue = if (imeBottomPadding > 0.dp) 12.dp else 18.dp,
-        animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
-        label = "composer_bottom_lift",
-    )
     Box(
         modifier = modifier
             .fillMaxWidth()
             .navigationBarsPadding()
-            .padding(bottom = imeBottomPadding + bottomLift),
+            .padding(bottom = 18.dp)
+            .pointerInput(onUserScrollStarted, onUserScrollFinished, onVerticalDrag) {
+                detectVerticalDragGestures(
+                    onDragStart = { onUserScrollStarted() },
+                    onDragEnd = { onUserScrollFinished() },
+                    onDragCancel = { onUserScrollFinished() },
+                    onVerticalDrag = { change, dragAmount ->
+                        change.consume()
+                        onVerticalDrag(dragAmount)
+                    },
+                )
+            },
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .onSizeChanged { onBodyHeightChanged(it.height) },
         ) {
-            ConversationComposerBar(
+            ChatGptPromptComposerBar(
                 value = value,
                 attachments = attachments,
                 attachmentRevision = attachmentRevision,
@@ -1493,6 +1768,738 @@ private fun ConversationComposerOverlay(
                 onQueueFollowUp = onQueueFollowUp,
                 onSteerFollowUp = onSteerFollowUp,
             )
+        }
+    }
+}
+
+@Composable
+private fun ChatGptPromptComposerBar(
+    modifier: Modifier = Modifier,
+    value: String,
+    attachments: List<ChatAttachment>,
+    attachmentRevision: Long,
+    availableSkills: List<InstalledSkill>,
+    availableMcpServers: List<McpServerConfig>,
+    selectedSkillIds: List<String>,
+    selectedMcpServerIds: List<String>,
+    agentModeAvailable: Boolean,
+    agentModeSelected: Boolean,
+    isEditing: Boolean,
+    termuxSetupState: TermuxSetupState,
+    isSending: Boolean,
+    showStarterPromptHint: Boolean,
+    showTermuxSetupNotice: Boolean,
+    onValueChange: (String) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
+    onSetSkillSelected: (String, Boolean) -> Unit,
+    onSetMcpServerSelected: (String, Boolean) -> Unit,
+    onSetAgentModeSelected: (Boolean) -> Unit,
+    onCancelEdit: () -> Unit,
+    onPickImages: () -> Unit,
+    onPickFiles: () -> Unit,
+    onRequestTermuxPermission: () -> Unit,
+    onOpenAppPermissions: () -> Unit,
+    onOpenTermuxSettings: () -> Unit,
+    onOpenTermux: () -> Unit,
+    onInstallTermux: () -> Unit,
+    onRefreshTermuxSetup: () -> Unit,
+    onPauseGeneration: () -> Unit,
+    onDismissStarterPromptHint: () -> Unit,
+    onFocusChanged: (Boolean) -> Unit,
+    onSend: () -> Unit,
+    onQueueFollowUp: () -> Unit,
+    onSteerFollowUp: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val composerTapInteractionSource = remember { MutableInteractionSource() }
+    var textFieldFocused by remember { mutableStateOf(false) }
+    var attachmentMenuExpanded by remember { mutableStateOf(false) }
+    val attachmentMenuVisibility = remember { MutableTransitionState(false) }
+    attachmentMenuVisibility.targetState = attachmentMenuExpanded
+    var toolsMenuExpanded by remember { mutableStateOf(false) }
+    val toolsMenuVisibility = remember { MutableTransitionState(false) }
+    toolsMenuVisibility.targetState = toolsMenuExpanded
+    var followUpMenuExpanded by remember { mutableStateOf(false) }
+    val followUpMenuVisibility = remember { MutableTransitionState(false) }
+    followUpMenuVisibility.targetState = followUpMenuExpanded
+    var measuredTextLineCount by remember { mutableIntStateOf(1) }
+    var measuredTextHeight by remember { mutableStateOf(26.dp) }
+    var composerFieldValue by remember { mutableStateOf(TextFieldValue(value, selection = TextRange(value.length))) }
+
+    BackHandler(enabled = attachmentMenuExpanded) { attachmentMenuExpanded = false }
+    BackHandler(enabled = toolsMenuExpanded) { toolsMenuExpanded = false }
+    BackHandler(enabled = followUpMenuExpanded) { followUpMenuExpanded = false }
+    LaunchedEffect(textFieldFocused) {
+        onFocusChanged(textFieldFocused)
+    }
+    LaunchedEffect(value) {
+        if (value != composerFieldValue.text) {
+            composerFieldValue = TextFieldValue(value, selection = TextRange(value.length))
+        }
+    }
+
+    val selectedSkillSet = remember(selectedSkillIds) { selectedSkillIds.toSet() }
+    val selectedMcpServerSet = remember(selectedMcpServerIds) { selectedMcpServerIds.toSet() }
+    val selectedSkillActions = remember(availableSkills, selectedSkillSet) {
+        availableSkills.filter { selectedSkillSet.contains(it.id) }
+    }
+    val selectedMcpActions = remember(availableMcpServers, selectedMcpServerSet) {
+        availableMcpServers.filter { selectedMcpServerSet.contains(it.id) }
+    }
+    val allSkillsSelected = availableSkills.isNotEmpty() && availableSkills.all { selectedSkillSet.contains(it.id) }
+    val allMcpServersSelected = availableMcpServers.isNotEmpty() && availableMcpServers.all { selectedMcpServerSet.contains(it.id) }
+    val hasSelectedActions = selectedSkillActions.isNotEmpty() || selectedMcpActions.isNotEmpty() || agentModeSelected
+    val selectedActionCount = selectedSkillActions.size + selectedMcpActions.size + if (agentModeSelected) 1 else 0
+    val hasDraft = value.isNotBlank() || attachments.isNotEmpty()
+    val canSendDraft = attachments.all { it.workspaceState == AttachmentWorkspaceState.Ready }
+    val showPauseButton = isSending && !hasDraft
+    val showSubmitButton = !isSending || hasDraft
+    val textLineCount = if (value.isBlank()) 1 else maxOf(value.count { it == '\n' } + 1, measuredTextLineCount).coerceIn(1, 5)
+    val cardMinHeight by animateDpAsState(
+        targetValue = maxOf(116.dp, measuredTextHeight + 74.dp + if (hasSelectedActions) 40.dp else 0.dp),
+        animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
+        label = "chatgpt_prompt_min_height",
+    )
+    val textStyle = MaterialTheme.typography.bodyLarge.copy(
+        color = AetherOnSurface,
+        fontSize = 16.sp,
+        lineHeight = 22.sp,
+        platformStyle = PlatformTextStyle(includeFontPadding = false),
+        lineHeightStyle = LineHeightStyle(
+            alignment = LineHeightStyle.Alignment.Center,
+            trim = LineHeightStyle.Trim.Both,
+        ),
+    )
+
+    fun applyPromptSelection(prompt: String) {
+        composerFieldValue = TextFieldValue(prompt, selection = TextRange(prompt.length))
+        onValueChange(prompt)
+        focusRequester.requestFocus()
+        keyboardController?.show()
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        if (showTermuxSetupNotice) {
+            TermuxSetupNotice(
+                setupState = termuxSetupState,
+                onRequestPermission = onRequestTermuxPermission,
+                onOpenAppPermissions = onOpenAppPermissions,
+                onOpenTermuxSettings = onOpenTermuxSettings,
+                onOpenTermux = onOpenTermux,
+                onInstallTermux = onInstallTermux,
+                onRefresh = onRefreshTermuxSetup,
+            )
+        }
+        if (showStarterPromptHint) {
+            SurfaceNotice(
+                title = strings.firstPromptReadyTitle,
+                subtitle = strings.firstPromptReadySubtitle,
+                actionLabel = strings.hide,
+                onAction = onDismissStarterPromptHint,
+                actionEnabled = true,
+            )
+        }
+        if (isEditing) {
+            SurfaceNotice(
+                title = strings.editingEarlierMessageTitle,
+                subtitle = strings.editingEarlierMessageSubtitle,
+                actionLabel = strings.cancel,
+                onAction = onCancelEdit,
+                actionEnabled = true,
+            )
+        }
+        if (attachments.isNotEmpty()) {
+            key(attachmentRevision) {
+                ComposerAttachmentTray(
+                    attachments = attachments,
+                    onRemoveAttachment = onRemoveAttachment,
+                )
+            }
+        }
+
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .offset(y = 7.dp)
+                    .blur(radius = 18.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded)
+                    .clip(ChatGptPromptShape)
+                    .background(ChatGptComposerShadow),
+            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = cardMinHeight)
+                    .animateContentSize(animationSpec = tween(durationMillis = 300, easing = ChatGptMotionEasing))
+                    .clip(ChatGptPromptShape)
+                    .background(AetherSurface)
+                    .clickable(
+                        interactionSource = composerTapInteractionSource,
+                        indication = null,
+                    ) {
+                        focusRequester.requestFocus()
+                        keyboardController?.show()
+                    }
+                    .padding(start = 16.dp, end = 14.dp, top = 18.dp, bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(if (hasSelectedActions) 10.dp else 8.dp),
+            ) {
+                AnimatedVisibility(
+                    visible = hasSelectedActions,
+                    enter = fadeIn(animationSpec = tween(durationMillis = 180, easing = ChatGptMotionEasing)),
+                    exit = fadeOut(animationSpec = tween(durationMillis = 140, easing = ChatGptMotionEasing)),
+                ) {
+                    ComposerActionTray(
+                        modifier = Modifier.fillMaxWidth(),
+                        skills = selectedSkillActions,
+                        mcpServers = selectedMcpActions,
+                        agentModeSelected = agentModeSelected,
+                        onRemoveSkill = { skillId -> onSetSkillSelected(skillId, false) },
+                        onRemoveMcpServer = { serverId -> onSetMcpServerSelected(serverId, false) },
+                        onRemoveAgentMode = { onSetAgentModeSelected(false) },
+                    )
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = measuredTextHeight.coerceAtLeast(30.dp)),
+                    contentAlignment = Alignment.TopStart,
+                ) {
+                    if (value.isBlank()) {
+                        Text(
+                            text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "输入消息..." else "Message...",
+                            style = textStyle,
+                            color = Color(0xFF767676),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    BasicTextField(
+                        value = composerFieldValue,
+                        onValueChange = { newValue ->
+                            composerFieldValue = newValue
+                            onValueChange(newValue.text)
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .focusRequester(focusRequester)
+                            .onFocusChanged { focusState ->
+                                if (textFieldFocused != focusState.isFocused) {
+                                    textFieldFocused = focusState.isFocused
+                                }
+                            },
+                        textStyle = textStyle,
+                        maxLines = 5,
+                        onTextLayout = { textLayoutResult ->
+                            val lineCount = textLayoutResult.lineCount.coerceIn(1, 5)
+                            measuredTextLineCount = lineCount
+                            val visibleLineBottom = textLayoutResult.getLineBottom(lineCount - 1)
+                            val visibleLineTop = textLayoutResult.getLineTop(0)
+                            measuredTextHeight = with(density) {
+                                (visibleLineBottom - visibleLineTop).toDp()
+                            }
+                        },
+                        cursorBrush = SolidColor(AetherOnSurface),
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Box {
+                        ComposerIconButton(
+                            icon = Icons.Rounded.Add,
+                            contentDescription = strings.addAttachmentOrTool,
+                            iconSize = 30.dp,
+                            onClick = {
+                                toolsMenuExpanded = false
+                                attachmentMenuExpanded = !attachmentMenuExpanded
+                            },
+                        )
+                        ComposerAttachmentPopup(
+                            visibleState = attachmentMenuVisibility,
+                            onDismiss = { attachmentMenuExpanded = false },
+                            onPickImages = {
+                                attachmentMenuExpanded = false
+                                onPickImages()
+                            },
+                            onPickFiles = {
+                                attachmentMenuExpanded = false
+                                onPickFiles()
+                            },
+                        )
+                    }
+
+                    Box {
+                        ComposerToolsButton(
+                            selected = toolsMenuExpanded || hasSelectedActions,
+                            selectedCount = selectedActionCount,
+                            onClick = {
+                                attachmentMenuExpanded = false
+                                toolsMenuExpanded = !toolsMenuExpanded
+                            },
+                        )
+                        ComposerToolsPopup(
+                            visibleState = toolsMenuVisibility,
+                            agentModeAvailable = agentModeAvailable,
+                            agentModeSelected = agentModeSelected,
+                            allSkillsSelected = allSkillsSelected,
+                            allMcpServersSelected = allMcpServersSelected,
+                            availableSkills = availableSkills,
+                            availableMcpServers = availableMcpServers,
+                            selectedSkillSet = selectedSkillSet,
+                            selectedMcpServerSet = selectedMcpServerSet,
+                            onDismiss = { toolsMenuExpanded = false },
+                            onPromptSelected = { prompt ->
+                                toolsMenuExpanded = false
+                                applyPromptSelection(prompt)
+                            },
+                            onSetAgentModeSelected = onSetAgentModeSelected,
+                            onSetSkillSelected = onSetSkillSelected,
+                            onSetMcpServerSelected = onSetMcpServerSelected,
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.weight(1f))
+
+                    ComposerIconButton(
+                        icon = Icons.Rounded.Mic,
+                        contentDescription = strings.voice,
+                        iconSize = 23.dp,
+                        onClick = {
+                            Toast.makeText(
+                                context,
+                                if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                                    "语音输入暂不可用"
+                                } else {
+                                    "Voice input is not available yet"
+                                },
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        },
+                    )
+                    if (showPauseButton) {
+                        ComposerPauseButton(onClick = onPauseGeneration)
+                    }
+                    if (showSubmitButton) {
+                        Box {
+                            ComposerSubmitButton(
+                                hasDraft = hasDraft,
+                                canSendDraft = canSendDraft,
+                                isSending = isSending,
+                                onClick = {
+                                    if (!hasDraft || !canSendDraft) return@ComposerSubmitButton
+                                    if (isSending) followUpMenuExpanded = true else onSend()
+                                },
+                            )
+                            ComposerFollowUpPopup(
+                                visible = isSending && (followUpMenuVisibility.currentState || followUpMenuVisibility.targetState),
+                                visibleState = followUpMenuVisibility,
+                                onDismiss = { followUpMenuExpanded = false },
+                                onSteerFollowUp = {
+                                    followUpMenuExpanded = false
+                                    onSteerFollowUp()
+                                },
+                                onQueueFollowUp = {
+                                    followUpMenuExpanded = false
+                                    onQueueFollowUp()
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerIconButton(
+    icon: ImageVector,
+    contentDescription: String?,
+    iconSize: Dp,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .size(38.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            tint = AetherOnSurface,
+            modifier = Modifier.size(iconSize),
+        )
+    }
+}
+
+@Composable
+private fun ComposerToolsButton(
+    selected: Boolean,
+    selectedCount: Int,
+    onClick: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    Row(
+        modifier = Modifier
+            .height(38.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(if (selected) AetherSurfaceHigh else AetherSurfaceHigh.copy(alpha = 0.72f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.Tune,
+            contentDescription = null,
+            tint = AetherOnSurface,
+            modifier = Modifier.size(20.dp),
+        )
+        Text(
+            text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "工具" else "Tools",
+            style = MaterialTheme.typography.bodyLarge.copy(fontSize = 16.sp, lineHeight = 20.sp),
+            color = AetherOnSurface,
+            maxLines = 1,
+        )
+        if (selectedCount > 0) {
+            Box(
+                modifier = Modifier
+                    .size(20.dp)
+                    .clip(CircleShape)
+                    .background(AetherOnSurface),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = selectedCount.coerceAtMost(9).toString(),
+                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                    color = AetherSurface,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerAttachmentPopup(
+    visibleState: MutableTransitionState<Boolean>,
+    onDismiss: () -> Unit,
+    onPickImages: () -> Unit,
+    onPickFiles: () -> Unit,
+) {
+    if (!visibleState.currentState && !visibleState.targetState) return
+    val strings = rememberAetherStrings()
+    val density = LocalDensity.current
+    Popup(
+        alignment = Alignment.BottomStart,
+        offset = with(density) { IntOffset(0, -48.dp.roundToPx()) },
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(
+            focusable = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true,
+        ),
+    ) {
+        AnimatedVisibility(
+            visibleState = visibleState,
+            enter = fadeIn() + scaleIn(initialScale = 0.94f, transformOrigin = TransformOrigin(0f, 1f)),
+            exit = fadeOut() + scaleOut(targetScale = 0.96f, transformOrigin = TransformOrigin(0f, 1f)),
+        ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 220.dp, max = 260.dp)
+                    .shadow(16.dp, RoundedCornerShape(24.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(AetherSurface)
+                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                ComposerPlusMenuRow(
+                    title = strings.photos,
+                    icon = Icons.Rounded.Image,
+                    iconTint = AetherOnSurface,
+                    iconContainerColor = Color.Transparent,
+                    onClick = onPickImages,
+                )
+                ComposerPlusMenuRow(
+                    title = strings.files,
+                    icon = Icons.Rounded.AttachFile,
+                    iconTint = AetherOnSurface,
+                    iconContainerColor = Color.Transparent,
+                    onClick = onPickFiles,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerToolsPopup(
+    visibleState: MutableTransitionState<Boolean>,
+    agentModeAvailable: Boolean,
+    agentModeSelected: Boolean,
+    allSkillsSelected: Boolean,
+    allMcpServersSelected: Boolean,
+    availableSkills: List<InstalledSkill>,
+    availableMcpServers: List<McpServerConfig>,
+    selectedSkillSet: Set<String>,
+    selectedMcpServerSet: Set<String>,
+    onDismiss: () -> Unit,
+    onPromptSelected: (String) -> Unit,
+    onSetAgentModeSelected: (Boolean) -> Unit,
+    onSetSkillSelected: (String, Boolean) -> Unit,
+    onSetMcpServerSelected: (String, Boolean) -> Unit,
+) {
+    if (!visibleState.currentState && !visibleState.targetState) return
+    val strings = rememberAetherStrings()
+    val isChinese = strings.appLanguage == AppLanguage.SimplifiedChinese
+    val density = LocalDensity.current
+    Popup(
+        alignment = Alignment.BottomStart,
+        offset = with(density) { IntOffset((-56).dp.roundToPx(), -48.dp.roundToPx()) },
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(
+            focusable = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = false,
+        ),
+    ) {
+        AnimatedVisibility(
+            visibleState = visibleState,
+            enter = fadeIn() +
+                scaleIn(initialScale = 0.94f, transformOrigin = TransformOrigin(0f, 1f)) +
+                slideInVertically(initialOffsetY = { it / 12 }),
+            exit = fadeOut() +
+                scaleOut(targetScale = 0.96f, transformOrigin = TransformOrigin(0f, 1f)) +
+                slideOutVertically(targetOffsetY = { it / 14 }),
+        ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 292.dp, max = 332.dp)
+                    .shadow(18.dp, RoundedCornerShape(24.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(AetherSurface)
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 14.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "生成图片" else "Create an image",
+                    icon = Icons.Rounded.Brush,
+                    onClick = { onPromptSelected(if (isChinese) "生成一张图片，内容是：" else "Create an image of ") },
+                )
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "搜索网页" else "Search the web",
+                    icon = Icons.Rounded.Public,
+                    onClick = { onPromptSelected(if (isChinese) "搜索网页：" else "Search the web for ") },
+                )
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "写作或编程" else "Write or code",
+                    icon = Icons.Rounded.Edit,
+                    onClick = { onPromptSelected(if (isChinese) "帮我写作或编程：" else "Help me write or code ") },
+                )
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "深度研究" else "Run deep research",
+                    icon = Icons.Rounded.TravelExplore,
+                    trailing = if (isChinese) "剩余 5 次" else "5 left",
+                    onClick = { onPromptSelected(if (isChinese) "对这个主题进行深度研究：" else "Run deep research on ") },
+                )
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "深入思考" else "Think for longer",
+                    icon = Icons.Rounded.Lightbulb,
+                    onClick = { onPromptSelected(if (isChinese) "请认真思考这个问题：" else "Think carefully about ") },
+                )
+                if (agentModeAvailable || availableSkills.isNotEmpty() || availableMcpServers.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                if (agentModeAvailable) {
+                    ChatGptToolMenuRow(
+                        title = strings.agentMode,
+                        icon = LucideIcons.MousePointer2,
+                        selected = agentModeSelected,
+                        onClick = {
+                            onDismiss()
+                            onSetAgentModeSelected(!agentModeSelected)
+                        },
+                    )
+                }
+                if (availableSkills.isNotEmpty()) {
+                    ChatGptToolMenuRow(
+                        title = if (allSkillsSelected) {
+                            if (isChinese) "清空技能选择" else "Clear selected skills"
+                        } else {
+                            if (isChinese) "全选技能" else "Select all skills"
+                        },
+                        icon = Icons.Rounded.Check,
+                        selected = allSkillsSelected,
+                        onClick = {
+                            onDismiss()
+                            availableSkills.forEach { skill -> onSetSkillSelected(skill.id, !allSkillsSelected) }
+                        },
+                    )
+                }
+                availableSkills.forEach { skill ->
+                    val selected = selectedSkillSet.contains(skill.id)
+                    ChatGptToolMenuRow(
+                        title = skill.quickActionLabel(),
+                        icon = Icons.Rounded.Extension,
+                        selected = selected,
+                        onClick = {
+                            onDismiss()
+                            onSetSkillSelected(skill.id, !selected)
+                        },
+                    )
+                }
+                if (availableMcpServers.isNotEmpty()) {
+                    ChatGptToolMenuRow(
+                        title = if (allMcpServersSelected) {
+                            if (isChinese) "清空 MCP 选择" else "Clear selected MCP"
+                        } else {
+                            if (isChinese) "全选 MCP" else "Select all MCP"
+                        },
+                        icon = Icons.Rounded.Check,
+                        selected = allMcpServersSelected,
+                        onClick = {
+                            onDismiss()
+                            availableMcpServers.forEach { server -> onSetMcpServerSelected(server.id, !allMcpServersSelected) }
+                        },
+                    )
+                }
+                availableMcpServers.forEach { server ->
+                    val selected = selectedMcpServerSet.contains(server.id)
+                    val isStdIo = server.transport is McpTransportConfig.StdIo
+                    ChatGptToolMenuRow(
+                        title = server.quickActionLabel(),
+                        icon = if (isStdIo) Icons.Rounded.Terminal else Icons.Rounded.Cloud,
+                        selected = selected,
+                        onClick = {
+                            onDismiss()
+                            onSetMcpServerSelected(server.id, !selected)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChatGptToolMenuRow(
+    title: String,
+    icon: ImageVector,
+    onClick: () -> Unit,
+    trailing: String? = null,
+    selected: Boolean = false,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (selected) AetherSurfaceHigh else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = AetherOnSurface,
+            modifier = Modifier.size(21.dp),
+        )
+        Text(
+            text = title,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 22.sp),
+            color = AetherOnSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (trailing != null) {
+            Text(
+                text = trailing,
+                style = MaterialTheme.typography.bodyMedium,
+                color = AetherOnSurfaceVariant,
+                maxLines = 1,
+            )
+        }
+        if (selected) {
+            Icon(
+                imageVector = Icons.Rounded.Check,
+                contentDescription = null,
+                tint = AetherOnSurface,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ComposerFollowUpPopup(
+    visible: Boolean,
+    visibleState: MutableTransitionState<Boolean>,
+    onDismiss: () -> Unit,
+    onSteerFollowUp: () -> Unit,
+    onQueueFollowUp: () -> Unit,
+) {
+    if (!visible) return
+    val strings = rememberAetherStrings()
+    val density = LocalDensity.current
+    Popup(
+        alignment = Alignment.BottomEnd,
+        offset = with(density) { IntOffset(0, -12.dp.roundToPx()) },
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(
+            focusable = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true,
+        ),
+    ) {
+        AnimatedVisibility(
+            visibleState = visibleState,
+            enter = fadeIn() + scaleIn(initialScale = 0.92f, transformOrigin = TransformOrigin(1f, 1f)),
+            exit = fadeOut() + scaleOut(targetScale = 0.96f, transformOrigin = TransformOrigin(1f, 1f)),
+        ) {
+            Column(
+                modifier = Modifier
+                    .widthIn(min = 252.dp, max = 284.dp)
+                    .shadow(20.dp, RoundedCornerShape(30.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+                    .clip(RoundedCornerShape(30.dp))
+                    .background(AetherSurface)
+                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                ComposerPlusMenuRow(
+                    title = strings.steerCurrentRun,
+                    icon = Icons.Rounded.AutoAwesome,
+                    iconTint = AetherOnSurface,
+                    iconContainerColor = Color.Transparent,
+                    onClick = onSteerFollowUp,
+                )
+                ComposerPlusMenuRow(
+                    title = strings.queueNextTurn,
+                    icon = Icons.Rounded.ArrowUpward,
+                    iconTint = AetherOnSurface,
+                    iconContainerColor = Color.Transparent,
+                    onClick = onQueueFollowUp,
+                )
+            }
         }
     }
 }
@@ -1539,15 +2546,22 @@ private fun ConversationComposerBar(
     var attachmentMenuExpanded by remember { mutableStateOf(false) }
     val attachmentMenuVisibility = remember { MutableTransitionState(false) }
     attachmentMenuVisibility.targetState = attachmentMenuExpanded
+    var toolsMenuExpanded by remember { mutableStateOf(false) }
+    val toolsMenuVisibility = remember { MutableTransitionState(false) }
+    toolsMenuVisibility.targetState = toolsMenuExpanded
     var followUpMenuExpanded by remember { mutableStateOf(false) }
     val followUpMenuVisibility = remember { MutableTransitionState(false) }
     followUpMenuVisibility.targetState = followUpMenuExpanded
     BackHandler(enabled = attachmentMenuExpanded) { attachmentMenuExpanded = false }
+    BackHandler(enabled = toolsMenuExpanded) { toolsMenuExpanded = false }
     BackHandler(enabled = followUpMenuExpanded) { followUpMenuExpanded = false }
     var textFieldFocused by remember { mutableStateOf(false) }
     var measuredTextLineCount by remember { mutableIntStateOf(1) }
     var measuredTextHeight by remember { mutableStateOf(22.dp) }
     val density = LocalDensity.current
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val composerTapInteractionSource = remember { MutableInteractionSource() }
     val stableImeBottom by rememberStableImeBottom(focused = textFieldFocused)
     val stableImeVisible = stableImeBottom > ImeStabilizationMinVisibleHeight
     val selectedSkillSet = remember(selectedSkillIds) { selectedSkillIds.toSet() }
@@ -1579,7 +2593,7 @@ private fun ConversationComposerBar(
     val showPauseButton = isSending && !hasDraft
     val showSubmitButton = !isSending || hasDraft
     val keepPlusSeparated = value.isNotBlank() || hasSelectedActions
-    val plusSeparated = keepPlusSeparated || (textFieldFocused && stableImeVisible)
+    val plusSeparated = keepPlusSeparated || textFieldFocused || stableImeVisible
     val explicitTextLineCount = if (value.isBlank()) {
         1
     } else {
@@ -1614,43 +2628,34 @@ private fun ConversationComposerBar(
     LaunchedEffect(textFieldFocused) {
         onFocusChanged(textFieldFocused)
     }
-    val composerHorizontalPadding by animateDpAsState(
-        targetValue = when {
-            plusSeparated -> 14.dp
-            hasSelectedActions -> 18.dp
-            else -> 30.dp
-        },
-        animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
-        label = "composer_horizontal_padding",
-    )
     val fieldStartPadding by animateDpAsState(
         targetValue = if (plusSeparated) 50.dp else 0.dp,
-        animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
+        animationSpec = tween(durationMillis = ComposerFocusTransitionMillis, easing = ChatGptMotionEasing),
         label = "composer_field_start",
     )
     val fieldContentStartPadding by animateDpAsState(
         targetValue = if (plusSeparated) 18.dp else 52.dp,
-        animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
+        animationSpec = tween(durationMillis = ComposerFocusTransitionMillis, easing = ChatGptMotionEasing),
         label = "composer_field_content_start",
     )
     val fieldMinHeight by animateDpAsState(
         targetValue = maxOf(
-            if (plusSeparated) 56.dp else 50.dp,
-            measuredTextHeight + fieldTopPadding + fieldBottomPadding,
+            116.dp,
+            measuredTextHeight + fieldTopPadding + fieldBottomPadding + 54.dp,
         ),
         animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
         label = "composer_field_min_height",
     )
     val plusShadowElevation by animateDpAsState(
         targetValue = if (plusSeparated) 10.dp else 0.dp,
-        animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
+        animationSpec = tween(durationMillis = ComposerFocusTransitionMillis, easing = ChatGptMotionEasing),
         label = "composer_plus_shadow",
     )
 
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = composerHorizontalPadding),
+            .padding(horizontal = 24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         if (showTermuxSetupNotice) {
@@ -1724,6 +2729,13 @@ private fun ConversationComposerBar(
                         )
                         .clip(fieldShape)
                         .background(AetherSurface)
+                        .clickable(
+                            interactionSource = composerTapInteractionSource,
+                            indication = null,
+                        ) {
+                            focusRequester.requestFocus()
+                            keyboardController?.show()
+                        }
                         .padding(
                             start = fieldContentStartPadding,
                             end = 8.dp,
@@ -1783,6 +2795,7 @@ private fun ConversationComposerBar(
                                 enabled = true,
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .focusRequester(focusRequester)
                                     .onFocusChanged { focusState ->
                                         if (textFieldFocused != focusState.isFocused) {
                                             textFieldFocused = focusState.isFocused
@@ -2071,7 +3084,7 @@ private fun ComposerPauseButton(
         modifier = Modifier
             .size(38.dp)
             .clip(CircleShape)
-            .background(ChatGptPurple)
+            .background(AetherOnSurface)
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
@@ -2080,7 +3093,7 @@ private fun ComposerPauseButton(
                 .offset(x = 0.5.dp)
                 .size(11.dp)
                 .clip(RoundedCornerShape(3.dp))
-                .background(Color.White)
+                .background(AetherSurface)
         )
     }
 }
@@ -2094,11 +3107,8 @@ private fun ComposerSubmitButton(
 ) {
     val strings = rememberAetherStrings()
     val enabled = hasDraft && canSendDraft
-    val buttonColor = if (enabled) {
-        ChatGptPurple
-    } else {
-        AetherSurfaceHigher
-    }
+    val buttonColor = if (enabled) AetherOnSurface else AetherSurfaceHigher
+    val iconColor = if (enabled) AetherSurface else AetherOnSurfaceVariant.copy(alpha = 0.48f)
     Box(
         modifier = Modifier
             .size(38.dp)
@@ -2117,7 +3127,7 @@ private fun ComposerSubmitButton(
             } else {
                 strings.send
             },
-            tint = Color.White,
+            tint = iconColor,
             modifier = Modifier.size(21.dp),
         )
     }

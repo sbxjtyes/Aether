@@ -169,6 +169,7 @@ private val TimelineLineWidth = 2.dp
 private val TimelineLineTopGap = 9.dp
 private val TimelineLineBottomGap = 0.dp
 private val MessageTimestampFormatter = DateTimeFormatter.ofPattern("MMMM d, h:mm a", Locale.US)
+private val EmptyToolInvocationDetail = ToolInvocationDetail(command = "", result = null)
 
 @Composable
 fun ConversationMessageBubble(
@@ -1106,16 +1107,8 @@ fun ToolInvocationList(
             lastAutoExpanded = autoExpand
         }
     }
-    val childIndent by animateDpAsState(
-        targetValue = if (headerVisible) ToolGroupIndent else 0.dp,
-        animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-        label = "tool_group_indent",
-    )
-    val arrowRotation by animateFloatAsState(
-        targetValue = if (expanded) 90f else 0f,
-        animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-        label = "tool_group_arrow_rotation",
-    )
+    val childIndent = if (headerVisible) ToolGroupIndent else 0.dp
+    val arrowRotation = if (expanded) 90f else 0f
 
     Column(
         modifier = Modifier
@@ -1123,24 +1116,7 @@ fun ToolInvocationList(
             .padding(top = 6.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        AnimatedVisibility(
-            visible = headerVisible,
-            enter = fadeIn(
-                animationSpec = tween(
-                    durationMillis = ToolTransitionDurationMillis - 100,
-                    easing = ToolTransitionEasing,
-                ),
-            ) + expandVertically(
-                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-                expandFrom = Alignment.Top,
-            ),
-            exit = fadeOut(
-                animationSpec = tween(durationMillis = 180, easing = FastOutLinearInEasing),
-            ) + shrinkVertically(
-                animationSpec = tween(durationMillis = 220, easing = FastOutLinearInEasing),
-                shrinkTowards = Alignment.Top,
-            ),
-        ) {
+        if (headerVisible) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1178,36 +1154,14 @@ fun ToolInvocationList(
             }
         }
 
-        AnimatedVisibility(
-            visible = headerVisible && !expanded,
-            enter = fadeIn(animationSpec = tween(durationMillis = 180, easing = ToolTransitionEasing)),
-            exit = fadeOut(animationSpec = tween(durationMillis = 140, easing = FastOutLinearInEasing)),
-        ) {
+        if (headerVisible && !expanded) {
             CollapsedToolInvocationPreview(
                 toolInvocations = toolInvocations,
                 onExpand = { expanded = true },
             )
         }
 
-        AnimatedVisibility(
-            visible = expanded,
-            enter = expandVertically(
-                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-                expandFrom = Alignment.Top,
-            ) + fadeIn(
-                animationSpec = tween(
-                    durationMillis = ToolTransitionDurationMillis - 90,
-                    delayMillis = 40,
-                    easing = ToolTransitionEasing,
-                ),
-            ),
-            exit = shrinkVertically(
-                animationSpec = tween(durationMillis = 260, easing = FastOutLinearInEasing),
-                shrinkTowards = Alignment.Top,
-            ) + fadeOut(
-                animationSpec = tween(durationMillis = 180, easing = FastOutLinearInEasing),
-            ),
-        ) {
+        if (expanded) {
             ToolInvocationCardsColumn(
                 toolInvocations = toolInvocations,
                 indent = childIndent,
@@ -1226,10 +1180,7 @@ private fun ToolInvocationCardsColumn(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = indent)
-            .animateContentSize(
-                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-            ),
+            .padding(start = indent),
         verticalArrangement = Arrangement.spacedBy(0.dp),
     ) {
         toolInvocations.forEach { toolInvocation ->
@@ -1246,29 +1197,10 @@ private fun ToolInvocationAnimatedCard(
     toolInvocation: ChatToolInvocation,
     topPadding: Dp,
 ) {
-    var visible by rememberSaveable(toolInvocation.id) { mutableStateOf(false) }
-    LaunchedEffect(toolInvocation.id) {
-        visible = true
-    }
-
-    AnimatedVisibility(
-        visible = visible,
-        enter = expandVertically(
-            animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-            expandFrom = Alignment.Top,
-        ) + fadeIn(
-            animationSpec = tween(
-                durationMillis = ToolTransitionDurationMillis - 90,
-                delayMillis = 30,
-                easing = ToolTransitionEasing,
-            ),
-        ),
-    ) {
-        ToolInvocationCard(
-            toolInvocation = toolInvocation,
-            topPadding = topPadding,
-        )
-    }
+    ToolInvocationCard(
+        toolInvocation = toolInvocation,
+        topPadding = topPadding,
+    )
 }
 
 @Composable
@@ -1845,25 +1777,7 @@ private fun ReasoningTimelineToolRow(
                     onOpenLink = onOpenLink,
                 )
             }
-            AnimatedVisibility(
-                visible = expanded && detail.command.isNotBlank(),
-                enter = expandVertically(
-                    animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-                    expandFrom = Alignment.Top,
-                ) + fadeIn(
-                    animationSpec = tween(
-                        durationMillis = ToolTransitionDurationMillis - 90,
-                        delayMillis = 40,
-                        easing = ToolTransitionEasing,
-                    ),
-                ),
-                exit = shrinkVertically(
-                    animationSpec = tween(durationMillis = 240, easing = FastOutLinearInEasing),
-                    shrinkTowards = Alignment.Top,
-                ) + fadeOut(
-                    animationSpec = tween(durationMillis = 160, easing = FastOutLinearInEasing),
-                ),
-            ) {
+            if (expanded && detail.command.isNotBlank()) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     SyntaxHighlightedCodeBlock(
                         label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "命令" else "Command",
@@ -2148,33 +2062,12 @@ fun ReconnectingStatusCard(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .animateContentSize(
-                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-            )
             .noRippleClickable(enabled = detail.isNotBlank()) { expanded = !expanded },
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         ShimmerStatusText(text = text)
 
-        AnimatedVisibility(
-            visible = expanded && detail.isNotBlank(),
-            enter = expandVertically(
-                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-                expandFrom = Alignment.Top,
-            ) + fadeIn(
-                animationSpec = tween(
-                    durationMillis = ToolTransitionDurationMillis - 90,
-                    delayMillis = 40,
-                    easing = ToolTransitionEasing,
-                ),
-            ),
-            exit = shrinkVertically(
-                animationSpec = tween(durationMillis = 240, easing = FastOutLinearInEasing),
-                shrinkTowards = Alignment.Top,
-            ) + fadeOut(
-                animationSpec = tween(durationMillis = 160, easing = FastOutLinearInEasing),
-            ),
-        ) {
+        if (expanded && detail.isNotBlank()) {
             SyntaxHighlightedCodeBlock(
                 label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "错误" else "Error",
                 content = remember(detail) { highlightToolResult(detail) },
@@ -2190,8 +2083,19 @@ fun ToolInvocationCard(
 ) {
     val strings = rememberAetherStrings()
     val arguments = remember(toolInvocation.argumentsJson) { parseJsonObject(toolInvocation.argumentsJson) }
-    val detail = remember(toolInvocation, strings.appLanguage) { formatToolInvocationDetail(strings, toolInvocation) }
     var expanded by rememberSaveable(toolInvocation.id) { mutableStateOf(false) }
+    // Compute detail lazily: only when the card is expanded or actively running.
+    // The key intentionally excludes `expanded` so that toggling open/close does
+    // not re-trigger an expensive JSON parse; instead we gate display with the
+    // `expanded` flag below. The detail is cached as long as the invocation data
+    // and language setting are unchanged.
+    val detail = remember(toolInvocation.id, toolInvocation.isRunning, toolInvocation.outputJson, strings.appLanguage) {
+        if (toolInvocation.isRunning || toolInvocation.outputJson.isNotBlank()) {
+            formatToolInvocationDetail(strings, toolInvocation)
+        } else {
+            EmptyToolInvocationDetail
+        }
+    }
     LaunchedEffect(
         toolInvocation.id,
         toolInvocation.isRunning,
@@ -2216,9 +2120,6 @@ fun ToolInvocationCard(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .animateContentSize(
-                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-            )
             .noRippleClickable { expanded = !expanded }
             .padding(top = topPadding),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -2236,25 +2137,7 @@ fun ToolInvocationCard(
                 color = AetherOnSurfaceVariant,
             )
         }
-        AnimatedVisibility(
-            visible = expanded && detail.command.isNotBlank(),
-            enter = expandVertically(
-                animationSpec = tween(durationMillis = ToolTransitionDurationMillis, easing = ToolTransitionEasing),
-                expandFrom = Alignment.Top,
-            ) + fadeIn(
-                animationSpec = tween(
-                    durationMillis = ToolTransitionDurationMillis - 90,
-                    delayMillis = 40,
-                    easing = ToolTransitionEasing,
-                ),
-            ),
-            exit = shrinkVertically(
-                animationSpec = tween(durationMillis = 240, easing = FastOutLinearInEasing),
-                shrinkTowards = Alignment.Top,
-            ) + fadeOut(
-                animationSpec = tween(durationMillis = 160, easing = FastOutLinearInEasing),
-            ),
-        ) {
+        if (expanded && detail.command.isNotBlank()) {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 SyntaxHighlightedCodeBlock(
                     label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "命令" else "Command",
@@ -2302,13 +2185,14 @@ private fun SyntaxHighlightedCodeBlock(
                     .background(AetherSurfaceHigh)
                     .padding(horizontal = 12.dp, vertical = 10.dp)
                     .heightIn(max = 220.dp)
-                    .horizontalScroll(rememberScrollState())
-                    .verticalScroll(rememberScrollState()),
+                    .horizontalScroll(rememberScrollState()),
             ) {
                 Text(
                     text = content,
                     style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                     color = AetherOnSurface,
+                    maxLines = 14,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }
@@ -2459,16 +2343,20 @@ private fun AttachmentFilePreview(
             )
         } else {
             SelectionContainer {
-                Column(
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(min = 160.dp, max = 360.dp)
-                        .verticalScroll(rememberScrollState()),
+                        .heightIn(min = 160.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(AetherSurface)
+                        .padding(14.dp),
                 ) {
                     Text(
                         text = preview.text,
                         style = MaterialTheme.typography.bodyMedium,
                         color = AetherOnSurface,
+                        maxLines = 12,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }
@@ -3012,6 +2900,34 @@ private fun formatToolInvocationTitleLabel(toolInvocation: ChatToolInvocation): 
             subject = arguments?.optString("url").orEmpty(),
             fallback = "web page",
         )
+        "stock_market_data" -> {
+            val action = arguments?.optString("action").orEmpty().lowercase()
+            val symbol = arguments?.optString("symbol").orEmpty().trim()
+            val query = arguments?.optString("query").orEmpty().trim()
+            when (action) {
+                "search" -> formatArgumentDrivenTitle(
+                    isRunning = toolInvocation.isRunning,
+                    progressiveVerb = "Searching stocks",
+                    completedVerb = "Searched stocks",
+                    subject = query,
+                    fallback = "stocks",
+                )
+                "chart" -> formatArgumentDrivenTitle(
+                    isRunning = toolInvocation.isRunning,
+                    progressiveVerb = "Fetching chart",
+                    completedVerb = "Fetched chart",
+                    subject = symbol,
+                    fallback = "stock chart",
+                )
+                else -> formatArgumentDrivenTitle(
+                    isRunning = toolInvocation.isRunning,
+                    progressiveVerb = "Fetching quote",
+                    completedVerb = "Fetched quote",
+                    subject = symbol.ifBlank { query },
+                    fallback = "stock quote",
+                )
+            }
+        }
         else -> if (toolInvocation.isRunning) {
             "Using ${toolInvocation.toolName}"
         } else {
@@ -3071,6 +2987,21 @@ private fun summarizeToolInvocationCommandLabel(
         "agent_display" -> summarizeAgentDisplayCommand(arguments)
         "tavily_search" -> "search ${arguments.optString("query").trim()}"
         "fetch_web_url" -> "fetch ${arguments.optString("url").trim()}"
+        "stock_market_data" -> {
+            val action = arguments.optString("action").lowercase().ifBlank { "quote" }
+            val symbol = arguments.optString("symbol").trim()
+            val query = arguments.optString("query").trim()
+            val range = arguments.optString("range").trim()
+            val interval = arguments.optString("interval").trim()
+            buildString {
+                append("stock_market_data")
+                if (symbol.isNotBlank()) { append(" "); append(symbol) }
+                else if (query.isNotBlank()) { append(" "); append(query) }
+                if (action.isNotBlank() && action != "quote") { append(" action=$action") }
+                if (range.isNotBlank()) { append(" range=$range") }
+                if (interval.isNotBlank()) { append(" interval=$interval") }
+            }
+        }
         else -> toolName
     }.trim()
 }
@@ -3095,6 +3026,8 @@ private fun formatToolInvocationGroupTitle(
 
 private fun formatToolInvocationDetail(strings: AetherStrings, toolInvocation: ChatToolInvocation): ToolInvocationDetail {
     val arguments = parseJsonObject(toolInvocation.argumentsJson)
+    // For stock_market_data we only parse the output JSON when we must (completed state).
+    // The arguments JSON is small and always parsed; the output JSON can be large (candles).
     val output = parseJsonObject(toolInvocation.outputJson)
     val command = output?.optString("command")
         .orEmpty()
@@ -3111,6 +3044,12 @@ private fun formatToolInvocationDetail(strings: AetherStrings, toolInvocation: C
 
     val result = when {
         output == null -> toolInvocation.outputJson.trim().ifBlank { strings.noOutput }
+        // Fast path for stock_market_data: the output JSON can contain hundreds of candle
+        // entries. Avoid the expensive JSONObject.toString(2) path by reading only the
+        // pre-formatted stdout summary that the tool already produces.
+        toolInvocation.toolName.equals("stock_market_data", ignoreCase = true) -> {
+            output.optString("stdout").trim().ifBlank { strings.noOutput }
+        }
         isMcpToolInvocation(toolInvocation.toolName, output) -> {
             formatMcpToolResult(strings, output)
         }
@@ -3415,7 +3354,11 @@ private fun CollapsedToolInvocationPreview(
         verticalArrangement = Arrangement.spacedBy(7.dp),
     ) {
         toolInvocations.take(4).forEach { invocation ->
-            val detail = remember(invocation, strings.appLanguage) {
+            // Use a stable, lightweight key (id + outputJson length) instead of the full
+            // invocation object so that large stock_market_data payloads do not cause the
+            // key equality check itself to be expensive, and so that scrolling past a
+            // collapsed preview does not retrigger JSON parsing on recomposition.
+            val detail = remember(invocation.id, invocation.isRunning, invocation.outputJson.length, strings.appLanguage) {
                 formatToolInvocationDetail(strings, invocation)
             }
             Row(
