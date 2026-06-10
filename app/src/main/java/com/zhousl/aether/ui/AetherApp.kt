@@ -108,7 +108,9 @@ import androidx.core.content.FileProvider
 import com.zhousl.aether.data.AetherPrivacyPolicyUrl
 import com.zhousl.aether.data.AetherWebsiteUrl
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
+import com.zhousl.aether.data.AgentTaskState
 import com.zhousl.aether.data.AppSettings
+import com.zhousl.aether.data.SessionExecutionState
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.LlmProviderConfig
 import com.zhousl.aether.data.ProviderModelOption
@@ -167,6 +169,8 @@ fun AetherApp(
     onPrivacyPolicyAccepted: () -> Unit = {},
 ) {
     val uiState = viewModel.uiState.collectAsStateWithLifecycle().value
+    // 流式执行状态单独订阅，逐 token 更新只影响依赖它的子树，不会重组整包 uiState。
+    val executionStates = viewModel.executionStates.collectAsStateWithLifecycle().value
     val strings = remember(uiState.settings.language) { aetherStringsFor(uiState.settings.language) }
 
     AetherLocalization(uiState.settings.language) {
@@ -178,6 +182,7 @@ fun AetherApp(
                 AetherAppContent(
                     viewModel = viewModel,
                     uiState = uiState,
+                    executionStates = executionStates,
                     strings = strings,
                     onPrivacyPolicyAccepted = onPrivacyPolicyAccepted,
                 )
@@ -190,6 +195,7 @@ fun AetherApp(
 private fun AetherAppContent(
     viewModel: AetherViewModel,
     uiState: AetherUiState,
+    executionStates: Map<String, SessionExecutionState>,
     strings: AetherStrings,
     onPrivacyPolicyAccepted: () -> Unit,
 ) {
@@ -202,7 +208,7 @@ private fun AetherAppContent(
     val activeSession = uiState.sessions.firstOrNull { it.id == uiState.currentSessionId }
     val activeProviderConfig = uiState.providerConfigs.firstOrNull { it.isEnabled }
         ?: uiState.providerConfigs.firstOrNull()
-    val currentSessionExecution = uiState.sessionExecutionStates[uiState.currentSessionId]
+    val currentSessionExecution = executionStates[uiState.currentSessionId]
     val currentMessages = activeSession?.messages.orEmpty()
     val selectedSkillIds = activeSession?.selectedSkillIds ?: uiState.draftSelectedSkillIds
     val selectedMcpServerIds = activeSession?.activeMcpServerIds ?: uiState.draftSelectedMcpServerIds
@@ -445,7 +451,7 @@ private fun AetherAppContent(
             ConversationDrawer(
                 sessions = uiState.sessions,
                 selectedSessionId = uiState.currentSessionId,
-                sessionExecutionStates = uiState.sessionExecutionStates,
+                sessionExecutionStates = executionStates,
                 unviewedCompletedSessionIds = uiState.unviewedCompletedSessionIds,
                 onNewChat = {
                     viewModel.startNewChat()
@@ -549,6 +555,7 @@ private fun AetherAppContent(
                             pendingStatusText = currentSessionExecution?.pendingStatusText.orEmpty(),
                             pendingStatusDetail = currentSessionExecution?.pendingStatusDetail.orEmpty(),
                             pendingInputs = pendingInputs,
+                            taskState = activeSession?.taskState ?: AgentTaskState(),
                             inputValue = uiState.draftInput,
                             draftAttachments = uiState.draftAttachments,
                             draftAttachmentRevision = uiState.draftAttachmentRevision,

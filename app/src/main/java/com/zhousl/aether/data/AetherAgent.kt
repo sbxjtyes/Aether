@@ -28,6 +28,15 @@ private const val MaxSleepDurationMillis = 10 * 60 * 1000L
 private const val AetherAgentLogTag = "AetherAgent"
 private const val MaxStockCandleOutputCount = 200
 private const val QuoteStockCandleOutputCount = 5
+private const val MaxConversationDecisionTextChars = 2_000
+private const val MaxTaskStateTextChars = 2_000
+private const val MaxTaskStateItemTextChars = 240
+private const val MaxTaskStateItemCount = 24
+
+// 单个 turn 内工具调用轮次的硬上限，防止模型陷入无限工具调用循环耗尽资源。
+private const val MaxToolRoundsPerTurn = 64
+// 工具执行遇到疑似瞬时错误（网络/超时等）时的额外重试次数。
+private const val MaxTransientToolRetries = 1
 
 class AetherAgent(
     private val client: OpenAiCompatibleClient,
@@ -49,6 +58,7 @@ class AetherAgent(
         activeSkills: List<ActiveSkillContext> = emptyList(),
         mcpToolBindings: List<McpToolBinding> = emptyList(),
         agentModeEnabled: Boolean = false,
+        taskState: AgentTaskState = AgentTaskState(),
         onToolEvent: suspend (AgentToolEvent) -> Unit = {},
         onAssistantTextDelta: suspend (String) -> Unit = {},
         onAssistantReasoningDelta: suspend (String) -> Unit = {},
@@ -56,8 +66,9 @@ class AetherAgent(
         onAssistantTextReset: suspend () -> Unit = {},
         onStreamingStatus: suspend (StreamingStatus?) -> Unit = {},
         onSkillActivated: suspend (ActiveSkillContext) -> Unit = {},
+        onTaskStateUpdated: suspend (AgentTaskState) -> Unit = {},
         pollInjectedUserMessages: suspend () -> List<LlmMessage> = { emptyList() },
-    ): Result<String> {
+    ): Result<AgentTurnResult> {
         return try {
         val conversation = client.buildConversation(
             settings = settings,
@@ -94,7 +105,11 @@ class AetherAgent(
                 LlmProvider.OpenAiCompatible,
             ) && mcpToolBindings.isNotEmpty()
         var lastAssistantText = ""
+        var conversationDecision = AgentConversationDecision.completed()
+        var latestTaskState = taskState
+        var updatedTaskState: AgentTaskState? = null
         var lastAgentModeScreenshotMessageIndex: Int? = null
+        var internalOnlyContinuationCount = 0
         val latestUserText = messages.lastOrNull { it.role == "user" }
             ?.contentParts
             ?.filterIsInstance<LlmTextPart>()
@@ -104,8 +119,16 @@ class AetherAgent(
         val parallelToolCallSupportKey = settings.parallelToolCallSupportKey()
         var parallelToolCallsEnabled = !useBasicToolCompatibility && settings.supportsParallelToolCalls()
 
+        var turnUsage = TokenUsage()
         var round = 0
         while (true) {
+            if (round >= MaxToolRoundsPerTurn) {
+                // 触达单轮工具调用硬上限：停止以避免失控的无限循环。
+                if (lastAssistantText.isBlank()) {
+                    lastAssistantText = "Reached the maximum number of tool-call rounds for a single turn and stopped to avoid an endless loop. Send another message to continue."
+                }
+                break
+            }
             val injectedMessages = pollInjectedUserMessages()
             if (injectedMessages.isNotEmpty()) {
                 lastAssistantText = ""
@@ -122,11 +145,14 @@ class AetherAgent(
                 mcpToolBindings = mcpToolBindings,
                 exposeNamespacedMcpTools = exposeNamespacedMcpTools,
                 agentModeEnabled = agentModeEnabled,
+                taskState = latestTaskState,
                 parallelToolCallsEnabled = parallelToolCallsEnabled,
                 basicToolCompatibilityMode = useBasicToolCompatibility,
             )
             val tools = buildList {
                 addAll(baseTools)
+                add(buildConversationStatusToolDefinition())
+                add(buildTaskStateToolDefinition())
                 if (!parallelToolCallsEnabled && !useBasicToolCompatibility) {
                     add(buildRunToolBatchToolDefinition())
                 }
@@ -176,6 +202,7 @@ class AetherAgent(
                 continue
             }
 
+            response.usage?.let { turnUsage += it }
             conversation += response.assistantMessage
 
             if (response.assistantText.isNotBlank()) {
@@ -210,10 +237,38 @@ class AetherAgent(
                 onSkillActivated = onSkillActivated,
             )
             toolResults.forEach { result ->
+                if (result.name == "set_conversation_status") {
+                    conversationDecision = parseConversationDecision(result.rawOutput)
+                }
+                if (result.name == "update_task_state") {
+                    parseTaskStateToolOutput(result.rawOutput)?.let { parsedTaskState ->
+                        latestTaskState = parsedTaskState
+                        updatedTaskState = parsedTaskState
+                        onTaskStateUpdated(parsedTaskState)
+                    }
+                }
                 buildAgentDisplayScreenshotMessage(result.rawOutput)?.let { screenshotMessage ->
                     pendingAgentDisplayScreenshotMessage = screenshotMessage
                 }
             }
+            if (toolResults.all { isInternalToolCall(it.name) }) {
+                if (lastAssistantText.isNotBlank()) break
+                if (internalOnlyContinuationCount >= 2) break
+                internalOnlyContinuationCount += 1
+                conversation += client.buildToolResultMessages(
+                    settings = settings,
+                    results = toolResults.map { result ->
+                        ChatCompletionToolResult(
+                            callId = result.id,
+                            name = result.name,
+                            output = result.visibleOutput,
+                        )
+                    },
+                )
+                round += 1
+                continue
+            }
+            internalOnlyContinuationCount = 0
             conversation += client.buildToolResultMessages(
                 settings = settings,
                 results = toolResults.map { result ->
@@ -239,10 +294,18 @@ class AetherAgent(
             }
             round += 1
         }
+        val finalTaskState = updatedTaskState ?: latestTaskState
+        val finalConversationDecision = deriveConversationDecision(
+            explicitDecision = conversationDecision,
+            taskState = finalTaskState,
+        )
         Result.success(
-            lastAssistantText.ifBlank {
-                "The model finished without returning any assistant text."
-            }
+            AgentTurnResult(
+                assistantText = lastAssistantText.ifBlank { fallbackAssistantText(finalConversationDecision, finalTaskState) },
+                conversationDecision = finalConversationDecision,
+                taskState = updatedTaskState,
+                usage = turnUsage,
+            )
         )
         } catch (cancellationException: CancellationException) {
             throw cancellationException
@@ -270,7 +333,9 @@ class AetherAgent(
                 id = toolCalls[index].id.ifBlank { "tool-$round-$index" },
             )
             if (!parallelToolCallsEnabled || !isParallelSafeToolCall(current.toolCall.name)) {
-                onToolStarted(current, onToolEvent)
+                if (!isInternalToolCall(current.toolCall.name)) {
+                    onToolStarted(current, onToolEvent)
+                }
                 val result = executeToolCall(
                     indexedToolCall = current,
                     settings = settings,
@@ -279,7 +344,9 @@ class AetherAgent(
                     activeSkills = activeSkills,
                     onSkillActivated = onSkillActivated,
                 )
-                onToolCompleted(result, onToolEvent)
+                if (!isInternalToolCall(result.name)) {
+                    onToolCompleted(result, onToolEvent)
+                }
                 results += result
                 index += 1
                 continue
@@ -298,7 +365,11 @@ class AetherAgent(
                 index += 1
             }
 
-            batch.forEach { onToolStarted(it, onToolEvent) }
+            batch.forEach {
+                if (!isInternalToolCall(it.toolCall.name)) {
+                    onToolStarted(it, onToolEvent)
+                }
+            }
             val indexedBatchResults = coroutineScope {
                 batch.mapIndexed { batchIndex, item ->
                     async {
@@ -310,7 +381,9 @@ class AetherAgent(
                             activeSkills = activeSkills,
                             onSkillActivated = onSkillActivated,
                         )
-                        onToolCompleted(result, onToolEvent)
+                        if (!isInternalToolCall(result.name)) {
+                            onToolCompleted(result, onToolEvent)
+                        }
                         batchIndex to result
                     }
                 }.map { it.await() }
@@ -358,22 +431,33 @@ class AetherAgent(
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): ExecutedToolCallResult {
         val toolCall = indexedToolCall.toolCall
-        val rawOutput = try {
-            executeFunctionCall(
-                toolCall = toolCall,
-                settings = settings,
-                workspaceDirectory = workspaceDirectory,
-                availableSkills = availableSkills,
-                activeSkills = activeSkills,
-                onSkillActivated = onSkillActivated,
-            )
-        } catch (cancellationException: CancellationException) {
-            throw cancellationException
-        } catch (throwable: Throwable) {
-            JSONObject().apply {
-                put("ok", false)
-                put("errmsg", throwable.message ?: "Tool execution failed.")
-            }.toString()
+        var attempt = 0
+        var rawOutput: String
+        while (true) {
+            rawOutput = try {
+                executeFunctionCall(
+                    toolCall = toolCall,
+                    settings = settings,
+                    workspaceDirectory = workspaceDirectory,
+                    availableSkills = availableSkills,
+                    activeSkills = activeSkills,
+                    onSkillActivated = onSkillActivated,
+                )
+            } catch (cancellationException: CancellationException) {
+                throw cancellationException
+            } catch (throwable: Throwable) {
+                // 仅对疑似瞬时错误（网络/超时等）做有限次自动重试；确定性错误（如参数错误）直接回传模型。
+                if (attempt < MaxTransientToolRetries && shouldReconnectLlmRequest(throwable)) {
+                    attempt += 1
+                    delay(800L * attempt)
+                    continue
+                }
+                JSONObject().apply {
+                    put("ok", false)
+                    put("errmsg", throwable.message ?: "Tool execution failed.")
+                }.toString()
+            }
+            break
         }
         val visibleOutput = sanitizeToolOutputForConversation(toolCall.name, rawOutput)
         return ExecutedToolCallResult(
@@ -388,10 +472,15 @@ class AetherAgent(
     private fun isParallelSafeToolCall(toolName: String): Boolean = when (toolName) {
         "run_tool_batch",
         "activate_skill",
-        "agent_display" -> false
+        "agent_display",
+        "set_conversation_status",
+        "update_task_state" -> false
 
         else -> true
     }
+
+    private fun isInternalToolCall(toolName: String): Boolean =
+        toolName == "set_conversation_status" || toolName == "update_task_state"
 
     private suspend fun executeFunctionCall(
         toolCall: ChatCompletionToolCall,
@@ -426,6 +515,8 @@ class AetherAgent(
             "fetch_bash_output" -> bashTool.fetchExecution(toolCall.arguments)
             "kill_bash" -> bashTool.killExecution(toolCall.arguments)
             "sleep" -> executeSleep(toolCall.arguments)
+            "set_conversation_status" -> executeSetConversationStatus(toolCall.arguments)
+            "update_task_state" -> executeUpdateTaskState(toolCall.arguments)
             "activate_skill" -> executeActivateSkill(
                 argumentsJson = toolCall.arguments,
                 availableSkills = availableSkills,
@@ -475,6 +566,193 @@ class AetherAgent(
                 }.toString()
             }
         }
+    }
+
+    private fun executeSetConversationStatus(argumentsJson: String): String {
+        val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
+            ?: return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Arguments were not valid JSON.")
+                put("status", AgentConversationStatus.Completed.storageValue)
+            }.toString()
+        val status = AgentConversationStatus.fromStorageValue(arguments.optString("status"))
+        val reason = arguments.cleanOptionalString("reason")
+            .take(MaxConversationDecisionTextChars)
+        val nextPrompt = arguments.cleanOptionalString("next_prompt")
+            .ifBlank { arguments.cleanOptionalString("nextPrompt") }
+            .take(MaxConversationDecisionTextChars)
+        return JSONObject().apply {
+            put("ok", true)
+            put("status", status.storageValue)
+            put("reason", reason)
+            put("next_prompt", nextPrompt)
+        }.toString()
+    }
+
+    private fun parseConversationDecision(output: String): AgentConversationDecision {
+        val parsed = runCatching { JSONObject(output) }.getOrNull()
+            ?: return AgentConversationDecision.completed()
+        if (!parsed.optBoolean("ok", true)) {
+            return AgentConversationDecision(
+                status = AgentConversationStatus.Blocked,
+                reason = parsed.optString("errmsg").trim(),
+            )
+        }
+        return AgentConversationDecision(
+            status = AgentConversationStatus.fromStorageValue(parsed.optString("status")),
+            reason = parsed.cleanOptionalString("reason").take(MaxConversationDecisionTextChars),
+            nextPrompt = parsed.cleanOptionalString("next_prompt")
+                .ifBlank { parsed.cleanOptionalString("nextPrompt") }
+                .take(MaxConversationDecisionTextChars),
+        )
+    }
+
+    private fun fallbackAssistantText(
+        conversationDecision: AgentConversationDecision,
+        taskState: AgentTaskState?,
+    ): String = when (conversationDecision.status) {
+        AgentConversationStatus.WaitingForUser -> conversationDecision.reason.ifBlank {
+            "I need your input before I can continue."
+        }
+        AgentConversationStatus.Blocked -> conversationDecision.reason.ifBlank {
+            "I am blocked and cannot make meaningful progress yet."
+        }
+        AgentConversationStatus.Continue -> conversationDecision.reason.ifBlank {
+            "I will continue with the next step."
+        }
+        AgentConversationStatus.Completed -> taskState?.summary
+            ?.takeIf { it.isNotBlank() }
+            ?: "Done."
+    }
+
+    private fun deriveConversationDecision(
+        explicitDecision: AgentConversationDecision,
+        taskState: AgentTaskState?,
+    ): AgentConversationDecision {
+        if (explicitDecision.status == AgentConversationStatus.Continue) {
+            return if (explicitDecision.nextPrompt.isNotBlank()) {
+                explicitDecision
+            } else {
+                explicitDecision.copy(
+                    nextPrompt = buildTaskContinuationPrompt(taskState)
+                        .ifBlank { "Continue the current task and decide the next status after making progress." },
+                )
+            }
+        }
+        if (explicitDecision != AgentConversationDecision.completed()) {
+            return explicitDecision
+        }
+        if (taskState?.status != AgentTaskStatus.InProgress) {
+            return explicitDecision
+        }
+        return AgentConversationDecision(
+            status = AgentConversationStatus.Continue,
+            reason = taskState.summary.ifBlank { "Task state is still in progress." },
+            nextPrompt = buildTaskContinuationPrompt(taskState),
+        )
+    }
+
+    private fun buildTaskContinuationPrompt(taskState: AgentTaskState?): String {
+        if (taskState == null) return ""
+        val nextTodo = taskState.todos.firstOrNull { !it.done }?.text.orEmpty()
+        return buildString {
+            append("Continue the current task.")
+            if (taskState.goal.isNotBlank()) {
+                append("\nGoal: ")
+                append(taskState.goal)
+            }
+            if (nextTodo.isNotBlank()) {
+                append("\nNext todo: ")
+                append(nextTodo)
+            }
+            if (taskState.summary.isNotBlank()) {
+                append("\nProgress summary: ")
+                append(taskState.summary)
+            }
+            append("\nUse the necessary tools now. Update task state after making progress, then set conversation status again.")
+        }.take(MaxConversationDecisionTextChars)
+    }
+
+    private fun executeUpdateTaskState(argumentsJson: String): String {
+        val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
+            ?: return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Arguments were not valid JSON.")
+            }.toString()
+        val taskState = AgentTaskState(
+            goal = arguments.cleanOptionalString("goal").take(MaxTaskStateTextChars),
+            status = AgentTaskStatus.fromStorageValue(arguments.cleanOptionalString("status")),
+            todos = parseTaskStateItems(arguments.optJSONArray("todos")),
+            completionCriteria = arguments.stringArrayValue("completion_criteria", "completionCriteria")
+                .map { it.take(MaxTaskStateItemTextChars) }
+                .take(MaxTaskStateItemCount),
+            summary = arguments.cleanOptionalString("summary").take(MaxTaskStateTextChars),
+            updatedAtMillis = System.currentTimeMillis(),
+        )
+        return JSONObject().apply {
+            put("ok", true)
+            put("task_state", taskState.toJsonObject())
+        }.toString()
+    }
+
+    private fun parseTaskStateToolOutput(output: String): AgentTaskState? {
+        val parsed = runCatching { JSONObject(output) }.getOrNull() ?: return null
+        if (!parsed.optBoolean("ok", true)) return null
+        val stateJson = parsed.optJSONObject("task_state") ?: parsed
+        return parseTaskStateObject(stateJson)
+    }
+
+    private fun parseTaskStateObject(json: JSONObject): AgentTaskState = AgentTaskState(
+        goal = json.cleanOptionalString("goal").take(MaxTaskStateTextChars),
+        status = AgentTaskStatus.fromStorageValue(json.cleanOptionalString("status")),
+        todos = parseTaskStateItems(json.optJSONArray("todos")),
+        completionCriteria = json.stringArrayValue("completion_criteria", "completionCriteria")
+            .map { it.take(MaxTaskStateItemTextChars) }
+            .take(MaxTaskStateItemCount),
+        summary = json.cleanOptionalString("summary").take(MaxTaskStateTextChars),
+        updatedAtMillis = json.optLong("updated_at_millis").takeIf { it > 0L }
+            ?: json.optLong("updatedAtMillis").takeIf { it > 0L }
+            ?: System.currentTimeMillis(),
+    )
+
+    private fun parseTaskStateItems(items: JSONArray?): List<AgentTaskItem> {
+        if (items == null) return emptyList()
+        return buildList {
+            for (index in 0 until items.length()) {
+                if (size >= MaxTaskStateItemCount) break
+                val item = items.optJSONObject(index) ?: continue
+                val text = item.cleanOptionalString("text").take(MaxTaskStateItemTextChars)
+                if (text.isBlank()) continue
+                add(
+                    AgentTaskItem(
+                        id = item.cleanOptionalString("id")
+                            .take(80)
+                            .ifBlank { "task-${index + 1}" },
+                        text = text,
+                        done = item.optBoolean("done", item.optBoolean("completed", false)),
+                    )
+                )
+            }
+        }
+    }
+
+    private fun AgentTaskState.toJsonObject(): JSONObject = JSONObject().apply {
+        put("goal", goal)
+        put("status", status.storageValue)
+        put("summary", summary)
+        put("updated_at_millis", updatedAtMillis)
+        put("todos", JSONArray().apply {
+            todos.forEach { item ->
+                put(
+                    JSONObject().apply {
+                        put("id", item.id)
+                        put("text", item.text)
+                        put("done", item.done)
+                    }
+                )
+            }
+        })
+        put("completion_criteria", JSONArray().apply { completionCriteria.forEach(::put) })
     }
 
     private fun sanitizeToolOutputForConversation(
@@ -558,6 +836,13 @@ class AetherAgent(
             return JSONObject().apply {
                 put("ok", false)
                 put("errmsg", "run_tool_batch cannot call itself.")
+            }.toString()
+        }
+        val internalCall = calls.firstOrNull { isInternalToolCall(it.toolName) }
+        if (internalCall != null) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "${internalCall.toolName} must be called as a top-level tool, not inside run_tool_batch.")
             }.toString()
         }
         if (runInParallel) {
@@ -681,6 +966,8 @@ class AetherAgent(
     private fun canRunInsideExplicitParallelBatch(toolName: String): Boolean = when (toolName) {
         "run_tool_batch",
         "activate_skill",
+        "set_conversation_status",
+        "update_task_state",
         "agent_display" -> false
 
         else -> true
@@ -1916,6 +2203,7 @@ class AetherAgent(
         mcpToolBindings: List<McpToolBinding>,
         exposeNamespacedMcpTools: Boolean,
         agentModeEnabled: Boolean,
+        taskState: AgentTaskState,
         parallelToolCallsEnabled: Boolean,
         basicToolCompatibilityMode: Boolean,
     ): String = buildString {
@@ -1956,6 +2244,7 @@ class AetherAgent(
                 "The bash tool runs inside Termux on the user's phone. It watches the command for up to 45 seconds. " +
                 "If the command finishes quickly, bash returns the final structured JSON with stdout, stderr, exit_code, err, errmsg, duration_ms, command, and working_directory. " +
                 "If the command is still running after 45 seconds, bash returns status=running plus run_id and the latest stdout/stderr snapshot without stopping the command. " +
+                "bash and fetch_bash_output return up to 65536 bytes from each of stdout and stderr by default; pass tail_bytes up to 262144 when you expect long command output or when stdout_truncated/stderr_truncated is true. " +
                 "When bash returns status=running, use sleep to wait, then call fetch_bash_output with the same run_id to poll for more logs or completion. " +
                 "If a long-running command is stuck or no longer needed, call kill_bash with the run_id. " +
                 "Use sleep instead of busy waiting. " +
@@ -1964,6 +2253,25 @@ class AetherAgent(
                 "When you create or modify a file that the user should download, include a Markdown link that uses file:// with the absolute workspace path, for example [report.txt](file://$workspaceDirectory/report.txt). " +
                 "Only claim you executed shell commands if you actually called bash. " +
                 "After using tools, summarize the result clearly for the user."
+        )
+        append("\n\n")
+        append(
+            "Persistent task state protocol: Aether keeps a compact task board for this chat across turns. " +
+                "When the user's goal, todo list, completion criteria, task status, or short progress summary changes, call update_task_state with the full current state. " +
+                "Keep task state concise and action-oriented. Use status=in_progress while working, waiting_for_user when user input is required, completed when done, blocked when stuck, and idle only when no task is active. " +
+                "Do not mention this hidden task board unless it helps answer the user."
+        )
+        append("\n<task_state>\n")
+        append(renderTaskStateForPrompt(taskState))
+        append("\n</task_state>")
+        append("\n\n")
+        append(
+            "Conversation status protocol: for task-oriented work, decide whether this conversation should continue autonomously or stop for the user. " +
+                "When you know the task needs another model turn after your current visible response, call set_conversation_status with status=continue and a concise next_prompt describing the next step. " +
+                "When you need information, confirmation, permissions, or files from the user, call set_conversation_status with status=waiting_for_user. " +
+                "When the task is finished, call set_conversation_status with status=completed. " +
+                "When you cannot make meaningful progress because of a missing tool, failed setup, unavailable permission, or repeated blocker, call set_conversation_status with status=blocked and explain the blocker in reason. " +
+                "If you do not call set_conversation_status before ending a response, Aether treats the turn as completed."
         )
         if (agentModeEnabled) {
             append("\n\n")
@@ -2136,6 +2444,42 @@ class AetherAgent(
         }
     }
 
+    private fun renderTaskStateForPrompt(taskState: AgentTaskState): String {
+        if (taskState.isEmpty) {
+            return "No active task state yet."
+        }
+        return buildString {
+            append("status: ")
+            append(taskState.status.storageValue)
+            if (taskState.goal.isNotBlank()) {
+                append("\ngoal: ")
+                append(taskState.goal)
+            }
+            if (taskState.summary.isNotBlank()) {
+                append("\nsummary: ")
+                append(taskState.summary)
+            }
+            if (taskState.todos.isNotEmpty()) {
+                append("\ntodos:")
+                taskState.todos.forEach { item ->
+                    append("\n- [")
+                    append(if (item.done) "x" else " ")
+                    append("] ")
+                    append(item.id)
+                    append(": ")
+                    append(item.text)
+                }
+            }
+            if (taskState.completionCriteria.isNotEmpty()) {
+                append("\ncompletion_criteria:")
+                taskState.completionCriteria.forEach { criterion ->
+                    append("\n- ")
+                    append(criterion)
+                }
+            }
+        }
+    }
+
     private fun shouldForceToolUse(latestUserText: String): Boolean {
         val normalized = latestUserText.lowercase()
         if (normalized.isBlank()) return false
@@ -2286,555 +2630,6 @@ class AetherAgent(
         val value = optString(key).trim()
         return value.takeUnless { it.equals("null", ignoreCase = true) || it.equals("undefined", ignoreCase = true) }
             .orEmpty()
-    }
-
-    private fun buildReadToolDefinition(): JSONObject = buildToolDefinition(
-        name = "read",
-        description = "Read a text file from Termux with optional line-based offset and limit. path accepts ~ or ~/... for the Termux home directory.",
-        properties = JSONObject().apply {
-            put("path", stringProperty("The file path to read."))
-            put("offset", integerProperty("Optional zero-based line offset to start reading from."))
-            put("limit", integerProperty("Optional maximum number of lines to return."))
-            put(
-                "showLineNumbers",
-                booleanProperty("Whether stdout should prefix each returned line with its original 1-based line number."),
-            )
-            put(
-                "show_line_numbers",
-                booleanProperty("Alias of showLineNumbers."),
-            )
-            put(
-                "workingDirectory",
-                stringProperty("Optional working directory used to resolve relative paths."),
-            )
-            put(
-                "working_directory",
-                stringProperty("Alias of workingDirectory."),
-            )
-        },
-        required = listOf("path"),
-    )
-
-    private fun buildEditToolDefinition(): JSONObject = buildToolDefinition(
-        name = "edit",
-        description = "Precisely edit a text file using exact oldText/newText replacements. For one edit use only oldText/newText. For multiple edits use only edits[]. path accepts ~ or ~/... for the Termux home directory.",
-        properties = JSONObject().apply {
-            put("path", stringProperty("The file path to edit."))
-            put("oldText", stringProperty("For a single edit only, the exact text to replace. Omit this when using edits[]."))
-            put("newText", stringProperty("For a single edit only, the replacement text. Omit this when using edits[]."))
-            put(
-                "edits",
-                JSONObject().apply {
-                    put("type", "array")
-                    put(
-                        "description",
-                        "For multiple edits only, a list of non-overlapping precise replacements. Omit top-level oldText/newText when using this.",
-                    )
-                    put(
-                        "items",
-                        JSONObject().apply {
-                            put("type", "object")
-                            put(
-                                "properties",
-                                JSONObject().apply {
-                                    put("oldText", stringProperty("The exact text to replace."))
-                                    put("newText", stringProperty("The replacement text."))
-                                }
-                            )
-                            put("required", JSONArray().put("oldText").put("newText"))
-                            put("additionalProperties", false)
-                        }
-                    )
-                }
-            )
-            put(
-                "workingDirectory",
-                stringProperty("Optional working directory used to resolve relative paths."),
-            )
-            put(
-                "working_directory",
-                stringProperty("Alias of workingDirectory."),
-            )
-        },
-        required = listOf("path"),
-    )
-
-    private fun buildWriteToolDefinition(): JSONObject = buildToolDefinition(
-        name = "write",
-        description = "Create a new text file or completely overwrite an existing text file. path accepts ~ or ~/... for the Termux home directory.",
-        properties = JSONObject().apply {
-            put("path", stringProperty("The file path to create or overwrite."))
-            put("content", stringProperty("The full file contents to write."))
-            put(
-                "workingDirectory",
-                stringProperty("Optional working directory used to resolve relative paths."),
-            )
-            put(
-                "working_directory",
-                stringProperty("Alias of workingDirectory."),
-            )
-        },
-        required = listOf("path", "content"),
-    )
-
-    private fun buildGrepToolDefinition(): JSONObject = buildToolDefinition(
-        name = "grep",
-        description = "Search for text or a regex pattern inside a file or directory tree. path accepts ~ or ~/... for the Termux home directory.",
-        properties = JSONObject().apply {
-            put("path", stringProperty("The file or directory path to search."))
-            put("pattern", stringProperty("The text or regex pattern to search for."))
-            put("isRegex", booleanProperty("Whether pattern should be treated as a regex."))
-            put("caseSensitive", booleanProperty("Whether the search should be case-sensitive."))
-            put("maxResults", integerProperty("Optional maximum number of matches to return."))
-            put(
-                "workingDirectory",
-                stringProperty("Optional working directory used to resolve relative paths."),
-            )
-            put(
-                "working_directory",
-                stringProperty("Alias of workingDirectory."),
-            )
-        },
-        required = listOf("path", "pattern"),
-    )
-
-    private fun buildFindToolDefinition(): JSONObject = buildToolDefinition(
-        name = "find",
-        description = "Find files or directories by glob pattern. path accepts ~ or ~/... for the Termux home directory.",
-        properties = JSONObject().apply {
-            put("path", stringProperty("The directory path to search in."))
-            put("pattern", stringProperty("The glob pattern to match, such as *.kt."))
-            put(
-                "type",
-                stringProperty("Optional match type: any, file, or directory."),
-            )
-            put("caseSensitive", booleanProperty("Whether the glob match should be case-sensitive."))
-            put("maxDepth", integerProperty("Optional maximum search depth."))
-            put("maxResults", integerProperty("Optional maximum number of results to return."))
-            put(
-                "workingDirectory",
-                stringProperty("Optional working directory used to resolve relative paths."),
-            )
-            put(
-                "working_directory",
-                stringProperty("Alias of workingDirectory."),
-            )
-        },
-        required = listOf("path", "pattern"),
-    )
-
-    private fun buildLsToolDefinition(): JSONObject = buildToolDefinition(
-        name = "ls",
-        description = "List the contents of a directory or inspect a file path. path accepts ~ or ~/... for the Termux home directory.",
-        properties = JSONObject().apply {
-            put("path", stringProperty("The file or directory path to list."))
-            put("recursive", booleanProperty("Whether to list recursively."))
-            put("includeHidden", booleanProperty("Whether to include hidden files and directories."))
-            put("maxDepth", integerProperty("Optional maximum recursion depth."))
-            put("maxEntries", integerProperty("Optional maximum number of entries to return."))
-            put(
-                "workingDirectory",
-                stringProperty("Optional working directory used to resolve relative paths."),
-            )
-            put(
-                "working_directory",
-                stringProperty("Alias of workingDirectory."),
-            )
-        },
-        required = listOf("path"),
-    )
-
-    private fun buildBashToolDefinition(): JSONObject = JSONObject().apply {
-        put("type", "function")
-        put(
-            "function",
-            JSONObject().apply {
-                put("name", "bash")
-                put(
-                    "description",
-                    "Execute a bash command inside Termux on the user's Android device. The tool watches the command for up to 45 seconds. If the command is still running after that, it returns status=running, a run_id, and the latest stdout/stderr snapshot without interrupting the command. working_directory accepts ~ or ~/... for the Termux home directory."
-                )
-                put(
-                    "parameters",
-                    buildStrictToolParameters(
-                        properties = JSONObject().apply {
-                            put(
-                                "command",
-                                JSONObject().apply {
-                                    put("type", "string")
-                                    put("description", "The bash command or script to execute.")
-                                }
-                            )
-                            put(
-                                "working_directory",
-                                JSONObject().apply {
-                                    put("type", "string")
-                                    put(
-                                        "description",
-                                        "Optional working directory inside Termux, for example ~/.aether/workspaces/<session-id>."
-                                    )
-                                }
-                            )
-                            put(
-                                "workingDirectory",
-                                JSONObject().apply {
-                                    put("type", "string")
-                                    put(
-                                        "description",
-                                        "Alias of working_directory."
-                                    )
-                                }
-                            )
-                        },
-                        required = listOf("command"),
-                    )
-                )
-                put("strict", true)
-            }
-        )
-    }
-
-    private fun buildFetchBashOutputToolDefinition(): JSONObject = buildToolDefinition(
-        name = "fetch_bash_output",
-        description = "Fetch the latest stdout/stderr snapshot and status for a previously started long-running bash command by run_id.",
-        properties = JSONObject().apply {
-            put("run_id", stringProperty("The run_id returned by bash when it reported status=running."))
-            put("runId", stringProperty("Alias of run_id."))
-            put("tail_bytes", integerProperty("Optional maximum number of bytes to return from the end of stdout and stderr."))
-            put("tailBytes", integerProperty("Alias of tail_bytes."))
-        },
-        required = listOf("run_id"),
-    )
-
-    private fun buildKillBashToolDefinition(): JSONObject = buildToolDefinition(
-        name = "kill_bash",
-        description = "Stop a previously started long-running bash command by run_id and return its latest logs.",
-        properties = JSONObject().apply {
-            put("run_id", stringProperty("The run_id returned by bash when it reported status=running."))
-            put("runId", stringProperty("Alias of run_id."))
-            put("tail_bytes", integerProperty("Optional maximum number of bytes to return from the end of stdout and stderr."))
-            put("tailBytes", integerProperty("Alias of tail_bytes."))
-        },
-        required = listOf("run_id"),
-    )
-
-    private fun buildSleepToolDefinition(): JSONObject = buildToolDefinition(
-        name = "sleep",
-        description = "Pause the agent for a fixed duration so a long-running bash command can continue before you fetch logs again.",
-        properties = JSONObject().apply {
-            put("duration_ms", integerProperty("How long to sleep in milliseconds. Use this before polling a running bash command again."))
-            put("durationMs", integerProperty("Alias of duration_ms."))
-        },
-        required = listOf("duration_ms"),
-    )
-
-    private fun buildAnalyzeImageToolDefinition(): JSONObject = buildToolDefinition(
-        name = "analyze_image",
-        description = "Analyze an image file from the current workspace with model vision. Use this instead of assuming what an uploaded image contains.",
-        properties = JSONObject().apply {
-            put("path", stringProperty("The image file path to inspect. Relative paths resolve from the current workspace."))
-            put("prompt", stringProperty("Optional question or instruction for what to inspect in the image."))
-            put(
-                "workingDirectory",
-                stringProperty("Optional working directory used to resolve relative paths."),
-            )
-            put(
-                "working_directory",
-                stringProperty("Alias of workingDirectory."),
-            )
-        },
-        required = listOf("path"),
-    )
-
-    private fun buildFetchWebUrlToolDefinition(): JSONObject = buildToolDefinition(
-        name = "fetch_web_url",
-        description = "Fetch a specific HTTP or HTTPS URL and return the page content converted to Markdown. Use this when the user gives you a URL or you need the contents of one page.",
-        properties = JSONObject().apply {
-            put("url", stringProperty("The HTTP or HTTPS URL to fetch."))
-            put("max_chars", integerProperty("Optional maximum number of Markdown characters to return."))
-            put("maxChars", integerProperty("Alias of max_chars."))
-        },
-        required = listOf("url"),
-    )
-
-    private fun buildTavilySearchToolDefinition(): JSONObject = buildToolDefinition(
-        name = "tavily_search",
-        description = "Search the public web with Tavily. Requires a Tavily API key in Settings > Web Tools. Use this for web discovery or current online information.",
-        properties = JSONObject().apply {
-            put("query", stringProperty("The search query to execute."))
-            put("topic", stringProperty("Optional search topic: general, news, or finance."))
-            put("search_depth", stringProperty("Optional search depth: basic, advanced, fast, or ultra-fast."))
-            put("max_results", integerProperty("Optional maximum number of results to return, between 1 and 20."))
-            put("time_range", stringProperty("Optional recency filter, such as day, week, month, or year. Do not combine this with start_date or end_date."))
-            put("include_answer", booleanProperty("Whether Tavily should include a synthesized answer."))
-            put("include_raw_content", booleanProperty("Whether each result should include raw page content in Markdown."))
-            put("include_domains", stringArrayProperty("Optional list of domains to include."))
-            put("exclude_domains", stringArrayProperty("Optional list of domains to exclude."))
-            put("country", stringProperty("Optional lowercase Tavily country value for localized general search, such as united states or china. Leave null when unsure."))
-            put("start_date", stringProperty("Optional start date in YYYY-MM-DD format. Do not combine this with time_range."))
-            put("end_date", stringProperty("Optional end date in YYYY-MM-DD format. Do not combine this with time_range."))
-        },
-        required = listOf("query"),
-    )
-
-    private fun buildStockMarketDataToolDefinition(): JSONObject = buildToolDefinition(
-        name = "stock_market_data",
-        description = "Search stock symbols or fetch current quote and historical OHLCV chart data from Eastmoney public market data endpoints. Supports A-shares and many HK/US symbols. Data may be delayed and is not financial advice.",
-        properties = JSONObject().apply {
-            put("action", stringProperty("One of: search, quote, chart. Defaults to search when query is provided without symbol, otherwise quote."))
-            put("query", stringProperty("Search text for action=search, such as Apple, 贵州茅台, or BTC."))
-            put("symbol", stringProperty("Stock symbol or Eastmoney QuoteID/secid for quote/chart, such as 001896.SZ, 600519.SH, 0.001896, 105.AAPL, AAPL, or 00700.HK."))
-            put("range", stringProperty("Optional chart range, such as 1d, 5d, 1mo, 6mo, 1y, 5y, max. Defaults to 1d for quote and 1mo for chart."))
-            put("interval", stringProperty("Optional chart interval, such as 1m, 5m, 15m, 1h, 1d, 1wk, 1mo. Defaults to 1m for quote and 1d for chart."))
-            put("include_pre_post", booleanProperty("Whether to include pre-market and post-market data when available."))
-            put("includePrePost", booleanProperty("Alias of include_pre_post."))
-            put("max_results", integerProperty("For action=search, maximum number of symbol matches to return, between 1 and 25."))
-            put("maxResults", integerProperty("Alias of max_results."))
-        },
-        required = emptyList(),
-    )
-
-    private fun buildRunToolBatchToolDefinition(): JSONObject = buildToolDefinition(
-        name = "run_tool_batch",
-        description = "Submit multiple Aether tool calls in one top-level tool call. mode=parallel runs them at the same time; mode=sequential starts the next call only after the previous call finishes. If native parallel top-level tool calls are available, prefer direct multiple tool calls for simultaneous work and use this tool for ordered sequential batches or explicit fallback batching.",
-        properties = JSONObject().apply {
-            put(
-                "mode",
-                stringProperty("Execution mode: parallel for simultaneous execution, or sequential for one-after-another runtime execution."),
-            )
-            put(
-                "calls",
-                JSONObject().apply {
-                    put("type", "array")
-                    put("description", "Tool calls to execute.")
-                    put(
-                        "items",
-                        JSONObject().apply {
-                            put("type", "object")
-                            put(
-                                "properties",
-                                JSONObject().apply {
-                                    put("tool_name", stringProperty("The Aether tool name to call, such as read, bash, grep, edit, or mcp_call_tool."))
-                                    put(
-                                        "arguments_json",
-                                        stringProperty("JSON object string containing the arguments for that tool, for example {\"path\":\"README.md\"}. Use {} when the tool has no arguments."),
-                                    )
-                                },
-                            )
-                            put("required", JSONArray().put("tool_name").put("arguments_json"))
-                            put("additionalProperties", false)
-                        },
-                    )
-                },
-            )
-        },
-        required = listOf("mode", "calls"),
-    )
-
-    private fun buildAgentModeToolDefinition(): JSONObject = buildToolDefinition(
-        name = "agent_display",
-        description = "Operate Aether Agent Mode on an isolated Android virtual display. Use this only when Agent Mode is selected in the chat composer.",
-        properties = JSONObject().apply {
-            put("action", stringProperty("One of: start, status, launch, tap, swipe, key, text, sequence, screenshot, stop."))
-            put("target", stringProperty("For launch: package name or exact app label."))
-            put("x", integerProperty("For tap: normalized X coordinate from 0 to 1000."))
-            put("y", integerProperty("For tap: normalized Y coordinate from 0 to 1000."))
-            put("x1", integerProperty("For swipe: normalized start X coordinate from 0 to 1000."))
-            put("y1", integerProperty("For swipe: normalized start Y coordinate from 0 to 1000."))
-            put("x2", integerProperty("For swipe: normalized end X coordinate from 0 to 1000."))
-            put("y2", integerProperty("For swipe: normalized end Y coordinate from 0 to 1000."))
-            put("duration_ms", integerProperty("For swipe: gesture duration in milliseconds."))
-            put("durationMs", integerProperty("Alias of duration_ms."))
-            put("key", stringProperty("For key: Android key code name or number, such as BACK, HOME, ENTER, or 4."))
-            put("text", stringProperty("For text: text to type into the focused field."))
-            put("steps", JSONObject().apply {
-                put("type", "array")
-                put("description", "For sequence: array of step objects. Each step has action (tap/swipe/key/text/wait/launch) plus the same params as the corresponding action. Optional wait_ms (0-5000) between steps.")
-                put("items", JSONObject().apply {
-                    put("type", "object")
-                    put("additionalProperties", true)
-                })
-            })
-        },
-        required = listOf("action"),
-    )
-
-    private fun buildActivateSkillToolDefinition(): JSONObject = buildToolDefinition(
-        name = "activate_skill",
-        description = "Load an installed Agent Skill into the current chat session. Use this when an installed skill matches the task or the user explicitly requests one.",
-        properties = JSONObject().apply {
-            put("name", stringProperty("The installed skill name or id to activate."))
-        },
-        required = listOf("name"),
-    )
-
-    private fun buildReadSkillResourceToolDefinition(): JSONObject = buildToolDefinition(
-        name = "read_skill_resource",
-        description = "Read a bundled file from an already active Agent Skill by relative path. Use this for progressive disclosure when a skill's SKILL.md tells you to inspect references, scripts, assets, or agents metadata.",
-        properties = JSONObject().apply {
-            put("skill", stringProperty("The active skill name or id."))
-            put("relative_path", stringProperty("The resource path relative to the skill root, such as references/guide.md or scripts/run.py."))
-            put("path", stringProperty("Alias of relative_path."))
-            put("max_chars", integerProperty("Optional maximum number of UTF-8 text characters to return."))
-        },
-        required = listOf("skill"),
-    )
-
-    private fun buildMcpGenericToolDefinitions(): List<JSONObject> = listOf(
-        buildToolDefinition(
-            name = "mcp_list_tools",
-            description = "List callable MCP tools across all connected servers or for one server.",
-            properties = JSONObject().apply {
-                put("server_id", stringProperty("Optional MCP server id to filter by."))
-                put("serverId", stringProperty("Alias of server_id."))
-            },
-            required = emptyList(),
-        ),
-        buildToolDefinition(
-            name = "mcp_call_tool",
-            description = "Call an MCP tool by server id and tool name.",
-            properties = JSONObject().apply {
-                put("server_id", stringProperty("The MCP server id to call."))
-                put("serverId", stringProperty("Alias of server_id."))
-                put("tool_name", stringProperty("The MCP tool name to invoke."))
-                put("toolName", stringProperty("Alias of tool_name."))
-                put(
-                    "arguments",
-                    JSONObject().apply {
-                        put("type", "object")
-                        put("description", "Arguments to pass to the MCP tool.")
-                        put("additionalProperties", true)
-                    },
-                )
-            },
-            required = listOf("server_id", "tool_name"),
-        ),
-        buildToolDefinition(
-            name = "mcp_list_resources",
-            description = "List available MCP resources across all connected servers or for one server.",
-            properties = JSONObject().apply {
-                put("server_id", stringProperty("Optional MCP server id to filter by."))
-                put("serverId", stringProperty("Alias of server_id."))
-            },
-            required = emptyList(),
-        ),
-        buildToolDefinition(
-            name = "mcp_read_resource",
-            description = "Read a specific MCP resource from a connected server.",
-            properties = JSONObject().apply {
-                put("server_id", stringProperty("The MCP server id to read from."))
-                put("serverId", stringProperty("Alias of server_id."))
-                put("uri", stringProperty("The MCP resource URI."))
-            },
-            required = listOf("server_id", "uri"),
-        ),
-        buildToolDefinition(
-            name = "mcp_list_prompts",
-            description = "List available MCP prompts across all connected servers or for one server.",
-            properties = JSONObject().apply {
-                put("server_id", stringProperty("Optional MCP server id to filter by."))
-                put("serverId", stringProperty("Alias of server_id."))
-            },
-            required = emptyList(),
-        ),
-        buildToolDefinition(
-            name = "mcp_get_prompt",
-            description = "Fetch a rendered MCP prompt from a connected server.",
-            properties = JSONObject().apply {
-                put("server_id", stringProperty("The MCP server id to query."))
-                put("serverId", stringProperty("Alias of server_id."))
-                put("name", stringProperty("The MCP prompt name."))
-                put(
-                    "arguments",
-                    JSONObject().apply {
-                        put("type", "object")
-                        put("description", "Optional prompt arguments.")
-                        put("additionalProperties", true)
-                    },
-                )
-            },
-            required = listOf("server_id", "name"),
-        ),
-    )
-
-    private fun buildMcpToolDefinition(binding: McpToolBinding): JSONObject = JSONObject().apply {
-        put("type", "function")
-        put(
-            "function",
-            JSONObject().apply {
-                put("name", binding.namespacedToolName)
-                put(
-                    "description",
-                    buildString {
-                        append("Call MCP tool ")
-                        append(binding.serverName)
-                        append("/")
-                        append(binding.toolName)
-                        if (binding.description.isNotBlank()) {
-                            append(": ")
-                            append(binding.description)
-                        }
-                    },
-                )
-                put(
-                    "parameters",
-                    JSONObject(binding.inputSchema.toString()).apply {
-                        if (!has("type")) put("type", "object")
-                    },
-                )
-                put("strict", false)
-            },
-        )
-    }
-
-    private fun buildToolDefinition(
-        name: String,
-        description: String,
-        properties: JSONObject,
-        required: List<String>,
-    ): JSONObject = JSONObject().apply {
-        put("type", "function")
-        put(
-            "function",
-            JSONObject().apply {
-                put("name", name)
-                put("description", description)
-                put(
-                    "parameters",
-                    buildStrictToolParameters(
-                        properties = properties,
-                        required = required,
-                    )
-                )
-                put("strict", true)
-            }
-        )
-    }
-
-    private fun stringProperty(description: String): JSONObject = JSONObject().apply {
-        put("type", "string")
-        put("description", description)
-    }
-
-    private fun integerProperty(description: String): JSONObject = JSONObject().apply {
-        put("type", "integer")
-        put("description", description)
-    }
-
-    private fun booleanProperty(description: String): JSONObject = JSONObject().apply {
-        put("type", "boolean")
-        put("description", description)
-    }
-
-    private fun stringArrayProperty(description: String): JSONObject = JSONObject().apply {
-        put("type", "array")
-        put("description", description)
-        put(
-            "items",
-            JSONObject().apply {
-                put("type", "string")
-            },
-        )
     }
 
     private fun extractMcpServerId(arguments: JSONObject): String =

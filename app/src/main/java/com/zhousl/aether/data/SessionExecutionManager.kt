@@ -38,6 +38,14 @@ private const val ForegroundServiceEnsureMinIntervalMillis = 1_000L
 private const val ReasoningSummaryMaxInputChars = 8_000
 private const val ReasoningSummaryTitleMaxChars = 120
 private const val ReasoningSummaryDetailMaxChars = 520
+private const val MaxAutonomousContinuationTurns = 8
+
+// 对话历史上下文预算（防止超长对话直接撞上模型 context 上限）。
+// 这是一个保守的安全阈值；超过后按从新到旧保留最近消息，更早的消息折叠为一条摘要提示。
+// 估算口径：约 4 个字符 ≈ 1 token。
+private const val MaxHistoryTokenBudget = 48_000
+private const val ApproxCharsPerToken = 4
+private const val OmittedHistoryPreviewChars = 160
 private const val ReasoningSummarySystemPrompt =
     "You write concise user-visible progress summaries for assistant reasoning. Use a consistent first-person planning style, and never quote long private reasoning verbatim."
 
@@ -80,6 +88,8 @@ data class SessionTurnRequest(
     val activeSkills: List<ActiveSkillContext>,
     val activeMcpServerIds: List<String>,
     val agentModeEnabled: Boolean,
+    val taskState: AgentTaskState = AgentTaskState(),
+    val autonomousContinuationPrompt: String = "",
 )
 
 data class SessionTurnEvent(
@@ -263,22 +273,45 @@ class SessionExecutionManager(
     ) {
         var nextRequest: SessionTurnRequest? = initialRequest
         var lastCompletion: CompletionSummary? = null
+        var autonomousContinuationCount = 0
 
         try {
-            while (nextRequest != null && !handle.pauseRequested) {
+            while (!handle.pauseRequested) {
+                val activeRequest = nextRequest ?: break
                 lastCompletion = executeTurn(
                     handle = handle,
-                    request = nextRequest,
+                    request = activeRequest,
                 )
                 if (handle.pauseRequested) break
                 promoteRemainingSteersToQueue(handle)
                 if (handle.pauseRequested) break
 
-                val nextQueued = pollNextQueuedInput(handle) ?: break
-                nextRequest = buildQueuedTurnRequest(
-                    sessionId = handle.sessionId,
-                    queuedInput = nextQueued.message,
-                )
+                val nextQueued = pollNextQueuedInput(handle)
+                if (nextQueued != null) {
+                    autonomousContinuationCount = 0
+                    nextRequest = buildQueuedTurnRequest(
+                        sessionId = handle.sessionId,
+                        queuedInput = nextQueued.message,
+                    )
+                    continue
+                }
+
+                val decision = lastCompletion.conversationDecision
+                if (
+                    decision.shouldContinueAutonomously &&
+                    decision.nextPrompt.isNotBlank() &&
+                    autonomousContinuationCount < MaxAutonomousContinuationTurns
+                ) {
+                    autonomousContinuationCount += 1
+                    nextRequest = buildAutonomousContinuationRequest(
+                        previousRequest = activeRequest,
+                        decision = decision,
+                        continuationIndex = autonomousContinuationCount,
+                    )
+                    continue
+                }
+
+                nextRequest = null
             }
         } finally {
             clearPendingInputs(handle)
@@ -371,12 +404,14 @@ class SessionExecutionManager(
 
             val result = agent.runTurn(
                 settings = request.settings,
-                messages = buildRequestMessages(request.requestMessages),
+                messages = buildRequestMessages(request.requestMessages) +
+                    buildAutonomousContinuationMessage(request.autonomousContinuationPrompt),
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = resolvedAvailableSkills,
                 activeSkills = resolvedActiveSkills,
                 mcpToolBindings = mcpClientManager.toolBindings(),
                 agentModeEnabled = request.agentModeEnabled,
+                taskState = request.taskState,
                 onToolEvent = { event ->
                     if (handle.pauseRequested) return@runTurn
                     val nowUptime = SystemClock.uptimeMillis()
@@ -511,6 +546,13 @@ class SessionExecutionManager(
                         activeMcpServerIds = resolvedMcpServerIds,
                     )
                 },
+                onTaskStateUpdated = { taskState ->
+                    handle.latestTaskState = taskState
+                    updateSessionTaskState(
+                        sessionId = handle.sessionId,
+                        taskState = taskState,
+                    )
+                },
                 pollInjectedUserMessages = {
                     if (handle.pauseRequested) return@runTurn emptyList()
                     val drained = drainSteerInputs(handle)
@@ -533,16 +575,18 @@ class SessionExecutionManager(
             )
             val thoughtDurationMillis = (System.currentTimeMillis() - turnStartedAtMillis).coerceAtLeast(0L)
             val completion = result.fold(
-                onSuccess = { reply ->
+                onSuccess = { turnResult ->
                     appendAgentMessage(
                         sessionId = handle.sessionId,
                         blocks = ensureAssistantResponseFinalText(
                             blocks = currentAssistantResponseBlocks(handle.sessionId),
-                            finalText = reply,
+                            finalText = turnResult.assistantText,
                         ) { handle.nextPendingBlockId("agent-text") },
                         thoughtDurationMillis = thoughtDurationMillis,
                         outcome = SessionTurnOutcome.Success,
-                    )
+                        taskState = turnResult.taskState ?: handle.latestTaskState,
+                        tokenUsage = turnResult.usage.takeIf { !it.isEmpty },
+                    ).copy(conversationDecision = turnResult.conversationDecision)
                 },
                 onFailure = { throwable ->
                     appendAgentMessage(
@@ -615,6 +659,27 @@ class SessionExecutionManager(
         providerConfigs = currentProviderConfigs.value,
     )
 
+    private fun buildAutonomousContinuationRequest(
+        previousRequest: SessionTurnRequest,
+        decision: AgentConversationDecision,
+        continuationIndex: Int,
+    ): SessionTurnRequest? {
+        val session = chatStateStore.state.value.sessions.firstOrNull { it.id == previousRequest.sessionId }
+            ?: return null
+        return previousRequest.copy(
+            requestMessages = syncActiveBranches(session.messages),
+            selectedSkillIds = session.selectedSkillIds,
+            activeSkills = session.activeSkills,
+            activeMcpServerIds = session.activeMcpServerIds,
+            agentModeEnabled = session.agentModeEnabled,
+            taskState = session.taskState,
+            autonomousContinuationPrompt = buildAutonomousContinuationPrompt(
+                decision = decision,
+                continuationIndex = continuationIndex,
+            ),
+        )
+    }
+
     private fun updateSessionSelections(
         sessionId: String,
         selectedSkillIds: List<String>,
@@ -634,6 +699,21 @@ class SessionExecutionManager(
                     activeMcpServerIds = activeMcpServerIds,
                 ),
             )
+            persisted.copy(sessions = updatedSessions)
+        }
+    }
+
+    private fun updateSessionTaskState(
+        sessionId: String,
+        taskState: AgentTaskState,
+    ) {
+        chatStateStore.update { persisted ->
+            val sessionIndex = persisted.sessions.indexOfFirst { it.id == sessionId }
+            if (sessionIndex < 0) return@update persisted
+            val updatedSessions = persisted.sessions.toMutableList()
+            val session = updatedSessions[sessionIndex]
+            if (session.taskState == taskState) return@update persisted
+            updatedSessions[sessionIndex] = session.copy(taskState = taskState)
             persisted.copy(sessions = updatedSessions)
         }
     }
@@ -682,6 +762,8 @@ class SessionExecutionManager(
         blocks: List<AssistantResponseBlock>,
         thoughtDurationMillis: Long?,
         outcome: SessionTurnOutcome,
+        taskState: AgentTaskState? = null,
+        tokenUsage: TokenUsage? = null,
     ): CompletionSummary {
         var sessionTitle = resolveSessionTitle(sessionId)
         var replySummary = blocks.lastOrNull()
@@ -693,6 +775,7 @@ class SessionExecutionManager(
             normalizedBlocks = normalizedBlocks,
             thoughtDurationMillis = thoughtDurationMillis,
             assistantActionsHidden = false,
+            tokenUsage = tokenUsage,
         )
 
         chatStateStore.update { persisted ->
@@ -703,7 +786,9 @@ class SessionExecutionManager(
             val session = updatedSessions.removeAt(sessionIndex)
             val updatedSession = session.withDerivedMessages(
                 session.messages + appendedMessages
-            )
+            ).let { derivedSession ->
+                taskState?.let { derivedSession.copy(taskState = it) } ?: derivedSession
+            }
             sessionTitle = updatedSession.title
             replySummary = updatedSession.preview
             updatedSessions.add(0, updatedSession)
@@ -720,6 +805,7 @@ class SessionExecutionManager(
             distinctToolCount = toolNames.size,
             toolNames = toolNames,
             durationMillis = thoughtDurationMillis,
+            conversationDecision = AgentConversationDecision.completed(),
         )
     }
 
@@ -727,6 +813,7 @@ class SessionExecutionManager(
         normalizedBlocks: List<AssistantResponseBlock>,
         thoughtDurationMillis: Long?,
         assistantActionsHidden: Boolean,
+        tokenUsage: TokenUsage? = null,
     ): List<ChatMessage> {
         val messageTimestamp = System.currentTimeMillis()
         val responseGroupId = "agent-group-$messageTimestamp"
@@ -785,6 +872,11 @@ class SessionExecutionManager(
                         val lastIndex = lastIndex
                         set(lastIndex, get(lastIndex).copy(thoughtDurationMillis = thoughtDurationMillis))
                     }
+                    // 把整轮的令牌用量挂到最后一条助手消息上，供 UI 展示与持久化。
+                    if (tokenUsage != null && !tokenUsage.isEmpty) {
+                        val lastIndex = lastIndex
+                        set(lastIndex, get(lastIndex).copy(tokenUsage = tokenUsage))
+                    }
                 }
             }
         }
@@ -837,6 +929,7 @@ class SessionExecutionManager(
                 blocks = blocks,
                 thoughtDurationMillis = thoughtDurationMillis,
                 outcome = SessionTurnOutcome.Neutral,
+                taskState = handle.latestTaskState,
             )
         }
     }
@@ -1028,7 +1121,87 @@ class SessionExecutionManager(
         chatStateStore.state.value.sessions.firstOrNull { it.id == sessionId }?.title.orEmpty()
 
     private fun buildRequestMessages(messages: List<ChatMessage>): List<LlmMessage> =
-        messages.map(::buildRequestMessage)
+        applyHistoryContextBudget(messages).map(::buildRequestMessage)
+
+    /**
+     * 在发送给模型前对对话历史做上下文预算控制：
+     * - 估算每条消息的 token 量（约 4 字符 / token）。
+     * - 从最新消息向前累加，保留预算内的最近消息（至少保留最后一条用户消息）。
+     * - 被裁掉的更早消息折叠为一条 user 角色的摘要提示，告知模型省略了多少轮以及简要预览，
+     *   既避免 context 溢出，又保留必要的背景线索。
+     */
+    private fun applyHistoryContextBudget(messages: List<ChatMessage>): List<ChatMessage> {
+        if (messages.size <= 2) return messages
+
+        val estimatedTokens = IntArray(messages.size) { index ->
+            estimateMessageTokens(messages[index])
+        }
+        val totalTokens = estimatedTokens.sum()
+        if (totalTokens <= MaxHistoryTokenBudget) return messages
+
+        // 从最新往旧保留，直到逼近预算。
+        var budget = MaxHistoryTokenBudget
+        var keepFromIndex = messages.size
+        for (index in messages.indices.reversed()) {
+            val cost = estimatedTokens[index]
+            if (budget - cost < 0 && keepFromIndex != messages.size) {
+                break
+            }
+            budget -= cost
+            keepFromIndex = index
+        }
+        // 至少保留最近一条消息。
+        if (keepFromIndex >= messages.size) {
+            keepFromIndex = messages.size - 1
+        }
+        if (keepFromIndex <= 0) return messages
+
+        val omitted = messages.subList(0, keepFromIndex)
+        val kept = messages.subList(keepFromIndex, messages.size)
+        val summaryMessage = buildOmittedHistorySummaryMessage(omitted)
+        return listOf(summaryMessage) + kept
+    }
+
+    private fun estimateMessageTokens(message: ChatMessage): Int {
+        var chars = message.text.length
+        // 图片附件按经验值粗略计入，避免低估。
+        chars += message.attachments.size * (ApproxCharsPerToken * 256)
+        return (chars / ApproxCharsPerToken) + 1
+    }
+
+    private fun buildOmittedHistorySummaryMessage(omitted: List<ChatMessage>): ChatMessage {
+        val userCount = omitted.count { it.author == MessageAuthor.User }
+        val agentCount = omitted.size - userCount
+        val previews = omitted
+            .asSequence()
+            .filter { it.text.isNotBlank() }
+            .map { message ->
+                val role = if (message.author == MessageAuthor.User) "用户" else "助手"
+                val preview = message.text.replace("\n", " ").take(OmittedHistoryPreviewChars)
+                "- $role：$preview"
+            }
+            .toList()
+            .takeLast(8)
+        val summaryText = buildString {
+            append("[对话历史摘要] 为控制上下文长度，已省略较早的 ")
+            append(omitted.size)
+            append(" 条消息（用户 ")
+            append(userCount)
+            append(" 条，助手 ")
+            append(agentCount)
+            append(" 条）。以下是被省略内容的简要预览，若需要其中细节请向用户确认：\n")
+            if (previews.isEmpty()) {
+                append("（无可预览的文本内容）")
+            } else {
+                append(previews.joinToString("\n"))
+            }
+        }
+        return ChatMessage(
+            id = "history-summary",
+            author = MessageAuthor.User,
+            text = summaryText,
+        )
+    }
 
     private fun buildRequestMessage(message: ChatMessage): LlmMessage {
         val parts = mutableListOf<LlmContentPart>()
@@ -1061,6 +1234,45 @@ class SessionExecutionManager(
             }
         }
         return buildRequestMessage(message.copy(text = steerText))
+    }
+
+    private fun buildAutonomousContinuationMessage(prompt: String): List<LlmMessage> {
+        if (prompt.isBlank()) return emptyList()
+        return listOf(
+            LlmMessage(
+                role = "user",
+                contentParts = listOf(
+                    LlmTextPart(
+                        buildString {
+                            append(
+                                "Aether is continuing autonomously because you previously set conversation status to continue. " +
+                                    "Treat this as a hidden continuation control message, not as a new user request. " +
+                                    "Continue the same task and decide again whether to continue, wait for the user, finish, or report a blocker."
+                            )
+                            append("\n\nNext autonomous step:\n")
+                            append(prompt)
+                        }
+                    )
+                ),
+            )
+        )
+    }
+
+    private fun buildAutonomousContinuationPrompt(
+        decision: AgentConversationDecision,
+        continuationIndex: Int,
+    ): String = buildString {
+        append(decision.nextPrompt.trim())
+        val reason = decision.reason.trim()
+        if (reason.isNotBlank()) {
+            append("\n\nReason from previous turn: ")
+            append(reason)
+        }
+        append("\n\nAutonomous continuation ")
+        append(continuationIndex)
+        append(" of ")
+        append(MaxAutonomousContinuationTurns)
+        append(".")
     }
 
     private fun buildWorkspaceAttachmentPart(
@@ -2014,6 +2226,7 @@ class SessionExecutionManager(
         val distinctToolCount: Int,
         val toolNames: List<String>,
         val durationMillis: Long?,
+        val conversationDecision: AgentConversationDecision = AgentConversationDecision.completed(),
     ) {
         fun toTurnEvent(sessionId: String): SessionTurnEvent = SessionTurnEvent(
             sessionId = sessionId,
@@ -2039,6 +2252,7 @@ class SessionExecutionManager(
         var reasoningFirstSummarySubmitted: Boolean = false
         var reasoningLastSubmittedCharIndex: Int = 0
         var reasoningLastTimedSummaryAtMillis: Long = 0L
+        var latestTaskState: AgentTaskState? = null
 
         @Volatile
         var pauseRequested: Boolean = false

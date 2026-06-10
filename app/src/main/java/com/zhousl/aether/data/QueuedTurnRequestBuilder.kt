@@ -30,6 +30,7 @@ internal class QueuedTurnRequestBuilder(
                 activeMcpServerIds = updatedSession.activeMcpServerIds,
                 agentModeEnabled = updatedSession.agentModeEnabled,
                 selectedModelKey = updatedSession.selectedModelKey,
+                taskState = updatedSession.taskState,
             )
             updatedSessions.add(0, updatedSession)
             persisted.copy(sessions = updatedSessions)
@@ -50,6 +51,7 @@ internal class QueuedTurnRequestBuilder(
             activeSkills = selection.activeSkills,
             activeMcpServerIds = selection.activeMcpServerIds,
             agentModeEnabled = selection.agentModeEnabled,
+            taskState = selection.taskState,
         )
     }
 
@@ -60,5 +62,6 @@ internal class QueuedTurnRequestBuilder(
         val activeMcpServerIds: List<String> = emptyList(),
         val agentModeEnabled: Boolean = false,
         val selectedModelKey: String = "",
+        val taskState: AgentTaskState = AgentTaskState(),
     )
 }

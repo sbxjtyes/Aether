@@ -72,7 +72,7 @@ class AetherAppRuntime(
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     val settingsRepository = SettingsRepository(application)
-    val chatRepository = ChatRepository(application)
+    val chatRepository = ChatRepository(application, appScope)
     val extensionsRepository = AgentExtensionsRepository(application)
     val bashTool = TermuxBashTool(application)
     val rootSetupController = RootSetupController(

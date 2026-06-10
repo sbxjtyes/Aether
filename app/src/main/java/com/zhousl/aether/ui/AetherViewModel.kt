@@ -16,6 +16,7 @@ import com.zhousl.aether.data.AgentModeAuthorizationMethod
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AppSettings
 import com.zhousl.aether.data.AppThemeMode
+import com.zhousl.aether.data.AgentTaskState
 import com.zhousl.aether.data.CurrentOnboardingVersion
 import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.LlmApiClient
@@ -34,6 +35,7 @@ import com.zhousl.aether.data.OnboardingStarterPrompt
 import com.zhousl.aether.data.OpenAiCompatibleClient
 import com.zhousl.aether.data.RootSetupIssue
 import com.zhousl.aether.data.RootSetupState
+import com.zhousl.aether.data.SessionExecutionState
 import com.zhousl.aether.data.SessionFollowUpMode
 import com.zhousl.aether.data.SessionTurnEvent
 import com.zhousl.aether.data.SessionTurnOutcome
@@ -111,6 +113,10 @@ class AetherViewModel(
     val uiState: StateFlow<AetherUiState> = _uiState.asStateFlow()
     val transientMessages = _transientMessages.asSharedFlow()
 
+    // 流式专用状态：高频的逐 token 更新只走这个独立 Flow，避免每个 token 都复制整包 uiState。
+    val executionStates: StateFlow<Map<String, SessionExecutionState>> =
+        sessionExecutionManager.executionStates
+
     init {
         refreshTermuxSetup()
         refreshRootSetup()
@@ -149,35 +155,27 @@ class AetherViewModel(
         viewModelScope.launch {
             chatStateStore.state.collect { persisted ->
                 _uiState.update { current ->
-                    val currentExecution = current.sessionExecutionStates[persisted.currentSessionId.ifBlank { DraftSessionId }]
+                    val resolvedSessionId = persisted.currentSessionId.ifBlank { DraftSessionId }
+                    val currentExecution = sessionExecutionManager.executionStates.value[resolvedSessionId]
                     current.copy(
                         sessions = persisted.sessions,
-                        currentSessionId = persisted.currentSessionId.ifBlank { DraftSessionId },
+                        currentSessionId = resolvedSessionId,
                         isSending = currentExecution?.isRunning == true,
                         pendingResponseSessionId = currentExecution?.sessionId,
-                        pendingToolInvocations = currentExecution?.pendingToolInvocations.orEmpty(),
-                        pendingResponseBlocks = currentExecution?.pendingResponseBlocks.orEmpty(),
-                        pendingAssistantText = currentExecution?.pendingAssistantText.orEmpty(),
-                        pendingStatusText = currentExecution?.pendingStatusText.orEmpty(),
-                        pendingStatusDetail = currentExecution?.pendingStatusDetail.orEmpty(),
                     )
                 }
             }
         }
 
         viewModelScope.launch {
+            // 仅同步低频字段（是否生成中、当前 pending 会话）。逐 token 的高频流式数据由
+            // executionStates Flow 单独承载，UI 直接订阅它，避免每个 token 触发整包 uiState 复制与重组。
             sessionExecutionManager.executionStates.collect { executionStates ->
                 _uiState.update { current ->
                     val currentExecution = executionStates[current.currentSessionId]
                     current.copy(
-                        sessionExecutionStates = executionStates,
                         isSending = currentExecution?.isRunning == true,
                         pendingResponseSessionId = currentExecution?.sessionId,
-                        pendingToolInvocations = currentExecution?.pendingToolInvocations.orEmpty(),
-                        pendingResponseBlocks = currentExecution?.pendingResponseBlocks.orEmpty(),
-                        pendingAssistantText = currentExecution?.pendingAssistantText.orEmpty(),
-                        pendingStatusText = currentExecution?.pendingStatusText.orEmpty(),
-                        pendingStatusDetail = currentExecution?.pendingStatusDetail.orEmpty(),
                     )
                 }
             }
@@ -1229,10 +1227,11 @@ class AetherViewModel(
                 activeSkills = session.activeSkills,
                 activeMcpServerIds = session.activeMcpServerIds,
                 agentModeEnabled = session.agentModeEnabled,
+                taskState = AgentTaskState(),
             )
             val updatedSessions = current.sessions.toMutableList().apply {
                 removeAt(sessionIndex)
-                val updatedSession = session.withMessages(trimmedMessages)
+                val updatedSession = session.withMessages(trimmedMessages).copy(taskState = AgentTaskState())
                 updatedSessionForPersistence = updatedSession
                 add(0, updatedSession)
             }
@@ -1289,7 +1288,7 @@ class AetherViewModel(
                 messageId = messageId,
                 replacement = retryMessage,
             ) ?: return@update current
-            val updatedSession = session.withMessages(branchedMessages)
+            val updatedSession = session.withMessages(branchedMessages).copy(taskState = AgentTaskState())
             updatedSessionForPersistence = updatedSession
             val updatedSessions = current.sessions.toMutableList().apply {
                 removeAt(sessionIndex)
@@ -1309,6 +1308,7 @@ class AetherViewModel(
                 activeSkills = updatedSession.activeSkills,
                 activeMcpServerIds = updatedSession.activeMcpServerIds,
                 agentModeEnabled = updatedSession.agentModeEnabled,
+                taskState = AgentTaskState(),
             )
 
             current.copy(
@@ -2156,6 +2156,7 @@ class AetherViewModel(
         var requestActiveMcpServerIds: List<String> = emptyList()
         var requestAgentModeEnabled = false
         var requestModelKey = ""
+        var requestTaskState = AgentTaskState()
         var shouldGenerateSessionTitle = false
         var sessionForPersistence: ChatSession? = null
 
@@ -2180,7 +2181,7 @@ class AetherViewModel(
                             messageId = current.editingMessageId,
                             replacement = userMessage,
                         ) ?: (editingSession.messages.take(editingMessageIndex) + userMessage)
-                        val updated = editingSession.withMessages(branchedMessages)
+                        val updated = editingSession.withMessages(branchedMessages).copy(taskState = AgentTaskState())
                         sessionForPersistence = updated
                         updatedSessions.add(0, updated)
                         requestMessages = updated.messages
@@ -2189,6 +2190,7 @@ class AetherViewModel(
                         requestActiveMcpServerIds = updated.activeMcpServerIds
                         requestAgentModeEnabled = updated.agentModeEnabled
                         requestModelKey = updated.selectedModelKey
+                        requestTaskState = AgentTaskState()
                     } else {
                         updatedSessions.add(editingSessionIndex, editingSession)
                     }
@@ -2208,6 +2210,7 @@ class AetherViewModel(
                     requestActiveMcpServerIds = updated.activeMcpServerIds
                     requestAgentModeEnabled = updated.agentModeEnabled
                     requestModelKey = updated.selectedModelKey
+                    requestTaskState = updated.taskState
                 } else {
                     val newSession = createSession(
                         id = targetSessionId,
@@ -2230,6 +2233,7 @@ class AetherViewModel(
                     requestActiveMcpServerIds = newSession.activeMcpServerIds
                     requestAgentModeEnabled = newSession.agentModeEnabled
                     requestModelKey = newSession.selectedModelKey
+                    requestTaskState = newSession.taskState
                 }
             }
 
@@ -2246,6 +2250,7 @@ class AetherViewModel(
                 activeSkills = requestActiveSkills,
                 activeMcpServerIds = requestActiveMcpServerIds,
                 agentModeEnabled = requestAgentModeEnabled,
+                taskState = requestTaskState,
             )
 
             current.copy(
@@ -2721,6 +2726,7 @@ class AetherViewModel(
             activeSkills = session.activeSkills,
             activeMcpServerIds = session.activeMcpServerIds,
             agentModeEnabled = session.agentModeEnabled,
+            taskState = session.taskState,
         )
     }
 
@@ -3482,7 +3488,7 @@ class AetherViewModel(
         appendLine("screen=${snapshot.currentScreen}")
         appendLine("currentSessionId=${snapshot.currentSessionId}")
         appendLine("sessionCount=${snapshot.sessions.size}")
-        appendLine("runningSessionCount=${snapshot.sessionExecutionStates.values.count { it.isRunning }}")
+        appendLine("runningSessionCount=${sessionExecutionManager.executionStates.value.values.count { it.isRunning }}")
         appendLine("provider=${snapshot.settings.provider.storageValue}")
         appendLine("providerConfigCount=${snapshot.providerConfigs.size}")
         appendLine("skillCount=${snapshot.installedSkills.size}")

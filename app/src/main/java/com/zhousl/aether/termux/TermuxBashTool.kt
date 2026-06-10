@@ -19,8 +19,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 private const val ManagedCommandWatchWindowSeconds = 45
-private const val DefaultManagedLogTailBytes = 12 * 1024
-private const val MaxManagedLogTailBytes = 64 * 1024
+private const val DefaultManagedLogTailBytes = 64 * 1024
+private const val MaxManagedLogTailBytes = 256 * 1024
 private const val InternalCommandTimeoutMillis = 15_000L
 private const val SetupProbeTimeoutMillis = 12_000L
 private const val SessionWorkspaceRoot = "${TermuxContract.HomeDirectory}/.aether/workspaces"
@@ -110,6 +110,7 @@ class TermuxBashTool(
             arguments.stringValue("working_directory", "workingDirectory")
                 .ifBlank { TermuxContract.HomeDirectory }
         )
+        val tailBytes = resolveTailBytes(arguments)
 
         if (command.isBlank()) {
             return@withContext buildInvalidArgumentsResult("Missing required 'command' argument.")
@@ -136,7 +137,7 @@ class TermuxBashTool(
                     runId = runId,
                     command = command,
                     workingDirectory = workingDirectory,
-                    tailBytes = DefaultManagedLogTailBytes,
+                    tailBytes = tailBytes,
                 ),
                 commandFallback = command,
                 workingDirectoryFallback = workingDirectory,
@@ -146,6 +147,7 @@ class TermuxBashTool(
                 initialResult = initialResult,
                 runId = runId,
                 startedAtMillis = startedAtMillis,
+                tailBytes = tailBytes,
             )
         } catch (cancellationException: CancellationException) {
             runCatching { killExecutionByRunId(runId) }
@@ -292,6 +294,7 @@ class TermuxBashTool(
         initialResult: String,
         runId: String,
         startedAtMillis: Long,
+        tailBytes: Int,
     ): String {
         var currentResult = initialResult
         while (true) {
@@ -327,7 +330,7 @@ class TermuxBashTool(
             currentResult = executeManagedScript(
                 script = buildInspectManagedCommandScript(
                     runId = runId,
-                    tailBytes = DefaultManagedLogTailBytes,
+                    tailBytes = tailBytes,
                 ),
                 runIdFallback = runId,
             )

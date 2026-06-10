@@ -426,12 +426,13 @@ class OpenAiCompatibleClient(
             assistantMessage = JSONObject(message.toString()),
             reasoningText = extractOpenAiReasoningText(message),
             reasoningSummaryText = extractReasoningDetailsSummary(message.optJSONArray("reasoning_details")),
+            usage = extractUsage(json),
         )
     }
 
     private fun parseOpenAiResponses(json: JSONObject): ChatCompletionResult {
         val output = json.optJSONArray("output") ?: JSONArray()
-        return buildOpenAiResponsesResult(output)
+        return buildOpenAiResponsesResult(output).copy(usage = extractUsage(json))
     }
 
     private fun parseAnthropicMessage(json: JSONObject): ChatCompletionResult {
@@ -467,6 +468,7 @@ class OpenAiCompatibleClient(
                 put("role", "assistant")
                 put("content", JSONArray(content.toString()))
             },
+            usage = extractUsage(json),
         )
     }
 
@@ -511,8 +513,11 @@ class OpenAiCompatibleClient(
             assistantText = assistantText,
             toolCalls = toolCalls,
             assistantMessage = assistantMessage,
+            usage = extractUsage(json),
         )
     }
+
+    private fun extractUsage(json: JSONObject): TokenUsage? = parseTokenUsage(json)
 
     private fun serializeOpenAiConversationMessage(message: LlmMessage): JSONObject {
         val onlyTextPart = message.contentParts.singleOrNull() as? LlmTextPart
@@ -890,6 +895,8 @@ class OpenAiCompatibleClient(
             }
             if (stream) {
                 put("stream", true)
+                // 请求在流式结束时附带用量统计（OpenAI 兼容接口默认不返回 usage）。
+                put("stream_options", JSONObject().apply { put("include_usage", true) })
             }
             putReasoningDisabledIfNeeded(settings, disableReasoning)
         }
@@ -1710,8 +1717,10 @@ private class OpenAiStreamAccumulator(
     private val reasoningSummary = StringBuilder()
     private val reasoningDetails = mutableListOf<JSONObject>()
     private val toolCalls = linkedMapOf<Int, MutableToolCallAccumulator>()
+    private val usageTracker = UsageTracker()
 
     suspend fun consume(chunk: JSONObject) {
+        usageTracker.capture(chunk)
         val choices = chunk.optJSONArray("choices") ?: return
         for (choiceIndex in 0 until choices.length()) {
             val choice = choices.optJSONObject(choiceIndex) ?: continue
@@ -1809,6 +1818,7 @@ private class OpenAiStreamAccumulator(
                 .ifBlank { reasoningDetailsText.toString() }
                 .ifBlank { reasoningSummary.toString() },
             reasoningSummaryText = reasoningSummary.toString(),
+            usage = usageTracker.resolve(),
         )
     }
 }
@@ -1820,8 +1830,10 @@ private class OpenAiResponsesStreamAccumulator(
     private val messageContent = mutableListOf<JSONObject>()
     private val toolCalls = linkedMapOf<Int, MutableToolCallAccumulator>()
     private val completedFunctionCalls = linkedMapOf<Int, JSONObject>()
+    private val usageTracker = UsageTracker()
 
     suspend fun consume(chunk: JSONObject) {
+        usageTracker.capture(chunk)
         when (chunk.optString("type")) {
             "response.output_text.delta" -> {
                 val delta = chunk.optString("delta")
@@ -1888,7 +1900,7 @@ private class OpenAiResponsesStreamAccumulator(
             }
             completedFunctionCalls.toSortedMap().values.forEach(::put)
         }
-        return buildOpenAiResponsesResult(responseItems)
+        return buildOpenAiResponsesResult(responseItems).copy(usage = usageTracker.resolve())
     }
 
     private fun consumeOutputItem(
@@ -1943,8 +1955,10 @@ private class AnthropicStreamAccumulator(
     private val assistantText = StringBuilder()
     private val contentBlocks = mutableListOf<JSONObject>()
     private val toolUseBlocks = linkedMapOf<Int, MutableAnthropicToolUseAccumulator>()
+    private val usageTracker = UsageTracker()
 
     suspend fun consume(chunk: JSONObject) {
+        usageTracker.capture(chunk)
         when (chunk.optString("type")) {
             "content_block_start" -> {
                 val index = chunk.optInt("index", contentBlocks.size)
@@ -2009,7 +2023,7 @@ private class AnthropicStreamAccumulator(
         return buildAnthropicResultFromContent(
             assistantText = assistantText.toString(),
             content = normalizedBlocks,
-        )
+        ).copy(usage = usageTracker.resolve())
     }
 
     private fun ensureContentBlock(index: Int, block: JSONObject): JSONObject {
@@ -2039,8 +2053,10 @@ private class VertexStreamAccumulator(
 ) {
     private val assistantText = StringBuilder()
     private val parts = mutableListOf<MutableVertexPartAccumulator>()
+    private val usageTracker = UsageTracker()
 
     suspend fun consume(chunk: JSONObject) {
+        usageTracker.capture(chunk)
         val candidates = chunk.optJSONArray("candidates") ?: return
         for (candidateIndex in 0 until candidates.length()) {
             val candidate = candidates.optJSONObject(candidateIndex) ?: continue
@@ -2082,6 +2098,7 @@ private class VertexStreamAccumulator(
             assistantText = resolvedText,
             toolCalls = resolvedToolCalls,
             assistantMessage = buildVertexAssistantMessage(resolvedParts),
+            usage = usageTracker.resolve(),
         )
     }
 }

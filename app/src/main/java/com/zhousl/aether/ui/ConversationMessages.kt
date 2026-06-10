@@ -131,6 +131,7 @@ import com.zhousl.aether.ui.theme.AetherSurface
 import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import com.zhousl.aether.ui.theme.AetherTertiary
 import com.zhousl.aether.data.AppLanguage
+import com.zhousl.aether.data.TokenUsage
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
 import kotlinx.coroutines.Dispatchers
@@ -837,6 +838,7 @@ private fun AssistantMessageBlock(
             )
             }
         }
+        message.tokenUsage?.let { MessageTokenUsageLabel(it) }
     }
 }
 
@@ -926,6 +928,7 @@ fun ConversationAssistantGroupBubble(
             )
             }
         }
+        messages.firstNotNullOfOrNull { it.tokenUsage }?.let { MessageTokenUsageLabel(it) }
     }
 }
 
@@ -2811,6 +2814,37 @@ private fun formatThoughtDuration(durationMillis: Long): String {
     } else {
         "${minutes}m ${seconds}s"
     }
+}
+
+private fun formatTokenCount(count: Int): String {
+    if (count < 1000) return count.toString()
+    // 千分位分组，便于阅读大数值。
+    return count.toString().reversed().chunked(3).joinToString(",").reversed()
+}
+
+@Composable
+private fun MessageTokenUsageLabel(usage: TokenUsage) {
+    if (usage.isEmpty) return
+    val strings = rememberAetherStrings()
+    val isChinese = strings.appLanguage == AppLanguage.SimplifiedChinese
+    val parts = buildList {
+        if (usage.promptTokens > 0) {
+            add((if (isChinese) "输入 " else "in ") + formatTokenCount(usage.promptTokens))
+        }
+        if (usage.completionTokens > 0) {
+            add((if (isChinese) "输出 " else "out ") + formatTokenCount(usage.completionTokens))
+        }
+        val total = if (usage.totalTokens > 0) usage.totalTokens else usage.promptTokens + usage.completionTokens
+        if (total > 0) {
+            add((if (isChinese) "合计 " else "total ") + formatTokenCount(total))
+        }
+    }
+    if (parts.isEmpty()) return
+    Text(
+        text = parts.joinToString(" · ") + " tokens",
+        style = MaterialTheme.typography.labelSmall,
+        color = AetherOnSurfaceVariant,
+    )
 }
 
 private fun formatReasoningTraceDoneLabel(

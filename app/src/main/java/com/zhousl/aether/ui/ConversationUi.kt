@@ -95,7 +95,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
@@ -110,9 +109,6 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -135,7 +131,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
@@ -145,6 +140,8 @@ import kotlinx.coroutines.launch
 import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AgentModeDisplayState
+import com.zhousl.aether.data.AgentTaskState
+import com.zhousl.aether.data.AgentTaskStatus
 import com.zhousl.aether.data.McpServerConfig
 import com.zhousl.aether.data.McpTransportConfig
 import com.zhousl.aether.data.PendingSessionInput
@@ -164,6 +161,7 @@ import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import com.zhousl.aether.ui.theme.AetherSurfaceHigher
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 
@@ -214,6 +212,7 @@ data class ConversationScreenState(
     val pendingStatusText: String,
     val pendingStatusDetail: String,
     val pendingInputs: List<PendingSessionInput>,
+    val taskState: AgentTaskState,
     val inputValue: String,
     val draftAttachments: List<ChatAttachment>,
     val draftAttachmentRevision: Long,
@@ -288,6 +287,7 @@ fun ConversationScreen(
         pendingStatusText = state.pendingStatusText,
         pendingStatusDetail = state.pendingStatusDetail,
         pendingInputs = state.pendingInputs,
+        taskState = state.taskState,
         inputValue = state.inputValue,
         draftAttachments = state.draftAttachments,
         draftAttachmentRevision = state.draftAttachmentRevision,
@@ -419,6 +419,7 @@ private fun ConversationScreen(
     pendingStatusText: String,
     pendingStatusDetail: String,
     pendingInputs: List<PendingSessionInput>,
+    taskState: AgentTaskState,
     inputValue: String,
     draftAttachments: List<ChatAttachment>,
     draftAttachmentRevision: Long,
@@ -474,13 +475,13 @@ private fun ConversationScreen(
     val coroutineScope = rememberCoroutineScope()
     val conversationItems = remember(messages) { buildConversationListItems(messages) }
     var previewAttachment by remember { mutableStateOf<ChatAttachment?>(null) }
-    var shouldAutoFollow by rememberSaveable(conversationStateKey) { mutableStateOf(true) }
     var topBarBodyHeightPx by remember { mutableIntStateOf(0) }
     var composerBodyHeightPx by remember { mutableIntStateOf(0) }
-    var pendingGenerationHeightPx by remember { mutableIntStateOf(0) }
     var composerFocused by remember { mutableStateOf(false) }
-    var userScrollSessionActive by remember { mutableStateOf(false) }
+    var didInitialScrollToBottom by remember(conversationStateKey) { mutableStateOf(false) }
     var hasUnseenLatestContent by rememberSaveable(conversationStateKey) { mutableStateOf(false) }
+    // 生成期间是否自动跟随到最新内容：用户向上滚动时关闭，回到底部时恢复。
+    var autoFollowEnabled by remember(conversationStateKey) { mutableStateOf(true) }
     val density = LocalDensity.current
     val fallbackTopBarBodyHeight = with(density) {
         WindowInsets.statusBars.getTop(this).toDp() + 68.dp
@@ -494,48 +495,7 @@ private fun ConversationScreen(
     val conversationBottomClearance = composerBodyHeight + 72.dp
     val synchronizedImeOffsetPx = WindowInsets.ime.getBottom(density).coerceAtLeast(0)
 
-    fun startUserScrollSession() {
-        userScrollSessionActive = true
-        shouldAutoFollow = false
-    }
-
-    fun finishUserScrollSession() {
-        userScrollSessionActive = false
-        shouldAutoFollow = listState.isAtConversationBottom()
-    }
-
-    val conversationScrollConnection = remember(listState) {
-        object : NestedScrollConnection {
-            override fun onPreScroll(
-                available: Offset,
-                source: NestedScrollSource,
-            ): Offset {
-                if (source == NestedScrollSource.UserInput && available.y != 0f) {
-                    startUserScrollSession()
-                }
-                return Offset.Zero
-            }
-
-            override fun onPostScroll(
-                consumed: Offset,
-                available: Offset,
-                source: NestedScrollSource,
-            ): Offset {
-                if (source == NestedScrollSource.UserInput && (consumed.y != 0f || available.y != 0f)) {
-                    startUserScrollSession()
-                }
-                return Offset.Zero
-            }
-
-            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
-                finishUserScrollSession()
-                return Velocity.Zero
-            }
-        }
-    }
-
     fun dispatchComposerDragToConversation(dragAmountPx: Float) {
-        startUserScrollSession()
         listState.dispatchRawDelta(-dragAmountPx)
     }
 
@@ -547,12 +507,20 @@ private fun ConversationScreen(
     }
 
     fun jumpToConversationBottom() {
-        shouldAutoFollow = true
-        userScrollSessionActive = false
         hasUnseenLatestContent = false
+        autoFollowEnabled = true
         coroutineScope.launch {
             scrollToConversationBottom()
         }
+    }
+
+    LaunchedEffect(conversationStateKey, conversationItems.size) {
+        if (didInitialScrollToBottom || conversationItems.isEmpty()) return@LaunchedEffect
+        snapshotFlow { listState.layoutInfo.totalItemsCount }
+            .first { it > 0 }
+        scrollToConversationBottom()
+        hasUnseenLatestContent = false
+        didInitialScrollToBottom = true
     }
 
     LaunchedEffect(conversationItems, listState) {
@@ -593,34 +561,33 @@ private fun ConversationScreen(
             .distinctUntilChanged()
             .collect { isIdleAtBottom ->
                 if (isIdleAtBottom) {
-                    userScrollSessionActive = false
-                    shouldAutoFollow = true
                     hasUnseenLatestContent = false
                 }
             }
     }
 
-    LaunchedEffect(listState, shouldAutoFollow, composerBodyHeightPx, userScrollSessionActive) {
-        if (!shouldAutoFollow || userScrollSessionActive) return@LaunchedEffect
-        snapshotFlow {
-            val layoutInfo = listState.layoutInfo
-            val lastVisibleItem = layoutInfo.visibleItemsInfo.lastOrNull()
-            listOf(
-                layoutInfo.totalItemsCount,
-                lastVisibleItem?.index ?: -1,
-                lastVisibleItem?.offset ?: 0,
-                lastVisibleItem?.size ?: 0,
-            )
-        }
+    // 用户主动向上滚动（查看历史）时关闭自动跟随，避免生成时强行把视图拉回底部。
+    LaunchedEffect(listState) {
+        var lastIndex = listState.firstVisibleItemIndex
+        var lastOffset = listState.firstVisibleItemScrollOffset
+        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+            .collect { (index, offset) ->
+                val scrolledUp = index < lastIndex || (index == lastIndex && offset < lastOffset - 2)
+                if (scrolledUp && !listState.isAtConversationBottom()) {
+                    autoFollowEnabled = false
+                }
+                lastIndex = index
+                lastOffset = offset
+            }
+    }
+
+    // 视图回到底部时恢复自动跟随。
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isAtConversationBottom() }
             .distinctUntilChanged()
-            .collect {
-                if (
-                    shouldAutoFollow &&
-                    !userScrollSessionActive &&
-                    !listState.isScrollInProgress &&
-                    listState.layoutInfo.totalItemsCount > 0
-                ) {
-                    scrollToConversationBottom()
+            .collect { atBottom ->
+                if (atBottom) {
+                    autoFollowEnabled = true
                 }
             }
     }
@@ -687,25 +654,15 @@ private fun ConversationScreen(
     LaunchedEffect(autoFollowContentKey) {
         if (listState.layoutInfo.totalItemsCount == 0) {
             hasUnseenLatestContent = false
-        } else if (!shouldAutoFollow && !listState.isAtConversationBottom()) {
-            hasUnseenLatestContent = true
+            return@LaunchedEffect
         }
-    }
-    LaunchedEffect(
-        autoFollowContentKey,
-        pendingGenerationHeightPx,
-        composerBodyHeightPx,
-        shouldAutoFollow,
-        userScrollSessionActive,
-    ) {
-        if (
-            !shouldAutoFollow ||
-            userScrollSessionActive ||
-            listState.layoutInfo.totalItemsCount == 0
-        ) return@LaunchedEffect
-        withFrameNanos { }
-        if (shouldAutoFollow && !userScrollSessionActive && !listState.isScrollInProgress) {
+        if (!didInitialScrollToBottom) return@LaunchedEffect
+        if (autoFollowEnabled) {
+            // 跟随最新内容：用即时滚动而非动画，避免高频流式更新造成抖动。
             scrollToConversationBottom()
+            hasUnseenLatestContent = false
+        } else {
+            hasUnseenLatestContent = true
         }
     }
     val showScrollToLatestButton by remember(messages, listState) {
@@ -752,9 +709,7 @@ private fun ConversationScreen(
                 } else {
                     LazyColumn(
                         state = listState,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .nestedScroll(conversationScrollConnection),
+                        modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(
                             start = 20.dp,
                             end = 20.dp,
@@ -830,8 +785,7 @@ private fun ConversationScreen(
                                 )
                                 Column(
                                     modifier = Modifier
-                                        .fillMaxWidth()
-                                        .onSizeChanged { pendingGenerationHeightPx = it.height },
+                                        .fillMaxWidth(),
                                     verticalArrangement = Arrangement.spacedBy(10.dp),
                                 ) {
                                     PendingAssistantTimeline(
@@ -894,8 +848,8 @@ private fun ConversationScreen(
                 ConversationComposerOverlay(
                     modifier = Modifier.align(Alignment.BottomCenter),
                     onBodyHeightChanged = { composerBodyHeightPx = it },
-                    onUserScrollStarted = ::startUserScrollSession,
-                    onUserScrollFinished = ::finishUserScrollSession,
+                    onUserScrollStarted = {},
+                    onUserScrollFinished = {},
                     onVerticalDrag = ::dispatchComposerDragToConversation,
                     value = inputValue,
                     attachments = draftAttachments,
@@ -908,6 +862,7 @@ private fun ConversationScreen(
                     agentModeSelected = agentModeSelected,
                     isEditing = isEditing,
                     termuxSetupState = termuxSetupState,
+                    taskState = taskState,
                     isSending = isSending,
                     showStarterPromptHint = showStarterPromptHint,
                     showTermuxSetupNotice = showTermuxSetupNotice,
@@ -1669,6 +1624,189 @@ private fun PendingSessionInputBubble(
 }
 
 @Composable
+private fun TaskStatePanel(
+    taskState: AgentTaskState,
+    modifier: Modifier = Modifier,
+) {
+    if (taskState.isEmpty) return
+
+    var expanded by rememberSaveable(taskState.updatedAtMillis, taskState.goal) { mutableStateOf(false) }
+    val accent = taskStatusAccent(taskState.status)
+    val doneCount = taskState.todos.count { it.done }
+    val totalCount = taskState.todos.size
+    val progressLabel = if (totalCount > 0) "$doneCount/$totalCount" else taskStatusLabel(taskState.status)
+    val bodyText = taskPanelBodyText(taskState)
+    val visibleTodos = taskState.todos.take(5)
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .shadow(12.dp, RoundedCornerShape(24.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+            .clip(RoundedCornerShape(24.dp))
+            .background(AetherSurface.copy(alpha = 0.96f))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+            ) { expanded = !expanded }
+            .animateContentSize(animationSpec = tween(durationMillis = 220, easing = ChatGptMotionEasing))
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(30.dp)
+                    .clip(CircleShape)
+                    .background(accent.copy(alpha = 0.16f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = taskStatusIcon(taskState.status),
+                    contentDescription = null,
+                    tint = accent,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = taskStatusLabel(taskState.status),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = AetherOnSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = taskState.goal.ifBlank { bodyText },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                text = progressLabel,
+                style = MaterialTheme.typography.labelMedium,
+                color = accent,
+                maxLines = 1,
+            )
+            Icon(
+                imageVector = Icons.Rounded.KeyboardArrowDown,
+                contentDescription = null,
+                tint = AetherOnSurfaceVariant,
+                modifier = Modifier
+                    .size(22.dp)
+                    .graphicsLayer { rotationZ = if (expanded) 180f else 0f },
+            )
+        }
+
+        if (expanded) {
+            if (bodyText.isNotBlank() && bodyText != taskState.goal) {
+                Text(
+                    text = bodyText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            visibleTodos.forEach { item ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Top,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .padding(top = 2.dp)
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(if (item.done) accent.copy(alpha = 0.18f) else AetherSurfaceHigher),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (item.done) {
+                            Icon(
+                                imageVector = Icons.Rounded.Check,
+                                contentDescription = null,
+                                tint = accent,
+                                modifier = Modifier.size(13.dp),
+                            )
+                        }
+                    }
+                    Text(
+                        text = item.text,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (item.done) AetherOnSurfaceVariant else AetherOnSurface,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+
+            if (taskState.todos.size > visibleTodos.size) {
+                Text(
+                    text = "+${taskState.todos.size - visibleTodos.size} more",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AetherOnSurfaceVariant,
+                )
+            }
+
+            if (taskState.completionCriteria.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = "Completion",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = AetherOnSurfaceVariant,
+                    )
+                    taskState.completionCriteria.take(3).forEach { criterion ->
+                        Text(
+                            text = criterion,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = AetherOnSurface,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun taskPanelBodyText(taskState: AgentTaskState): String =
+    taskState.summary.ifBlank { taskState.completionCriteria.firstOrNull().orEmpty() }
+
+private fun taskStatusLabel(status: AgentTaskStatus): String = when (status) {
+    AgentTaskStatus.Idle -> "Task ready"
+    AgentTaskStatus.InProgress -> "Working"
+    AgentTaskStatus.WaitingForUser -> "Waiting for you"
+    AgentTaskStatus.Completed -> "Completed"
+    AgentTaskStatus.Blocked -> "Blocked"
+}
+
+@Composable
+private fun taskStatusAccent(status: AgentTaskStatus): Color = when (status) {
+    AgentTaskStatus.Completed -> AetherPrimary
+    AgentTaskStatus.Blocked -> MaterialTheme.colorScheme.error
+    AgentTaskStatus.WaitingForUser -> Color(0xFFB26A00)
+    AgentTaskStatus.InProgress -> AetherPrimary
+    AgentTaskStatus.Idle -> AetherOnSurfaceVariant
+}
+
+private fun taskStatusIcon(status: AgentTaskStatus): ImageVector = when (status) {
+    AgentTaskStatus.Completed -> Icons.Rounded.Check
+    AgentTaskStatus.Blocked -> Icons.Rounded.Close
+    AgentTaskStatus.WaitingForUser -> Icons.Rounded.Lightbulb
+    AgentTaskStatus.InProgress -> Icons.Rounded.AutoAwesome
+    AgentTaskStatus.Idle -> Icons.Rounded.AutoAwesome
+}
+
+@Composable
 private fun ConversationComposerOverlay(
     modifier: Modifier = Modifier,
     onBodyHeightChanged: (Int) -> Unit,
@@ -1686,6 +1824,7 @@ private fun ConversationComposerOverlay(
     agentModeSelected: Boolean,
     isEditing: Boolean,
     termuxSetupState: TermuxSetupState,
+    taskState: AgentTaskState,
     isSending: Boolean,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
@@ -1744,6 +1883,7 @@ private fun ConversationComposerOverlay(
                 agentModeSelected = agentModeSelected,
                 isEditing = isEditing,
                 termuxSetupState = termuxSetupState,
+                taskState = taskState,
                 isSending = isSending,
                 showStarterPromptHint = showStarterPromptHint,
                 showTermuxSetupNotice = showTermuxSetupNotice,
@@ -1786,6 +1926,7 @@ private fun ChatGptPromptComposerBar(
     agentModeSelected: Boolean,
     isEditing: Boolean,
     termuxSetupState: TermuxSetupState,
+    taskState: AgentTaskState,
     isSending: Boolean,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
@@ -1888,6 +2029,7 @@ private fun ChatGptPromptComposerBar(
             .padding(horizontal = 24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        TaskStatePanel(taskState = taskState)
         if (showTermuxSetupNotice) {
             TermuxSetupNotice(
                 setupState = termuxSetupState,

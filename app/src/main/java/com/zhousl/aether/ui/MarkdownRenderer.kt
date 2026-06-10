@@ -37,8 +37,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.ClickableText
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -47,7 +51,9 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -88,6 +94,7 @@ import java.security.MessageDigest
 import java.util.Base64
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -199,7 +206,16 @@ fun MarkdownContent(
     fadeSpan: MarkdownFadeSpan? = null,
 ) {
     val normalizedMarkdown = remember(markdown) { normalizeMarkdownSource(markdown) }
-    val blocks = remember(normalizedMarkdown) { parseMarkdownCached(normalizedMarkdown) }
+    // 已缓存（如历史消息预热、静态内容）直接命中，渲染零延迟；未命中则放到后台线程解析，
+    // 解析期间沿用上一帧的区块，避免主线程在流式逐 token 更新时反复全量解析造成掉帧。
+    // produceState 在 key 变化时会取消上一个未完成的解析，天然实现了对高频 token 的合并。
+    val blocks by produceState(
+        initialValue = MarkdownBlockCache.get(normalizedMarkdown) ?: emptyList(),
+        key1 = normalizedMarkdown,
+    ) {
+        val cached = MarkdownBlockCache.get(normalizedMarkdown)
+        value = cached ?: withContext(Dispatchers.Default) { parseMarkdownCached(normalizedMarkdown) }
+    }
 
     Column(
         modifier = modifier,
@@ -231,9 +247,7 @@ fun MarkdownContent(
                     MarkdownTable(block.headers, block.rows, onLinkClick, fadeSpan)
                 }
 
-                is MarkdownBlock.CodeFence -> SelectableMarkdownBlock {
-                    MarkdownCodeFence(block.code, fadeSpan)
-                }
+                is MarkdownBlock.CodeFence -> MarkdownCodeFence(block.code, block.language)
 
                 is MarkdownBlock.Image -> MarkdownImageBlock(
                     image = block.image,
@@ -242,7 +256,12 @@ fun MarkdownContent(
                     onLinkClick = onLinkClick,
                 )
 
-                is MarkdownBlock.Mermaid -> MarkdownMermaidBlock(block.diagram)
+                is MarkdownBlock.Mermaid -> if (fadeSpan != null) {
+                    // 流式阶段先用代码占位，避免 Mermaid WebView 在图未闭合前反复重载。
+                    MarkdownStreamingDiagramPlaceholder(block.diagram.code)
+                } else {
+                    MarkdownMermaidBlock(block.diagram)
+                }
                 MarkdownBlock.Rule -> HorizontalDivider(color = AetherOutlineSoft)
             }
         }
@@ -499,10 +518,7 @@ private fun MarkdownTableRow(
 }
 
 @Composable
-private fun MarkdownCodeFence(
-    code: MarkdownSourceText,
-    fadeSpan: MarkdownFadeSpan?,
-) {
+private fun MarkdownStreamingDiagramPlaceholder(code: MarkdownSourceText) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -510,10 +526,102 @@ private fun MarkdownCodeFence(
             .padding(horizontal = 14.dp, vertical = 12.dp)
     ) {
         Text(
-            text = plainMarkdownText(code.text, code.sourceOffset, fadeSpan),
-            style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
-            color = AetherOnSurface,
+            text = code.text,
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+            color = AetherOnSurfaceVariant,
+            softWrap = false,
         )
+    }
+}
+
+@Composable
+private fun MarkdownCodeFence(
+    code: MarkdownSourceText,
+    language: String,
+) {
+    val strings = rememberAetherStrings()
+    val clipboardManager = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
+    var copied by remember { mutableStateOf(false) }
+
+    val highlightColors = CodeHighlightColors(
+        keyword = AetherPrimary,
+        string = Color(0xFF2E9E5B),
+        comment = AetherOnSurfaceVariant,
+        number = Color(0xFFB07219),
+        punctuation = AetherOnSurfaceVariant,
+        plain = AetherOnSurface,
+    )
+    val highlighted = remember(code.text, language) {
+        highlightCode(code.text, language, highlightColors)
+    }
+    val languageLabel = remember(language) { codeFenceLanguageLabel(language) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(AetherSurfaceHigh, RoundedCornerShape(18.dp))
+            .padding(horizontal = 14.dp, vertical = 10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = languageLabel.ifBlank {
+                    if (strings.appLanguage == AppLanguage.SimplifiedChinese) "代码" else "Code"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = AetherOnSurfaceVariant,
+            )
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable {
+                        clipboardManager.setText(AnnotatedString(code.text))
+                        copied = true
+                        scope.launch {
+                            kotlinx.coroutines.delay(1_600)
+                            copied = false
+                        }
+                    }
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Icon(
+                    imageVector = if (copied) Icons.Rounded.Check else Icons.Rounded.ContentCopy,
+                    contentDescription = null,
+                    tint = if (copied) AetherPrimary else AetherOnSurfaceVariant,
+                    modifier = Modifier.size(15.dp),
+                )
+                Text(
+                    text = if (copied) {
+                        if (strings.appLanguage == AppLanguage.SimplifiedChinese) "已复制" else "Copied"
+                    } else {
+                        strings.copy
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (copied) AetherPrimary else AetherOnSurfaceVariant,
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        SelectionContainer {
+            Text(
+                text = highlighted,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
+                color = AetherOnSurface,
+                softWrap = false,
+            )
+        }
     }
 }
 
@@ -1099,7 +1207,9 @@ private fun MarkdownRichTextBlock(
     val shouldUseMathHtml = remember(text.text) {
         containsRenderableMarkdownMath(text.text)
     }
-    if (shouldUseMathHtml) {
+    // 流式阶段（fadeSpan != null）先用纯文本展示，避免每个 token 触发 KaTeX WebView 重新 loadData；
+    // 回合结束后以最终内容渲染时（fadeSpan == null）再挂载 WebView 做公式排版。
+    if (shouldUseMathHtml && fadeSpan == null) {
         MarkdownTextHtmlBlock(
             text = text.text,
             variant = variant,
@@ -1193,7 +1303,7 @@ private sealed interface MarkdownBlock {
         val headers: List<MarkdownSourceText>,
         val rows: List<List<MarkdownSourceText>>,
     ) : MarkdownBlock
-    data class CodeFence(val code: MarkdownSourceText) : MarkdownBlock
+    data class CodeFence(val code: MarkdownSourceText, val language: String = "") : MarkdownBlock
     data object Rule : MarkdownBlock
 }
 
@@ -1247,7 +1357,7 @@ private fun parseMarkdown(markdown: String): List<MarkdownBlock> {
                     )
                 )
             } else {
-                MarkdownBlock.CodeFence(code)
+                MarkdownBlock.CodeFence(code, fenceHeader.language)
             }
             continue
         }

@@ -57,6 +57,86 @@ internal data class ExecutedToolCallResult(
     val visibleOutput: String,
 )
 
+enum class AgentConversationStatus(
+    val storageValue: String,
+) {
+    Continue("continue"),
+    WaitingForUser("waiting_for_user"),
+    Completed("completed"),
+    Blocked("blocked");
+
+    companion object {
+        fun fromStorageValue(value: String): AgentConversationStatus = when (value.trim().lowercase()) {
+            "continue", "continues", "next", "next_turn" -> Continue
+            "waiting_for_user", "wait", "waiting", "needs_user", "need_user" -> WaitingForUser
+            "blocked", "stuck" -> Blocked
+            else -> Completed
+        }
+    }
+}
+
+enum class AgentTaskStatus(
+    val storageValue: String,
+) {
+    Idle("idle"),
+    InProgress("in_progress"),
+    WaitingForUser("waiting_for_user"),
+    Completed("completed"),
+    Blocked("blocked");
+
+    companion object {
+        fun fromStorageValue(value: String): AgentTaskStatus = when (value.trim().lowercase()) {
+            "in_progress", "working", "running", "active" -> InProgress
+            "waiting_for_user", "wait", "waiting", "needs_user", "need_user" -> WaitingForUser
+            "completed", "complete", "done", "finished" -> Completed
+            "blocked", "stuck" -> Blocked
+            else -> Idle
+        }
+    }
+}
+
+data class AgentTaskItem(
+    val id: String,
+    val text: String,
+    val done: Boolean = false,
+)
+
+data class AgentTaskState(
+    val goal: String = "",
+    val status: AgentTaskStatus = AgentTaskStatus.Idle,
+    val todos: List<AgentTaskItem> = emptyList(),
+    val completionCriteria: List<String> = emptyList(),
+    val summary: String = "",
+    val updatedAtMillis: Long = 0L,
+) {
+    val isEmpty: Boolean
+        get() = goal.isBlank() &&
+            todos.isEmpty() &&
+            completionCriteria.isEmpty() &&
+            summary.isBlank() &&
+            status == AgentTaskStatus.Idle
+}
+
+data class AgentConversationDecision(
+    val status: AgentConversationStatus = AgentConversationStatus.Completed,
+    val reason: String = "",
+    val nextPrompt: String = "",
+) {
+    val shouldContinueAutonomously: Boolean
+        get() = status == AgentConversationStatus.Continue
+
+    companion object {
+        fun completed(): AgentConversationDecision = AgentConversationDecision()
+    }
+}
+
+data class AgentTurnResult(
+    val assistantText: String,
+    val conversationDecision: AgentConversationDecision = AgentConversationDecision.completed(),
+    val taskState: AgentTaskState? = null,
+    val usage: TokenUsage = TokenUsage(),
+)
+
 internal class ParallelToolCallsUnsupportedRestart : RuntimeException()
 
 data class AgentToolEvent(

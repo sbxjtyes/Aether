@@ -1,8 +1,10 @@
 package com.zhousl.aether.ui
 
+import androidx.compose.runtime.Immutable
 import com.zhousl.aether.data.ActiveSkillContext
 import com.zhousl.aether.data.AgentModeAuthorizationState
 import com.zhousl.aether.data.AgentModeDisplayState
+import com.zhousl.aether.data.AgentTaskState
 import com.zhousl.aether.data.AppSettings
 import com.zhousl.aether.data.AppUpdateRelease
 import com.zhousl.aether.data.InstalledSkill
@@ -10,6 +12,7 @@ import com.zhousl.aether.data.LlmProviderConfig
 import com.zhousl.aether.data.McpServerConfig
 import com.zhousl.aether.data.RootSetupState
 import com.zhousl.aether.data.SessionExecutionState
+import com.zhousl.aether.data.TokenUsage
 import com.zhousl.aether.termux.TermuxSetupState
 
 internal const val DraftSessionId = "draft"
@@ -63,6 +66,7 @@ enum class AttachmentWorkspaceState {
     Failed,
 }
 
+@Immutable
 data class ChatAttachment(
     val id: String,
     val uri: String,
@@ -75,6 +79,7 @@ data class ChatAttachment(
     val workspaceError: String = "",
 )
 
+@Immutable
 data class ChatToolInvocation(
     val id: String,
     val toolName: String,
@@ -88,6 +93,7 @@ data class ChatToolInvocation(
     val timelineOrder: Long = 0L,
 )
 
+@Immutable
 data class ReasoningSummaryChunk(
     val id: String,
     val title: String = "",
@@ -98,6 +104,7 @@ data class ReasoningSummaryChunk(
     val timelineOrder: Long = 0L,
 )
 
+@Immutable
 data class ReasoningTrace(
     val id: String,
     val rawText: String = "",
@@ -114,6 +121,7 @@ data class ReasoningTrace(
         get() = chunks.isNotEmpty() || toolInvocations.isNotEmpty()
 }
 
+@Immutable
 sealed interface AssistantResponseBlock {
     val id: String
 
@@ -133,6 +141,7 @@ sealed interface AssistantResponseBlock {
     ) : AssistantResponseBlock
 }
 
+@Immutable
 data class ChatMessage(
     val id: String,
     val author: MessageAuthor,
@@ -145,8 +154,10 @@ data class ChatMessage(
     val branchGroup: ChatBranchGroup? = null,
     val responseGroupId: String? = null,
     val assistantActionsHidden: Boolean = false,
+    val tokenUsage: TokenUsage? = null,
 )
 
+@Immutable
 data class ChatSession(
     val id: String,
     val title: String,
@@ -158,6 +169,7 @@ data class ChatSession(
     val activeMcpServerIds: List<String> = emptyList(),
     val agentModeEnabled: Boolean = false,
     val selectedModelKey: String = "",
+    val taskState: AgentTaskState = AgentTaskState(),
 )
 
 data class AppUpdateUiState(
