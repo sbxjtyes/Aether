@@ -554,18 +554,6 @@ private fun ConversationScreen(
             }
     }
 
-    LaunchedEffect(listState) {
-        snapshotFlow {
-            !listState.isScrollInProgress && listState.isAtConversationBottom()
-        }
-            .distinctUntilChanged()
-            .collect { isIdleAtBottom ->
-                if (isIdleAtBottom) {
-                    hasUnseenLatestContent = false
-                }
-            }
-    }
-
     // 用户主动向上滚动（查看历史）时关闭自动跟随，避免生成时强行把视图拉回底部。
     LaunchedEffect(listState) {
         var lastIndex = listState.firstVisibleItemIndex
@@ -581,89 +569,65 @@ private fun ConversationScreen(
             }
     }
 
-    // 视图回到底部时恢复自动跟随。
+    // 仅在滚动停止且处于底部时恢复自动跟随，避免滑动过程中误判“在底部”而与手势拉锯。
     LaunchedEffect(listState) {
-        snapshotFlow { listState.isAtConversationBottom() }
+        snapshotFlow {
+            !listState.isScrollInProgress && listState.isAtConversationBottom()
+        }
             .distinctUntilChanged()
-            .collect { atBottom ->
-                if (atBottom) {
-                    autoFollowEnabled = true
+            .collect { idleAtBottom ->
+                if (!idleAtBottom) return@collect
+                autoFollowEnabled = true
+                hasUnseenLatestContent = false
+                if (listState.layoutInfo.totalItemsCount > 0) {
+                    scrollToConversationBottom()
                 }
             }
     }
-    val autoFollowContentKey = remember(
-        conversationItems,
-        pendingInputs,
-        pendingResponseBlocks,
-        pendingAssistantText,
-        pendingToolInvocations,
-        pendingStatusText,
-        pendingStatusDetail,
-        isSending,
-    ) {
-        buildString {
-            append(conversationItems.lastOrNull()?.key.orEmpty())
-            append('|')
-            append(pendingInputs.joinToString("|") { "${it.id}:${it.preview.length}:${it.attachmentCount}" })
-            append('|')
-            append(
-                pendingResponseBlocks.joinToString("|") { block ->
-                    when (block) {
-                        is AssistantResponseBlock.Text -> "${block.id}:text:${block.text.length}"
-                        is AssistantResponseBlock.ToolGroup -> block.toolInvocations.joinToString(
-                            prefix = "${block.id}:tools:",
-                            separator = ",",
-                        ) { invocation ->
-                            "${invocation.id}:${invocation.isRunning}:${invocation.outputJson.length}"
-                        }
-                        is AssistantResponseBlock.Reasoning -> buildString {
-                            append("${block.id}:reasoning:")
-                            append(block.trace.rawText.length)
-                            append(':')
-                            append(block.trace.latestStatusText.length)
-                            append(':')
-                            append(block.trace.completedAtMillis ?: 0L)
-                            append(':')
-                            append(block.trace.chunks.joinToString(",") { chunk ->
-                                "${chunk.id}:${chunk.title.length}:${chunk.detail.length}:${chunk.isPending}:${chunk.timelineOrder}"
-                            })
-                            append(':')
-                            append(block.trace.toolInvocations.joinToString(",") { invocation ->
-                                "${invocation.id}:${invocation.isRunning}:${invocation.outputJson.length}:${invocation.startedAtMillis}:${invocation.completedAtMillis ?: 0L}:${invocation.timelineOrder}"
-                            })
-                        }
-                    }
+
+    // 轻量内容版本号：流式更新时只统计长度/数量，避免在主线程拼接大字符串。
+    val streamingContentRevision by remember {
+        derivedStateOf {
+            var revision = conversationItems.size
+            revision = revision * 31 + conversationItems.lastOrNull()?.key.hashCode()
+            revision = revision * 31 + pendingAssistantText.length
+            revision = revision * 31 + pendingInputs.size
+            pendingResponseBlocks.forEach { block ->
+                revision = when (block) {
+                    is AssistantResponseBlock.Text -> revision * 31 + block.text.length
+                    is AssistantResponseBlock.ToolGroup -> revision * 31 + block.toolInvocations.sumOf { it.outputJson.length }
+                    is AssistantResponseBlock.Reasoning -> revision * 31 + block.trace.rawText.length +
+                        block.trace.toolInvocations.sumOf { it.outputJson.length }
                 }
-            )
-            append('|')
-            append(pendingAssistantText.length)
-            append('|')
-            append(
-                pendingToolInvocations.joinToString("|") { invocation ->
-                    "${invocation.id}:${invocation.isRunning}:${invocation.outputJson.length}"
-                }
-            )
-            append('|')
-            append(pendingStatusText)
-            append('|')
-            append(pendingStatusDetail)
-            append('|')
-            append(isSending)
+            }
+            revision = revision * 31 + pendingToolInvocations.sumOf { it.outputJson.length }
+            revision = revision * 31 + if (isSending) 1 else 0
+            revision
         }
     }
-    LaunchedEffect(autoFollowContentKey) {
-        if (listState.layoutInfo.totalItemsCount == 0) {
-            hasUnseenLatestContent = false
-            return@LaunchedEffect
-        }
+
+    LaunchedEffect(listState, didInitialScrollToBottom) {
         if (!didInitialScrollToBottom) return@LaunchedEffect
-        if (autoFollowEnabled) {
-            // 跟随最新内容：用即时滚动而非动画，避免高频流式更新造成抖动。
-            scrollToConversationBottom()
-            hasUnseenLatestContent = false
-        } else {
-            hasUnseenLatestContent = true
+        snapshotFlow {
+            Triple(streamingContentRevision, autoFollowEnabled, listState.isScrollInProgress)
         }
+            .distinctUntilChanged()
+            .collectLatest { (_, follow, scrolling) ->
+                if (listState.layoutInfo.totalItemsCount == 0) {
+                    hasUnseenLatestContent = false
+                    return@collectLatest
+                }
+                if (!follow) {
+                    hasUnseenLatestContent = true
+                    return@collectLatest
+                }
+                if (scrolling) return@collectLatest
+                // 合并同一帧内的多次流式更新，降低 scrollToItem 调用频率。
+                delay(16)
+                if (!autoFollowEnabled || listState.isScrollInProgress) return@collectLatest
+                scrollToConversationBottom()
+                hasUnseenLatestContent = false
+            }
     }
     val showScrollToLatestButton by remember(messages, listState) {
         derivedStateOf {

@@ -6,6 +6,9 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 
+internal const val MaxHighlightedCodeChars = 12_000
+internal const val MaxHighlightedCodeLines = 360
+
 /**
  * 轻量级代码高亮器（语法着色）。
  *
@@ -85,6 +88,18 @@ private fun usesHashComment(language: String): Boolean {
     }
 }
 
+internal fun shouldHighlightCode(code: String): Boolean {
+    if (code.length > MaxHighlightedCodeChars) return false
+    var lines = 1
+    code.forEach { char ->
+        if (char == '\n') {
+            lines++
+            if (lines > MaxHighlightedCodeLines) return false
+        }
+    }
+    return true
+}
+
 /**
  * 对源码进行词法着色，返回带颜色的 [AnnotatedString]。
  *
@@ -98,20 +113,22 @@ internal fun highlightCode(
 ): AnnotatedString = buildAnnotatedString {
     if (code.isEmpty()) return@buildAnnotatedString
 
+    append(code)
+
     val hashComment = usesHashComment(language)
     var i = 0
     val n = code.length
 
-    fun appendStyled(start: Int, end: Int, color: Color, italic: Boolean = false) {
+    fun styleRange(start: Int, end: Int, color: Color, italic: Boolean = false) {
         if (end <= start) return
-        pushStyle(
+        addStyle(
             SpanStyle(
                 color = color,
                 fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
-            )
+            ),
+            start,
+            end,
         )
-        append(code.substring(start, end))
-        pop()
     }
 
     while (i < n) {
@@ -121,13 +138,13 @@ internal fun highlightCode(
         if (c == '/' && i + 1 < n && code[i + 1] == '/') {
             val start = i
             while (i < n && code[i] != '\n') i++
-            appendStyled(start, i, colors.comment, italic = true)
+            styleRange(start, i, colors.comment, italic = true)
             continue
         }
         if (hashComment && c == '#') {
             val start = i
             while (i < n && code[i] != '\n') i++
-            appendStyled(start, i, colors.comment, italic = true)
+            styleRange(start, i, colors.comment, italic = true)
             continue
         }
 
@@ -137,7 +154,7 @@ internal fun highlightCode(
             i += 2
             while (i < n && !(code[i] == '*' && i + 1 < n && code[i + 1] == '/')) i++
             if (i < n) i += 2
-            appendStyled(start, i, colors.comment, italic = true)
+            styleRange(start, i, colors.comment, italic = true)
             continue
         }
 
@@ -159,7 +176,7 @@ internal fun highlightCode(
                 if (code[i] == '\n' && quote != '`') break
                 i++
             }
-            appendStyled(start, i, colors.string)
+            styleRange(start, i, colors.string)
             continue
         }
 
@@ -167,7 +184,7 @@ internal fun highlightCode(
         if (c.isDigit()) {
             val start = i
             while (i < n && (code[i].isLetterOrDigit() || code[i] == '.' || code[i] == '_')) i++
-            appendStyled(start, i, colors.number)
+            styleRange(start, i, colors.number)
             continue
         }
 
@@ -177,22 +194,19 @@ internal fun highlightCode(
             while (i < n && (code[i].isLetterOrDigit() || code[i] == '_' || code[i] == '$')) i++
             val word = code.substring(start, i)
             if (word in CommonCodeKeywords) {
-                appendStyled(start, i, colors.keyword)
-            } else {
-                appendStyled(start, i, colors.plain)
+                styleRange(start, i, colors.keyword)
             }
             continue
         }
 
         // 标点符号
         if (!c.isWhitespace() && (c in "{}()[];:,.<>=+-*/%&|!?~^")) {
-            appendStyled(i, i + 1, colors.punctuation)
+            styleRange(i, i + 1, colors.punctuation)
             i++
             continue
         }
 
         // 其它字符（空白等）原样输出
-        appendStyled(i, i + 1, colors.plain)
         i++
     }
 }

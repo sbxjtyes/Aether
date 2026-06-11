@@ -40,4 +40,15 @@ class CodeHighlighterTest {
         assertEquals(code, highlighted.text)
         assertTrue(highlighted.spanStyles.isNotEmpty())
     }
+
+    @Test
+    fun veryLargeCodeSkipsHighlighting() {
+        val code = buildString {
+            repeat(MaxHighlightedCodeChars + 1) {
+                append('a')
+            }
+        }
+
+        assertTrue(!shouldHighlightCode(code))
+    }
 }

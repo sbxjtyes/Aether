@@ -555,8 +555,18 @@ private fun MarkdownCodeFence(
         punctuation = AetherOnSurfaceVariant,
         plain = AetherOnSurface,
     )
-    val highlighted = remember(code.text, language) {
-        highlightCode(code.text, language, highlightColors)
+    val highlighted by produceState(
+        initialValue = AnnotatedString(code.text),
+        key1 = code.text,
+        key2 = language,
+    ) {
+        value = if (shouldHighlightCode(code.text)) {
+            withContext(Dispatchers.Default) {
+                highlightCode(code.text, language, highlightColors)
+            }
+        } else {
+            AnnotatedString(code.text)
+        }
     }
     val languageLabel = remember(language) { codeFenceLanguageLabel(language) }
 
