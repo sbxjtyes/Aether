@@ -199,6 +199,10 @@ private val ChatGptMotionEasing = CubicBezierEasing(0.22f, 0.84f, 0.18f, 1f)
 private const val ComposerFocusTransitionMillis = 160
 private const val ImeInsetStabilizationMillis = 24L
 private const val ConversationMarkdownPrewarmWindow = 4
+internal const val ConversationInitialMessageWindow = 40
+internal const val ConversationMessagePageSize = 24
+private const val ConversationLoadOlderScrollThreshold = 2
+private const val ConversationOlderMessagesHintKey = "conversation-older-messages-hint"
 private val ImeStabilizationMinVisibleHeight = 24.dp
 
 data class ConversationScreenState(
@@ -473,7 +477,28 @@ private fun ConversationScreen(
 ) {
     val listState = remember(conversationStateKey) { LazyListState() }
     val coroutineScope = rememberCoroutineScope()
-    val conversationItems = remember(messages) { buildConversationListItems(messages) }
+    var loadedFromMessageIndex by rememberSaveable(conversationStateKey) { mutableIntStateOf(-1) }
+    var isLoadingOlderMessages by remember(conversationStateKey) { mutableStateOf(false) }
+    LaunchedEffect(conversationStateKey, messages.size) {
+        loadedFromMessageIndex = when {
+            messages.isEmpty() -> 0
+            loadedFromMessageIndex < 0 -> initialConversationMessageStartIndex(messages.size)
+            loadedFromMessageIndex >= messages.size -> initialConversationMessageStartIndex(messages.size)
+            else -> loadedFromMessageIndex
+        }
+    }
+    val visibleMessages by remember(messages, loadedFromMessageIndex) {
+        derivedStateOf {
+            if (messages.isEmpty()) {
+                emptyList()
+            } else {
+                val start = clampConversationMessageStartIndex(loadedFromMessageIndex, messages.size)
+                messages.subList(start, messages.size)
+            }
+        }
+    }
+    val conversationItems = remember(visibleMessages) { buildConversationListItems(visibleMessages) }
+    val hasOlderMessages = loadedFromMessageIndex > 0
     var previewAttachment by remember { mutableStateOf<ChatAttachment?>(null) }
     var topBarBodyHeightPx by remember { mutableIntStateOf(0) }
     var composerBodyHeightPx by remember { mutableIntStateOf(0) }
@@ -514,6 +539,38 @@ private fun ConversationScreen(
         }
     }
 
+    suspend fun loadOlderConversationMessages() {
+        if (!hasOlderMessages || isLoadingOlderMessages) return
+        isLoadingOlderMessages = true
+        try {
+            val anchorIndex = listState.firstVisibleItemIndex
+            val anchorOffset = listState.firstVisibleItemScrollOffset
+            val anchorKey = conversationItems.getOrNull(anchorIndex)?.let { item ->
+                if (item.key == ConversationOlderMessagesHintKey) {
+                    conversationItems.getOrNull(anchorIndex + 1)?.key
+                } else {
+                    item.key
+                }
+            } ?: return
+
+            loadedFromMessageIndex = previousConversationMessageStartIndex(loadedFromMessageIndex)
+            loadedFromMessageIndex = clampConversationMessageStartIndex(loadedFromMessageIndex, messages.size)
+
+            snapshotFlow { listState.layoutInfo.totalItemsCount }
+                .first { it > 0 }
+
+            val updatedItems = buildConversationListItems(
+                messages.subList(loadedFromMessageIndex, messages.size),
+            )
+            val newIndex = updatedItems.indexOfFirst { it.key == anchorKey }
+            if (newIndex >= 0) {
+                listState.scrollToItem(newIndex, anchorOffset)
+            }
+        } finally {
+            isLoadingOlderMessages = false
+        }
+    }
+
     LaunchedEffect(conversationStateKey, conversationItems.size) {
         if (didInitialScrollToBottom || conversationItems.isEmpty()) return@LaunchedEffect
         snapshotFlow { listState.layoutInfo.totalItemsCount }
@@ -523,10 +580,32 @@ private fun ConversationScreen(
         didInitialScrollToBottom = true
     }
 
+    LaunchedEffect(listState, conversationStateKey, hasOlderMessages) {
+        snapshotFlow {
+            Triple(
+                listState.firstVisibleItemIndex,
+                listState.isScrollInProgress,
+                loadedFromMessageIndex,
+            )
+        }
+            .distinctUntilChanged()
+            .collect { (firstIndex, scrolling, startIndex) ->
+                if (scrolling || startIndex <= 0 || isLoadingOlderMessages) return@collect
+                val threshold = if (hasOlderMessages) {
+                    ConversationLoadOlderScrollThreshold
+                } else {
+                    0
+                }
+                if (firstIndex > threshold) return@collect
+                loadOlderConversationMessages()
+            }
+    }
+
     LaunchedEffect(conversationItems, listState) {
         snapshotFlow {
             val visibleMessageIndices = listState.layoutInfo.visibleItemsInfo.mapNotNull { itemInfo ->
-                itemInfo.index.takeIf { it in conversationItems.indices }
+                val itemIndex = itemInfo.index - if (hasOlderMessages) 1 else 0
+                itemIndex.takeIf { it in conversationItems.indices }
             }
             if (visibleMessageIndices.isEmpty()) {
                 null
@@ -682,6 +761,20 @@ private fun ConversationScreen(
                         ),
                         verticalArrangement = Arrangement.spacedBy(22.dp),
                     ) {
+                        if (hasOlderMessages) {
+                            item(
+                                key = ConversationOlderMessagesHintKey,
+                                contentType = "older-messages-hint",
+                            ) {
+                                ConversationOlderMessagesHint(
+                                    hiddenMessageCount = loadedFromMessageIndex,
+                                    isLoading = isLoadingOlderMessages,
+                                    onLoadMore = {
+                                        coroutineScope.launch { loadOlderConversationMessages() }
+                                    },
+                                )
+                            }
+                        }
                         items(
                             items = conversationItems,
                             key = { it.key },
@@ -1455,6 +1548,59 @@ private fun PendingAssistantTimeline(
                 }
             }
         }
+    }
+}
+
+internal fun initialConversationMessageStartIndex(
+    messageCount: Int,
+    initialWindow: Int = ConversationInitialMessageWindow,
+): Int = if (messageCount <= initialWindow) 0 else messageCount - initialWindow
+
+internal fun previousConversationMessageStartIndex(
+    currentStart: Int,
+    pageSize: Int = ConversationMessagePageSize,
+): Int = (currentStart - pageSize).coerceAtLeast(0)
+
+internal fun clampConversationMessageStartIndex(
+    startIndex: Int,
+    messageCount: Int,
+): Int = when {
+    messageCount <= 0 -> 0
+    startIndex <= 0 -> 0
+    startIndex >= messageCount -> initialConversationMessageStartIndex(messageCount)
+    else -> startIndex
+}
+
+@Composable
+private fun ConversationOlderMessagesHint(
+    hiddenMessageCount: Int,
+    isLoading: Boolean,
+    onLoadMore: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    val label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+        if (isLoading) "正在加载更早的消息…" else "向上滑动或点击加载更早的 $hiddenMessageCount 条消息"
+    } else {
+        if (isLoading) {
+            "Loading earlier messages…"
+        } else {
+            "Swipe up or tap to load $hiddenMessageCount earlier messages"
+        }
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(enabled = !isLoading, onClick = onLoadMore)
+            .background(AetherSurfaceHigh.copy(alpha = 0.72f))
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = AetherOnSurfaceVariant,
+        )
     }
 }
 

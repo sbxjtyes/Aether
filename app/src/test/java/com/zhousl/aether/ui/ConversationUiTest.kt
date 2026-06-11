@@ -101,6 +101,24 @@ class ConversationUiTest {
     }
 
     @Test
+    fun initialMessageWindowStartsNearLatestMessages() {
+        assertEquals(0, initialConversationMessageStartIndex(12))
+        assertEquals(60, initialConversationMessageStartIndex(100))
+    }
+
+    @Test
+    fun previousMessageWindowMovesBackwardByPageSize() {
+        assertEquals(36, previousConversationMessageStartIndex(60))
+        assertEquals(0, previousConversationMessageStartIndex(12))
+    }
+
+    @Test
+    fun clampMessageWindowStartHandlesOutOfRangeValues() {
+        assertEquals(0, clampConversationMessageStartIndex(-3, 80))
+        assertEquals(40, clampConversationMessageStartIndex(999, 80))
+    }
+
+    @Test
     fun reasoningTimelineKeepsSummaryAndToolsInRecordedOrder() {
         val trace = ReasoningTrace(
             id = "reasoning-1",
