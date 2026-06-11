@@ -29,6 +29,7 @@ secrets.properties
 google-services.json
 
 # Agent/editor scratch data
+cursor_chat_*.json
 .agents/
 .claude/
 .vscode/
