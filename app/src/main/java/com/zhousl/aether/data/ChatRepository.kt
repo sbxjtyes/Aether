@@ -248,6 +248,10 @@ internal fun parseChatSessionObject(
     agentModeEnabled = session.optBoolean("agentModeEnabled", false),
     selectedModelKey = session.optString("selectedModelKey"),
     taskState = parseAgentTaskState(session.optJSONObject("taskState")),
+    lastOpenedAtMillis = session.optLong("lastOpenedAtMillis"),
+    lastActivityAtMillis = session.optLong("lastActivityAtMillis"),
+    isPinned = session.optBoolean("isPinned", false),
+    isArchived = session.optBoolean("isArchived", false),
 )
 
 private fun corruptedChatStateSession(
@@ -281,6 +285,10 @@ internal fun ChatSession.toJson(): JSONObject = JSONObject().apply {
     put("title", title)
     put("preview", preview)
     put("hasCustomTitle", hasCustomTitle)
+    put("lastOpenedAtMillis", lastOpenedAtMillis)
+    put("lastActivityAtMillis", lastActivityAtMillis)
+    put("isPinned", isPinned)
+    put("isArchived", isArchived)
     put("agentModeEnabled", agentModeEnabled)
     put("selectedModelKey", selectedModelKey)
     put("selectedSkillIds", JSONArray().apply { selectedSkillIds.forEach(::put) })

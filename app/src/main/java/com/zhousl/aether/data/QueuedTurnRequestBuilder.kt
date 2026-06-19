@@ -22,6 +22,8 @@ internal class QueuedTurnRequestBuilder(
             val session = updatedSessions.removeAt(sessionIndex)
             val updatedSession = session.withDerivedMessages(
                 syncActiveBranches(session.messages + queuedInput)
+            ).copy(
+                lastOpenedAtMillis = maxOf(session.lastOpenedAtMillis, queuedInput.createdAtMillis),
             )
             selection = QueuedTurnSelection(
                 requestMessages = updatedSession.messages,

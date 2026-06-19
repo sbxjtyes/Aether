@@ -8,11 +8,14 @@ import com.zhousl.aether.ui.syncActiveBranches
 internal fun ChatSession.withDerivedMessages(
     messages: List<ChatMessage>,
 ): ChatSession {
-    val metadata = deriveSessionMetadata(messages)
+    val syncedMessages = syncActiveBranches(messages)
+    val metadata = deriveSessionMetadata(syncedMessages)
+    val derivedActivityAtMillis = syncedMessages.lastOrNull()?.createdAtMillis ?: 0L
     return copy(
         title = if (hasCustomTitle) title else metadata.first,
         preview = metadata.second,
-        messages = syncActiveBranches(messages),
+        messages = syncedMessages,
+        lastActivityAtMillis = maxOf(lastActivityAtMillis, derivedActivityAtMillis),
     )
 }
 

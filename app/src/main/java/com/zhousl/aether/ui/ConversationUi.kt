@@ -205,8 +205,13 @@ private const val ConversationLoadOlderScrollThreshold = 2
 private const val ConversationOlderMessagesHintKey = "conversation-older-messages-hint"
 private val ImeStabilizationMinVisibleHeight = 24.dp
 
-data class ConversationScreenState(
+internal data class ConversationScreenState(
     val conversationStateKey: String,
+    val currentSession: ChatSession? = null,
+    val currentTaskSnapshot: TaskWorkbenchSnapshot? = null,
+    val currentSessionTitle: String,
+    val currentSessionPinned: Boolean,
+    val currentSessionArchived: Boolean,
     val messages: List<ChatMessage>,
     val workspaceDirectory: String,
     val pendingToolInvocations: List<ChatToolInvocation>,
@@ -238,8 +243,14 @@ data class ConversationScreenState(
     val isSending: Boolean,
 )
 
-data class ConversationScreenActions(
+internal data class ConversationScreenActions(
     val onInputChanged: (String) -> Unit,
+    val onRenameThread: (String) -> Unit,
+    val onTogglePinned: () -> Unit,
+    val onArchiveThread: () -> Unit,
+    val onRestoreThread: () -> Unit,
+    val onExportThread: () -> Unit,
+    val onDeleteThread: () -> Unit,
     val onModelSelected: (String) -> Unit,
     val onRemoveDraftAttachment: (String) -> Unit,
     val onSetSkillSelected: (String, Boolean) -> Unit,
@@ -250,6 +261,7 @@ data class ConversationScreenActions(
     val onQueueFollowUp: () -> Unit,
     val onSteerFollowUp: () -> Unit,
     val onMenu: () -> Unit,
+    val onOpenInbox: () -> Unit,
     val onNewChat: () -> Unit,
     val onPickImages: () -> Unit,
     val onPickFiles: () -> Unit,
@@ -276,12 +288,17 @@ data class ConversationScreenActions(
  * 将聚合后的会话状态和动作转发到内部渲染实现。
  */
 @Composable
-fun ConversationScreen(
+internal fun ConversationScreen(
     state: ConversationScreenState,
     actions: ConversationScreenActions,
 ) {
     ConversationScreen(
         conversationStateKey = state.conversationStateKey,
+        currentSession = state.currentSession,
+        currentTaskSnapshot = state.currentTaskSnapshot,
+        currentSessionTitle = state.currentSessionTitle,
+        currentSessionPinned = state.currentSessionPinned,
+        currentSessionArchived = state.currentSessionArchived,
         messages = state.messages,
         workspaceDirectory = state.workspaceDirectory,
         pendingToolInvocations = state.pendingToolInvocations,
@@ -311,6 +328,12 @@ fun ConversationScreen(
         showStarterPromptHint = state.showStarterPromptHint,
         showTermuxSetupNotice = state.showTermuxSetupNotice,
         onInputChanged = actions.onInputChanged,
+        onRenameThread = actions.onRenameThread,
+        onTogglePinned = actions.onTogglePinned,
+        onArchiveThread = actions.onArchiveThread,
+        onRestoreThread = actions.onRestoreThread,
+        onExportThread = actions.onExportThread,
+        onDeleteThread = actions.onDeleteThread,
         onModelSelected = actions.onModelSelected,
         onRemoveDraftAttachment = actions.onRemoveDraftAttachment,
         onSetSkillSelected = actions.onSetSkillSelected,
@@ -321,6 +344,7 @@ fun ConversationScreen(
         onQueueFollowUp = actions.onQueueFollowUp,
         onSteerFollowUp = actions.onSteerFollowUp,
         onMenu = actions.onMenu,
+        onOpenInbox = actions.onOpenInbox,
         onNewChat = actions.onNewChat,
         onPickImages = actions.onPickImages,
         onPickFiles = actions.onPickFiles,
@@ -414,6 +438,11 @@ private fun topOverlayTailGradient(): Brush = Brush.verticalGradient(
 @Composable
 private fun ConversationScreen(
     conversationStateKey: String,
+    currentSession: ChatSession?,
+    currentTaskSnapshot: TaskWorkbenchSnapshot?,
+    currentSessionTitle: String,
+    currentSessionPinned: Boolean,
+    currentSessionArchived: Boolean,
     messages: List<ChatMessage>,
     workspaceDirectory: String,
     pendingToolInvocations: List<ChatToolInvocation>,
@@ -443,6 +472,12 @@ private fun ConversationScreen(
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
     onInputChanged: (String) -> Unit,
+    onRenameThread: (String) -> Unit,
+    onTogglePinned: () -> Unit,
+    onArchiveThread: () -> Unit,
+    onRestoreThread: () -> Unit,
+    onExportThread: () -> Unit,
+    onDeleteThread: () -> Unit,
     onModelSelected: (String) -> Unit,
     onRemoveDraftAttachment: (String) -> Unit,
     onSetSkillSelected: (String, Boolean) -> Unit,
@@ -453,6 +488,7 @@ private fun ConversationScreen(
     onQueueFollowUp: () -> Unit,
     onSteerFollowUp: () -> Unit,
     onMenu: () -> Unit,
+    onOpenInbox: () -> Unit,
     onNewChat: () -> Unit,
     onPickImages: () -> Unit,
     onPickFiles: () -> Unit,
@@ -949,9 +985,21 @@ private fun ConversationScreen(
             ConversationTopOverlay(
                 modifier = Modifier.align(Alignment.TopCenter),
                 onBodyHeightChanged = { topBarBodyHeightPx = it },
+                currentSession = currentSession,
+                currentTaskSnapshot = currentTaskSnapshot,
+                currentSessionTitle = currentSessionTitle,
+                currentSessionPinned = currentSessionPinned,
+                currentSessionArchived = currentSessionArchived,
                 modelOptions = modelOptions,
                 selectedModelKey = selectedModelKey,
                 onMenu = onMenu,
+                onOpenInbox = onOpenInbox,
+                onRenameThread = onRenameThread,
+                onTogglePinned = onTogglePinned,
+                onArchiveThread = onArchiveThread,
+                onRestoreThread = onRestoreThread,
+                onExportThread = onExportThread,
+                onDeleteThread = onDeleteThread,
                 onModelSelected = onModelSelected,
                 onNewChat = onNewChat,
             )
@@ -1038,9 +1086,21 @@ private fun ScrollToLatestButton(
 private fun ConversationTopOverlay(
     modifier: Modifier = Modifier,
     onBodyHeightChanged: (Int) -> Unit,
+    currentSession: ChatSession?,
+    currentTaskSnapshot: TaskWorkbenchSnapshot?,
+    currentSessionTitle: String,
+    currentSessionPinned: Boolean,
+    currentSessionArchived: Boolean,
     modelOptions: List<ProviderModelOption>,
     selectedModelKey: String,
     onMenu: () -> Unit,
+    onOpenInbox: () -> Unit,
+    onRenameThread: (String) -> Unit,
+    onTogglePinned: () -> Unit,
+    onArchiveThread: () -> Unit,
+    onRestoreThread: () -> Unit,
+    onExportThread: () -> Unit,
+    onDeleteThread: () -> Unit,
     onModelSelected: (String) -> Unit,
     onNewChat: () -> Unit,
 ) {
@@ -1054,9 +1114,21 @@ private fun ConversationTopOverlay(
                 .onSizeChanged { onBodyHeightChanged(it.height) },
         ) {
             ConversationTopBar(
+                currentSession = currentSession,
+                currentTaskSnapshot = currentTaskSnapshot,
+                currentSessionTitle = currentSessionTitle,
+                currentSessionPinned = currentSessionPinned,
+                currentSessionArchived = currentSessionArchived,
                 modelOptions = modelOptions,
                 selectedModelKey = selectedModelKey,
                 onMenu = onMenu,
+                onOpenInbox = onOpenInbox,
+                onRenameThread = onRenameThread,
+                onTogglePinned = onTogglePinned,
+                onArchiveThread = onArchiveThread,
+                onRestoreThread = onRestoreThread,
+                onExportThread = onExportThread,
+                onDeleteThread = onDeleteThread,
                 onModelSelected = onModelSelected,
                 onNewChat = onNewChat,
             )
@@ -1073,47 +1145,257 @@ private fun ConversationTopOverlay(
 @Composable
 private fun ConversationTopBar(
     modifier: Modifier = Modifier,
+    currentSession: ChatSession?,
+    currentTaskSnapshot: TaskWorkbenchSnapshot?,
+    currentSessionTitle: String,
+    currentSessionPinned: Boolean,
+    currentSessionArchived: Boolean,
     modelOptions: List<ProviderModelOption>,
     selectedModelKey: String,
     onMenu: () -> Unit,
+    onOpenInbox: () -> Unit,
+    onRenameThread: (String) -> Unit,
+    onTogglePinned: () -> Unit,
+    onArchiveThread: () -> Unit,
+    onRestoreThread: () -> Unit,
+    onExportThread: () -> Unit,
+    onDeleteThread: () -> Unit,
     onModelSelected: (String) -> Unit,
     onNewChat: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
     val focusManager = LocalFocusManager.current
-    Row(
+    Column(
         modifier = modifier
             .fillMaxWidth()
             .statusBarsPadding()
             .padding(horizontal = 15.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        HeaderCircleButton(
-            icon = Icons.Rounded.Menu,
-            contentDescription = strings.menu,
-            onClick = {
-                focusManager.clearFocus(force = true)
-                onMenu()
-            },
-            size = 44.dp,
-            containerColor = AetherSurface.copy(alpha = 0.96f),
-        )
-        ConversationModelSelector(
-            options = modelOptions,
-            selectedModelKey = selectedModelKey,
-            onSelected = onModelSelected,
-            modifier = Modifier
-                .weight(1f)
-                .padding(horizontal = 12.dp),
-        )
-        HeaderCircleButton(
-            icon = LucideIcons.SquarePen,
-            contentDescription = strings.newChat,
-            onClick = onNewChat,
-            size = 44.dp,
-            containerColor = AetherSurface.copy(alpha = 0.96f),
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            HeaderCircleButton(
+                icon = Icons.Rounded.Menu,
+                contentDescription = strings.menu,
+                onClick = {
+                    focusManager.clearFocus(force = true)
+                    onMenu()
+                },
+                size = 44.dp,
+                containerColor = AetherSurface.copy(alpha = 0.96f),
+            )
+            ConversationModelSelector(
+                options = modelOptions,
+                selectedModelKey = selectedModelKey,
+                onSelected = onModelSelected,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 10.dp),
+            )
+            HeaderCircleButton(
+                icon = LucideIcons.Cursor,
+                contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+                    "\u4efb\u52a1\u5de5\u4f5c\u53f0"
+                } else {
+                    "Task inbox"
+                },
+                onClick = onOpenInbox,
+                size = 44.dp,
+                containerColor = AetherSurface.copy(alpha = 0.96f),
+            )
+            HeaderCircleButton(
+                icon = LucideIcons.SquarePen,
+                contentDescription = strings.newChat,
+                onClick = onNewChat,
+                size = 44.dp,
+                containerColor = AetherSurface.copy(alpha = 0.96f),
+            )
+        }
+
+        ConversationThreadMetaBar(
+            session = currentSession,
+            taskSnapshot = currentTaskSnapshot,
+            title = currentSessionTitle,
+            isPinned = currentSessionPinned,
+            isArchived = currentSessionArchived,
+            onRenameThread = onRenameThread,
+            onTogglePinned = onTogglePinned,
+            onArchiveThread = onArchiveThread,
+            onRestoreThread = onRestoreThread,
+            onExportThread = onExportThread,
+            onDeleteThread = onDeleteThread,
         )
     }
+}
+
+@Composable
+private fun ConversationThreadMetaBar(
+    session: ChatSession?,
+    taskSnapshot: TaskWorkbenchSnapshot?,
+    title: String,
+    isPinned: Boolean,
+    isArchived: Boolean,
+    onRenameThread: (String) -> Unit,
+    onTogglePinned: () -> Unit,
+    onArchiveThread: () -> Unit,
+    onRestoreThread: () -> Unit,
+    onExportThread: () -> Unit,
+    onDeleteThread: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    val language = strings.appLanguage
+    val taskStatusLabel = taskSnapshot?.let { snapshot ->
+        taskWorkbenchStatusLabel(snapshot.effectiveStatus, language)
+    }
+    val taskStatusTint = taskSnapshot?.let { snapshot ->
+        taskWorkbenchStatusAccent(snapshot.effectiveStatus)
+    } ?: AetherOnSurfaceVariant
+    val activityDetail = taskSnapshot?.activityDetail?.takeIf { it.isNotBlank() }
+    var detailsVisible by rememberSaveable(session?.id) { mutableStateOf(false) }
+    var deleteConfirmationVisible by rememberSaveable(session?.id) { mutableStateOf(false) }
+
+    if (deleteConfirmationVisible) {
+        DeleteThreadsConfirmationDialog(
+            count = 1,
+            language = language,
+            onDismissRequest = { deleteConfirmationVisible = false },
+            onConfirm = {
+                deleteConfirmationVisible = false
+                detailsVisible = false
+                onDeleteThread()
+            },
+        )
+    }
+
+    session?.let { activeSession ->
+        if (detailsVisible) {
+            ThreadDetailSheet(
+                state = ThreadDetailSheetState(
+                    session = activeSession,
+                    taskSnapshot = taskSnapshot,
+                    isRunning = false,
+                ),
+                onDismissRequest = { detailsVisible = false },
+                onOpenThread = { detailsVisible = false },
+                onRename = onRenameThread,
+                onTogglePinned = onTogglePinned,
+                onToggleArchived = { if (isArchived) onRestoreThread() else onArchiveThread() },
+                onExport = onExportThread,
+                onDelete = {
+                    deleteConfirmationVisible = true
+                },
+            )
+        }
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .shadow(8.dp, RoundedCornerShape(22.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+            .clip(RoundedCornerShape(22.dp))
+            .background(AetherSurface.copy(alpha = 0.90f))
+            .clickable(enabled = session != null, onClick = { detailsVisible = true })
+            .padding(horizontal = 13.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = title.ifBlank {
+                    if (language == AppLanguage.SimplifiedChinese) "\u672a\u547d\u540d\u7ebf\u7a0b" else "Untitled thread"
+                },
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                color = AetherOnSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (taskStatusLabel != null || isPinned || isArchived) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    taskStatusLabel?.let { label ->
+                        ConversationThreadStatusPill(
+                            text = label,
+                            tint = taskStatusTint,
+                        )
+                    }
+                    if (isPinned) {
+                        ConversationThreadStatusPill(
+                            text = if (language == AppLanguage.SimplifiedChinese) "\u5df2\u7f6e\u9876" else "Pinned",
+                            tint = AetherPrimary,
+                        )
+                    }
+                    if (isArchived) {
+                        ConversationThreadStatusPill(
+                            text = if (language == AppLanguage.SimplifiedChinese) "\u5df2\u5f52\u6863" else "Archived",
+                            tint = Color(0xFF8B5CF6),
+                        )
+                    }
+                }
+            } else if (!activityDetail.isNullOrBlank()) {
+                Text(
+                    text = activityDetail,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = taskStatusTint.copy(alpha = 0.92f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        ConversationThreadActionPill(
+            label = if (language == AppLanguage.SimplifiedChinese) {
+                "\u8be6\u60c5"
+            } else {
+                "Details"
+            },
+            tint = AetherOnSurfaceVariant,
+            onClick = { detailsVisible = true },
+        )
+    }
+}
+
+@Composable
+private fun ConversationThreadStatusPill(
+    text: String,
+    tint: Color,
+) {
+    Text(
+        text = text,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(tint.copy(alpha = 0.12f))
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+        color = tint,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+@Composable
+private fun ConversationThreadActionPill(
+    label: String,
+    tint: Color,
+    onClick: () -> Unit,
+) {
+    Text(
+        text = label,
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(tint.copy(alpha = 0.12f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+        color = tint,
+        maxLines = 1,
+    )
 }
 
 @Composable

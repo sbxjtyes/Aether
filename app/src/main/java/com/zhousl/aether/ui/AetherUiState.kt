@@ -19,6 +19,7 @@ internal const val DraftSessionId = "draft"
 
 enum class AppScreen {
     Onboarding,
+    Inbox,
     Chat,
     Settings,
 }
@@ -170,6 +171,10 @@ data class ChatSession(
     val agentModeEnabled: Boolean = false,
     val selectedModelKey: String = "",
     val taskState: AgentTaskState = AgentTaskState(),
+    val lastOpenedAtMillis: Long = 0L,
+    val lastActivityAtMillis: Long = 0L,
+    val isPinned: Boolean = false,
+    val isArchived: Boolean = false,
 )
 
 data class AppUpdateUiState(
@@ -187,6 +192,7 @@ data class AetherUiState(
     val isOnboardingReplay: Boolean = false,
     val onboardingStep: OnboardingStep = OnboardingStep.Landing,
     val onboardingReturnScreen: AppScreen = AppScreen.Chat,
+    val settingsReturnScreen: AppScreen = AppScreen.Chat,
     val sessions: List<ChatSession> = emptyList(),
     val currentSessionId: String = DraftSessionId,
     val draftInput: String = "",

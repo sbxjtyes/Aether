@@ -705,8 +705,14 @@ class SessionExecutionManager(
             if (sessionIndex < 0) return@update persisted
             val updatedSessions = persisted.sessions.toMutableList()
             val session = updatedSessions[sessionIndex]
-            if (session.taskState == taskState) return@update persisted
-            updatedSessions[sessionIndex] = session.copy(taskState = taskState)
+            val updatedActivityAtMillis = maxOf(session.lastActivityAtMillis, taskState.updatedAtMillis)
+            if (session.taskState == taskState && updatedActivityAtMillis == session.lastActivityAtMillis) {
+                return@update persisted
+            }
+            updatedSessions[sessionIndex] = session.copy(
+                taskState = taskState,
+                lastActivityAtMillis = updatedActivityAtMillis,
+            )
             persisted.copy(sessions = updatedSessions)
         }
     }
@@ -970,6 +976,11 @@ class SessionExecutionManager(
                 0,
                 session.withDerivedMessages(
                     syncActiveBranches(session.messages + interruptedAssistantMessages + userMessages)
+                ).copy(
+                    lastOpenedAtMillis = maxOf(
+                        session.lastOpenedAtMillis,
+                        userMessages.maxOfOrNull { it.createdAtMillis } ?: 0L,
+                    ),
                 ),
             )
             persisted.copy(sessions = updatedSessions)

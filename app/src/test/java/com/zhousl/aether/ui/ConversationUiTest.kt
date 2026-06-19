@@ -1,10 +1,66 @@
 package com.zhousl.aether.ui
 
+import com.zhousl.aether.data.SessionExecutionState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ConversationUiTest {
+    @Test
+    fun taskWorkbenchSnapshotKeepsOpenedAndActivityTimesSeparate() {
+        val session = ChatSession(
+            id = "thread-1",
+            title = "Thread",
+            preview = "Preview",
+            messages = listOf(
+                ChatMessage(
+                    id = "user-1",
+                    author = MessageAuthor.User,
+                    text = "Hi",
+                    createdAtMillis = 1000L,
+                )
+            ),
+            lastOpenedAtMillis = 2000L,
+            lastActivityAtMillis = 3000L,
+        )
+
+        val snapshot = session.toTaskWorkbenchSnapshot(
+            executionState = SessionExecutionState(sessionId = session.id, isRunning = true),
+            isUnviewedComplete = false,
+            language = com.zhousl.aether.data.AppLanguage.English,
+        )
+
+        assertEquals(3000L, snapshot!!.lastActivityAtMillis)
+        assertEquals(2000L, snapshot.lastOpenedAtMillis)
+    }
+
+    @Test
+    fun taskWorkbenchSnapshotIncludesPlainConversationThreads() {
+        val session = ChatSession(
+            id = "thread-plain",
+            title = "Plain thread",
+            preview = "A normal conversation",
+            messages = listOf(
+                ChatMessage(
+                    id = "user-1",
+                    author = MessageAuthor.User,
+                    text = "Hi",
+                    createdAtMillis = 1000L,
+                )
+            ),
+            lastOpenedAtMillis = 1500L,
+        )
+
+        val snapshot = session.toTaskWorkbenchSnapshot(
+            executionState = null,
+            isUnviewedComplete = false,
+            language = com.zhousl.aether.data.AppLanguage.English,
+        )
+
+        assertEquals("Plain thread", snapshot!!.conversationLabel)
+        assertEquals(com.zhousl.aether.data.AgentTaskStatus.Idle, snapshot.effectiveStatus)
+    }
+
     @Test
     fun pendingIndicatorShowsThinkingAfterBodyTextResetsForToolCall() {
         val previousBlocks = listOf(

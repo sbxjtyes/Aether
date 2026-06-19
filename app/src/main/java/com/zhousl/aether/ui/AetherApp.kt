@@ -159,8 +159,9 @@ private fun tr(strings: AetherStrings, english: String, chinese: String): String
 
 private fun AppScreen.depth(): Int = when (this) {
     AppScreen.Onboarding -> 0
-    AppScreen.Chat -> 1
-    AppScreen.Settings -> 2
+    AppScreen.Inbox -> 1
+    AppScreen.Chat -> 2
+    AppScreen.Settings -> 3
 }
 
 @Composable
@@ -213,6 +214,18 @@ private fun AetherAppContent(
     val selectedSkillIds = activeSession?.selectedSkillIds ?: uiState.draftSelectedSkillIds
     val selectedMcpServerIds = activeSession?.activeMcpServerIds ?: uiState.draftSelectedMcpServerIds
     val agentModeSelected = activeSession?.agentModeEnabled ?: uiState.draftAgentModeEnabled
+    val currentTaskSnapshot = remember(
+        activeSession,
+        currentSessionExecution,
+        uiState.unviewedCompletedSessionIds,
+        uiState.settings.language,
+    ) {
+        activeSession?.toTaskWorkbenchSnapshot(
+            executionState = currentSessionExecution,
+            isUnviewedComplete = uiState.unviewedCompletedSessionIds.contains(activeSession.id),
+            language = uiState.settings.language,
+        )
+    }
     val conversationModelOptions = remember(uiState.providerConfigs, uiState.settings) {
         buildConversationModelOptions(
             settings = uiState.settings,
@@ -457,11 +470,22 @@ private fun AetherAppContent(
                     viewModel.startNewChat()
                     scope.launch { drawerState.close() }
                 },
+                onInboxSelected = {
+                    viewModel.openInbox()
+                    scope.launch { drawerState.close() }
+                },
                 onSessionSelected = { sessionId ->
                     viewModel.selectSession(sessionId)
                     scope.launch { drawerState.close() }
                 },
                 onRenameSession = viewModel::renameSession,
+                onToggleSessionPinned = viewModel::toggleSessionPinned,
+                onPinSessions = viewModel::pinSessions,
+                onUnpinSessions = viewModel::unpinSessions,
+                onArchiveSession = viewModel::archiveSession,
+                onArchiveSessions = viewModel::archiveSessions,
+                onUnarchiveSession = viewModel::unarchiveSession,
+                onUnarchiveSessions = viewModel::unarchiveSessions,
                 onExportSession = { session ->
                     pendingSessionExportId = session.id
                     sessionExportLauncher.launch("${session.title.ifBlank { "aether-session" }}.json")
@@ -543,9 +567,35 @@ private fun AetherAppContent(
                         onExploreSettings = viewModel::exploreSettingsFromOnboardingTour,
                     )
 
+                    AppScreen.Inbox -> TaskInboxScreen(
+                        sessions = uiState.sessions,
+                        selectedSessionId = uiState.currentSessionId,
+                        sessionExecutionStates = executionStates,
+                        unviewedCompletedSessionIds = uiState.unviewedCompletedSessionIds,
+                        onBack = viewModel::closeInbox,
+                        onTaskSelected = viewModel::selectSession,
+                        onPinTasks = viewModel::pinSessions,
+                        onUnpinTasks = viewModel::unpinSessions,
+                        onArchiveTasks = viewModel::archiveSessions,
+                        onRestoreTasks = viewModel::unarchiveSessions,
+                        onDeleteTasks = viewModel::deleteSessions,
+                        onRenameTask = viewModel::renameSession,
+                        onExportTask = { session ->
+                            pendingSessionExportId = session.id
+                            sessionExportLauncher.launch("${session.title.ifBlank { "aether-session" }}.json")
+                        },
+                        onNewChat = viewModel::startNewChat,
+                        onOpenSettings = viewModel::openSettings,
+                    )
+
                     AppScreen.Chat -> ConversationScreen(
                         state = ConversationScreenState(
                             conversationStateKey = uiState.currentSessionId,
+                            currentSession = activeSession,
+                            currentTaskSnapshot = currentTaskSnapshot,
+                            currentSessionTitle = activeSession?.title ?: strings.newChat,
+                            currentSessionPinned = activeSession?.isPinned == true,
+                            currentSessionArchived = activeSession?.isArchived == true,
                             messages = currentMessages,
                             workspaceDirectory = currentWorkspaceDirectory,
                             pendingToolInvocations = pendingToolInvocations,
@@ -588,6 +638,27 @@ private fun AetherAppContent(
                         ),
                         actions = ConversationScreenActions(
                             onInputChanged = viewModel::updateDraftInput,
+                            onRenameThread = { title ->
+                                activeSession?.let { viewModel.renameSession(it.id, title) }
+                            },
+                            onTogglePinned = {
+                                activeSession?.let { viewModel.toggleSessionPinned(it.id) }
+                            },
+                            onArchiveThread = {
+                                activeSession?.let { viewModel.archiveSession(it.id) }
+                            },
+                            onRestoreThread = {
+                                activeSession?.let { viewModel.unarchiveSession(it.id) }
+                            },
+                            onExportThread = {
+                                activeSession?.let { session ->
+                                    pendingSessionExportId = session.id
+                                    sessionExportLauncher.launch("${session.title.ifBlank { "aether-session" }}.json")
+                                }
+                            },
+                            onDeleteThread = {
+                                activeSession?.let { viewModel.deleteSession(it.id) }
+                            },
                             onModelSelected = viewModel::setCurrentChatModelSelection,
                             onRemoveDraftAttachment = viewModel::removeDraftAttachment,
                             onSetSkillSelected = viewModel::setComposerSkillSelected,
@@ -598,6 +669,7 @@ private fun AetherAppContent(
                             onQueueFollowUp = viewModel::queueCurrentMessage,
                             onSteerFollowUp = viewModel::steerCurrentMessage,
                             onMenu = { scope.launch { drawerState.open() } },
+                            onOpenInbox = viewModel::openInbox,
                             onNewChat = viewModel::startNewChat,
                             onPickImages = {
                                 imagePicker.launch(

@@ -3,6 +3,7 @@ package com.zhousl.aether.data
 import com.zhousl.aether.ui.ChatMessage
 import com.zhousl.aether.ui.ChatSession
 import com.zhousl.aether.ui.MessageAuthor
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Test
@@ -12,28 +13,29 @@ class ChatSessionSerializationTest {
     fun sessionRoundTripsThroughPerSessionJson() {
         val session = ChatSession(
             id = "session-1",
-            title = "测试会话",
-            preview = "你好",
+            title = "test session",
+            preview = "hello",
             hasCustomTitle = true,
             messages = listOf(
                 ChatMessage(
                     id = "u1",
                     author = MessageAuthor.User,
-                    text = "你好",
+                    text = "hello",
                     createdAtMillis = 1000L,
                 ),
                 ChatMessage(
                     id = "a1",
                     author = MessageAuthor.Agent,
-                    text = "你好，我能帮你什么？",
+                    text = "how can I help?",
                     createdAtMillis = 1001L,
                     tokenUsage = TokenUsage(promptTokens = 12, completionTokens = 8, totalTokens = 20),
                 ),
             ),
             selectedModelKey = "openai:gpt",
+            lastOpenedAtMillis = 1234L,
+            lastActivityAtMillis = 5678L,
         )
 
-        // 序列化为单会话 JSON，再用新的对象解析器读回。
         val json = session.toJson()
         val restored = parseChatSessionObject(json)
 
@@ -42,6 +44,8 @@ class ChatSessionSerializationTest {
         assertEquals(true, restored.hasCustomTitle)
         assertEquals(2, restored.messages.size)
         assertEquals("openai:gpt", restored.selectedModelKey)
+        assertEquals(1234L, restored.lastOpenedAtMillis)
+        assertEquals(5678L, restored.lastActivityAtMillis)
 
         val restoredUsage = restored.messages.last().tokenUsage
         assertNotNull(restoredUsage)
@@ -76,5 +80,16 @@ class ChatSessionSerializationTest {
         )
         assertEquals(1, raw.size)
         assertEquals("s1", raw.first().id)
+    }
+
+    @Test
+    fun missingRecencyFieldsDefaultToZero() {
+        val restored = parseChatSessionObject(
+            JSONObject(
+                "{\"id\":\"s2\",\"title\":\"t\",\"preview\":\"p\",\"messages\":[]}"
+            )
+        )
+        assertEquals(0L, restored.lastOpenedAtMillis)
+        assertEquals(0L, restored.lastActivityAtMillis)
     }
 }

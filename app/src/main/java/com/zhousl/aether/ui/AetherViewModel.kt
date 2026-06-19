@@ -58,6 +58,7 @@ import com.zhousl.aether.data.resolveDefaultTitleModelKey
 import com.zhousl.aether.data.resolveAutomaticModelKey
 import com.zhousl.aether.data.resolveModelSettings
 import com.zhousl.aether.data.resolveStoredOrAutomaticModelKey
+import com.zhousl.aether.data.withDerivedMessages
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
 import com.zhousl.aether.util.AetherLog
@@ -842,15 +843,45 @@ class AetherViewModel(
         sessionExecutionManager.pauseSession(sessionId)
     }
 
+    fun openInbox() {
+        _uiState.update { current ->
+            current.copy(
+                currentScreen = AppScreen.Inbox,
+                editingSessionId = null,
+                editingMessageId = null,
+                showStarterPromptHint = false,
+            )
+        }
+    }
+
+    fun closeInbox() {
+        _uiState.update { current ->
+            current.copy(
+                currentScreen = AppScreen.Chat,
+                showStarterPromptHint = false,
+            )
+        }
+    }
+
     fun openSettings() {
-        _uiState.update { it.copy(currentScreen = AppScreen.Settings) }
+        _uiState.update { current ->
+            current.copy(
+                currentScreen = AppScreen.Settings,
+                settingsReturnScreen = when (current.currentScreen) {
+                    AppScreen.Settings -> current.settingsReturnScreen
+                    AppScreen.Onboarding -> current.onboardingReturnScreen
+                    else -> current.currentScreen
+                },
+            )
+        }
     }
 
     fun closeSettings() {
-        _uiState.update {
-            it.copy(
-                currentScreen = AppScreen.Chat,
+        _uiState.update { current ->
+            current.copy(
+                currentScreen = current.settingsReturnScreen,
                 rootSetupProgressReturnPage = null,
+                settingsReturnScreen = AppScreen.Chat,
             )
         }
     }
@@ -878,10 +909,19 @@ class AetherViewModel(
     }
 
     fun selectSession(sessionId: String) {
+        val openedAtMillis = System.currentTimeMillis()
         _uiState.update {
+            val updatedSessions = it.sessions.map { session ->
+                if (session.id == sessionId) {
+                    session.copy(lastOpenedAtMillis = maxOf(session.lastOpenedAtMillis, openedAtMillis))
+                } else {
+                    session
+                }
+            }
             it.copy(
                 currentScreen = AppScreen.Chat,
                 currentSessionId = sessionId,
+                sessions = updatedSessions,
                 draftInput = "",
                 draftAttachments = emptyList(),
                 draftSelectedModelKey = "",
@@ -896,6 +936,14 @@ class AetherViewModel(
             )
         }
         persistCurrentSessionId(sessionId)
+        persistSessionMutation(sessionId) { session ->
+            val updatedOpenedAtMillis = maxOf(session.lastOpenedAtMillis, openedAtMillis)
+            if (updatedOpenedAtMillis == session.lastOpenedAtMillis) {
+                null
+            } else {
+                session.copy(lastOpenedAtMillis = updatedOpenedAtMillis)
+            }
+        }
     }
 
     fun renameSession(
@@ -914,6 +962,207 @@ class AetherViewModel(
                 )
             }
         }
+    }
+
+    fun toggleSessionPinned(sessionId: String) {
+        val session = _uiState.value.sessions.firstOrNull { it.id == sessionId } ?: return
+        if (session.isPinned) {
+            unpinSessions(setOf(sessionId))
+        } else {
+            pinSessions(setOf(sessionId))
+        }
+    }
+
+    fun pinSessions(sessionIds: Set<String>) {
+        val requestedIds = sessionIds.filterTo(mutableSetOf()) { it != DraftSessionId }
+        if (requestedIds.isEmpty()) return
+        var pinnedIds = emptySet<String>()
+        _uiState.update { current ->
+            pinnedIds = current.sessions
+                .filter { it.id in requestedIds && !it.isPinned && !it.isArchived }
+                .mapTo(mutableSetOf()) { it.id }
+            if (pinnedIds.isEmpty()) return@update current
+            current.copy(
+                sessions = current.sessions.map { session ->
+                    if (session.id in pinnedIds) session.copy(isPinned = true) else session
+                }
+            )
+        }
+        if (pinnedIds.isEmpty()) return
+        pinnedIds.forEach { pinnedId ->
+            persistSessionMutation(pinnedId) { session ->
+                if (session.isPinned || session.isArchived) {
+                    null
+                } else {
+                    session.copy(isPinned = true)
+                }
+            }
+        }
+        emitTransientMessage(
+            if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
+                if (pinnedIds.size == 1) "\u5bf9\u8bdd\u5df2\u7f6e\u9876" else "\u5df2\u7f6e\u9876 ${pinnedIds.size} \u4e2a\u7ebf\u7a0b"
+            } else {
+                if (pinnedIds.size == 1) "Thread pinned" else "Pinned ${pinnedIds.size} threads"
+            }
+        )
+        captureAnalyticsEvent(event = if (pinnedIds.size == 1) "conversation pinned" else "conversations pinned")
+    }
+
+    fun unpinSessions(sessionIds: Set<String>) {
+        val requestedIds = sessionIds.filterTo(mutableSetOf()) { it != DraftSessionId }
+        if (requestedIds.isEmpty()) return
+        var unpinnedIds = emptySet<String>()
+        _uiState.update { current ->
+            unpinnedIds = current.sessions
+                .filter { it.id in requestedIds && it.isPinned }
+                .mapTo(mutableSetOf()) { it.id }
+            if (unpinnedIds.isEmpty()) return@update current
+            current.copy(
+                sessions = current.sessions.map { session ->
+                    if (session.id in unpinnedIds) session.copy(isPinned = false) else session
+                }
+            )
+        }
+        if (unpinnedIds.isEmpty()) return
+        unpinnedIds.forEach { unpinnedId ->
+            persistSessionMutation(unpinnedId) { session ->
+                if (!session.isPinned) {
+                    null
+                } else {
+                    session.copy(isPinned = false)
+                }
+            }
+        }
+        emitTransientMessage(
+            if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
+                if (unpinnedIds.size == 1) "\u5bf9\u8bdd\u5df2\u53d6\u6d88\u7f6e\u9876" else "\u5df2\u53d6\u6d88\u7f6e\u9876 ${unpinnedIds.size} \u4e2a\u7ebf\u7a0b"
+            } else {
+                if (unpinnedIds.size == 1) "Thread unpinned" else "Unpinned ${unpinnedIds.size} threads"
+            }
+        )
+        captureAnalyticsEvent(event = if (unpinnedIds.size == 1) "conversation unpinned" else "conversations unpinned")
+    }
+
+    fun archiveSession(sessionId: String) {
+        archiveSessions(setOf(sessionId))
+    }
+
+    fun unarchiveSession(sessionId: String) {
+        unarchiveSessions(setOf(sessionId))
+    }
+
+    fun archiveSessions(sessionIds: Set<String>) {
+        val requestedIds = sessionIds.filterTo(mutableSetOf()) { it != DraftSessionId }
+        if (requestedIds.isEmpty()) return
+        val runningIds = requestedIds.filter(sessionExecutionManager::isSessionRunning).toSet()
+        if (runningIds.isNotEmpty()) {
+            emitTransientMessage(
+                if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
+                    "\u8bf7\u5148\u6682\u505c\u6b63\u5728\u8fd0\u884c\u7684\u7ebf\u7a0b\u518d\u5f52\u6863"
+                } else {
+                    "Pause running threads before archiving them."
+                }
+            )
+            requestedIds.removeAll(runningIds)
+            if (requestedIds.isEmpty()) return
+        }
+
+        var archivedIds = emptySet<String>()
+        var nextSessionId = DraftSessionId
+        var archivedCurrentSession = false
+        _uiState.update { current ->
+            archivedIds = current.sessions
+                .filter { it.id in requestedIds && !it.isArchived }
+                .mapTo(mutableSetOf()) { it.id }
+            if (archivedIds.isEmpty()) return@update current
+            archivedCurrentSession = current.currentSessionId in archivedIds
+            val updatedSessions = current.sessions.map { session ->
+                if (session.id in archivedIds) {
+                    session.copy(isArchived = true, isPinned = false)
+                } else {
+                    session
+                }
+            }
+            if (archivedCurrentSession) {
+                nextSessionId = updatedSessions.firstOrNull { !it.isArchived && it.id !in archivedIds }?.id ?: DraftSessionId
+            }
+            current.copy(
+                currentScreen = if (archivedCurrentSession) AppScreen.Chat else current.currentScreen,
+                sessions = updatedSessions,
+                currentSessionId = if (archivedCurrentSession) nextSessionId else current.currentSessionId,
+                draftInput = if (archivedCurrentSession) "" else current.draftInput,
+                draftAttachments = if (archivedCurrentSession) emptyList() else current.draftAttachments,
+                draftSelectedModelKey = if (archivedCurrentSession) {
+                    resolveDefaultChatModelKey(current.settings, current.providerConfigs)
+                } else {
+                    current.draftSelectedModelKey
+                },
+                draftSelectedSkillIds = if (archivedCurrentSession) emptyList() else current.draftSelectedSkillIds,
+                draftSelectedMcpServerIds = if (archivedCurrentSession) emptyList() else current.draftSelectedMcpServerIds,
+                draftAgentModeEnabled = if (archivedCurrentSession) false else current.draftAgentModeEnabled,
+                draftWorkspaceId = if (archivedCurrentSession) null else current.draftWorkspaceId,
+                editingSessionId = if (current.editingSessionId in archivedIds) null else current.editingSessionId,
+                editingMessageId = if (current.editingSessionId in archivedIds) null else current.editingMessageId,
+                unviewedCompletedSessionIds = current.unviewedCompletedSessionIds - archivedIds,
+                showStarterPromptHint = false,
+            )
+        }
+        if (archivedIds.isEmpty()) return
+        archivedIds.forEach { archivedId ->
+            persistSessionMutation(archivedId) { session ->
+                if (session.isArchived && !session.isPinned) {
+                    null
+                } else {
+                    session.copy(isArchived = true, isPinned = false)
+                }
+            }
+        }
+        if (archivedCurrentSession) {
+            persistCurrentSessionId(nextSessionId)
+        }
+        emitTransientMessage(
+            if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
+                if (archivedIds.size == 1) "\u5bf9\u8bdd\u5df2\u5f52\u6863" else "\u5df2\u5f52\u6863 ${archivedIds.size} \u4e2a\u7ebf\u7a0b"
+            } else {
+                if (archivedIds.size == 1) "Thread archived" else "Archived ${archivedIds.size} threads"
+            }
+        )
+        captureAnalyticsEvent(event = if (archivedIds.size == 1) "conversation archived" else "conversations archived")
+    }
+
+    fun unarchiveSessions(sessionIds: Set<String>) {
+        val requestedIds = sessionIds.filterTo(mutableSetOf()) { it != DraftSessionId }
+        if (requestedIds.isEmpty()) return
+        var restoredIds = emptySet<String>()
+        _uiState.update { current ->
+            restoredIds = current.sessions
+                .filter { it.id in requestedIds && it.isArchived }
+                .mapTo(mutableSetOf()) { it.id }
+            if (restoredIds.isEmpty()) return@update current
+            current.copy(
+                sessions = current.sessions.map { session ->
+                    if (session.id in restoredIds) session.copy(isArchived = false) else session
+                }
+            )
+        }
+        if (restoredIds.isEmpty()) return
+        restoredIds.forEach { restoredId ->
+            persistSessionMutation(restoredId) { session ->
+                if (!session.isArchived) {
+                    null
+                } else {
+                    session.copy(isArchived = false)
+                }
+            }
+        }
+        emitTransientMessage(
+            if (_uiState.value.settings.language == AppLanguage.SimplifiedChinese) {
+                if (restoredIds.size == 1) "\u5bf9\u8bdd\u5df2\u79fb\u51fa\u5f52\u6863" else "\u5df2\u6062\u590d ${restoredIds.size} \u4e2a\u7ebf\u7a0b"
+            } else {
+                if (restoredIds.size == 1) "Thread restored" else "Restored ${restoredIds.size} threads"
+            }
+        )
+        captureAnalyticsEvent(event = if (restoredIds.size == 1) "conversation unarchived" else "conversations unarchived")
     }
 
     fun deleteSession(sessionId: String) {
@@ -2201,7 +2450,9 @@ class AetherViewModel(
                 val existingIndex = updatedSessions.indexOfFirst { it.id == targetSessionId }
                 if (existingIndex >= 0) {
                     val existing = updatedSessions.removeAt(existingIndex)
-                    val updated = existing.withMessages(existing.messages + userMessage)
+                    val updated = existing
+                        .withMessages(existing.messages + userMessage)
+                        .copy(isArchived = false)
                     sessionForPersistence = updated
                     updatedSessions.add(0, updated)
                     requestMessages = updated.messages
@@ -2895,6 +3146,7 @@ class AetherViewModel(
         agentModeEnabled: Boolean = false,
     ): ChatSession {
         val metadata = deriveSessionMetadata(messages)
+        val lastActivityAtMillis = messages.lastOrNull()?.createdAtMillis ?: 0L
         return ChatSession(
             id = id,
             title = title ?: metadata.title,
@@ -2906,17 +3158,13 @@ class AetherViewModel(
             activeSkills = activeSkills,
             activeMcpServerIds = activeMcpServerIds,
             agentModeEnabled = agentModeEnabled,
+            lastOpenedAtMillis = lastActivityAtMillis,
+            lastActivityAtMillis = lastActivityAtMillis,
         )
     }
 
     private fun ChatSession.withMessages(messages: List<ChatMessage>): ChatSession {
-        val syncedMessages = syncActiveBranches(messages)
-        val metadata = deriveSessionMetadata(syncedMessages)
-        return copy(
-            title = if (hasCustomTitle) title else metadata.title,
-            preview = metadata.preview,
-            messages = syncedMessages,
-        )
+        return withDerivedMessages(messages)
     }
 
     private suspend fun resolveSelectedActiveSkills(
