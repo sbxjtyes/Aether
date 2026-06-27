@@ -7,6 +7,7 @@ import com.zhousl.aether.data.AgentModeDisplayState
 import com.zhousl.aether.data.AgentTaskState
 import com.zhousl.aether.data.AppSettings
 import com.zhousl.aether.data.AppUpdateRelease
+import com.zhousl.aether.data.ChatToolGroups
 import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.LlmProviderConfig
 import com.zhousl.aether.data.McpServerConfig
@@ -169,6 +170,8 @@ data class ChatSession(
     val activeSkills: List<ActiveSkillContext> = emptyList(),
     val activeMcpServerIds: List<String> = emptyList(),
     val agentModeEnabled: Boolean = false,
+    val enabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
+    val planModeEnabled: Boolean = false,
     val selectedModelKey: String = "",
     val taskState: AgentTaskState = AgentTaskState(),
     val lastOpenedAtMillis: Long = 0L,
@@ -202,6 +205,8 @@ data class AetherUiState(
     val draftSelectedSkillIds: List<String> = emptyList(),
     val draftSelectedMcpServerIds: List<String> = emptyList(),
     val draftAgentModeEnabled: Boolean = false,
+    val draftEnabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
+    val draftPlanModeEnabled: Boolean = false,
     val draftWorkspaceId: String? = null,
     val editingSessionId: String? = null,
     val editingMessageId: String? = null,

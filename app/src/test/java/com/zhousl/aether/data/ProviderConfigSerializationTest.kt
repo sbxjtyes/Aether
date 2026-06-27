@@ -44,11 +44,15 @@ class ProviderConfigSerializationTest {
             apiKey = "",
             baseUrl = "https://long-provider.example/v1",
             modelId = "model-a",
+            userAgent = "Allowed-Client/1.0",
         )
 
         val restoredConfig = parseProviderConfigs(serializeProviderConfigs(listOf(config))).single()
         assertEquals(providerId, restoredConfig.providerId)
-        assertEquals(providerId, listOf(restoredConfig).availableModelOptions().single().providerId)
+        assertEquals("Allowed-Client/1.0", restoredConfig.userAgent)
+        val option = listOf(restoredConfig).availableModelOptions().single()
+        assertEquals(providerId, option.providerId)
+        assertEquals("Allowed-Client/1.0", option.userAgent)
     }
 
     @Test
@@ -66,5 +70,21 @@ class ProviderConfigSerializationTest {
         ).availableModelOptions()
 
         assertTrue(options.isEmpty())
+    }
+
+    @Test
+    fun invalidUserAgentFallsBackToBrowserDefault() {
+        val config = LlmProviderConfig(
+            id = "provider",
+            providerId = "provider",
+            name = "Provider",
+            providerType = LlmProvider.OpenAiCompatible,
+            apiKey = "",
+            baseUrl = "https://provider.example/v1",
+            modelId = "model-a",
+            userAgent = "公益站Client/1.0",
+        )
+
+        assertEquals(DefaultLlmUserAgent, config.resolvedUserAgent())
     }
 }

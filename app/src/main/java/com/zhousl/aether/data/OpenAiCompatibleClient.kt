@@ -15,13 +15,16 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.ConnectionSpec
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.TlsVersion
 import okio.BufferedSource
 import org.json.JSONArray
 import org.json.JSONObject
@@ -30,14 +33,11 @@ import java.net.URI
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToLong
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLProtocolException
 
 class OpenAiCompatibleClient(
-    private val httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(DefaultHttpConnectTimeoutMillis, TimeUnit.MILLISECONDS)
-        .readTimeout(DefaultHttpReadTimeoutMillis, TimeUnit.MILLISECONDS)
-        .writeTimeout(DefaultHttpWriteTimeoutMillis, TimeUnit.MILLISECONDS)
-        .callTimeout(DefaultHttpCallTimeoutMillis, TimeUnit.MILLISECONDS)
-        .build(),
+    private val httpClient: OkHttpClient = buildDefaultLlmHttpClient(),
 ) {
     suspend fun createChatCompletion(
         settings: AppSettings,
@@ -384,26 +384,17 @@ class OpenAiCompatibleClient(
         val message = json.optJSONArray("choices")
             ?.optJSONObject(0)
             ?.optJSONObject("message")
-            ?: error("Missing assistant message in response.")
-
-        val assistantText = when (val content = message.opt("content")) {
-            is String -> content
-            is JSONArray -> buildString {
-                for (index in 0 until content.length()) {
-                    val item = content.opt(index)
-                    if (item is JSONObject) {
-                        append(
-                            item.optString("text")
-                                .ifBlank { item.optString("content") }
-                        )
-                    } else if (item is String) {
-                        append(item)
-                    }
-                }
+        if (message == null) {
+            json.optJSONArray("data")?.let { imageData ->
+                return buildOpenAiImageDataResult(
+                    imageData = imageData,
+                    usage = extractUsage(json),
+                )
             }
-
-            else -> ""
+            error("Missing assistant message in response.")
         }
+
+        val assistantText = buildOpenAiContentMarkdown(message.opt("content"))
 
         val toolCalls = buildList {
             val toolCallsArray = message.optJSONArray("tool_calls") ?: JSONArray()
@@ -431,8 +422,16 @@ class OpenAiCompatibleClient(
     }
 
     private fun parseOpenAiResponses(json: JSONObject): ChatCompletionResult {
-        val output = json.optJSONArray("output") ?: JSONArray()
-        return buildOpenAiResponsesResult(output).copy(usage = extractUsage(json))
+        val output = json.optJSONArray("output")
+        if (output == null) {
+            json.optJSONArray("data")?.let { imageData ->
+                return buildOpenAiImageDataResult(
+                    imageData = imageData,
+                    usage = extractUsage(json),
+                )
+            }
+        }
+        return buildOpenAiResponsesResult(output ?: JSONArray()).copy(usage = extractUsage(json))
     }
 
     private fun parseAnthropicMessage(json: JSONObject): ChatCompletionResult {
@@ -827,6 +826,7 @@ class OpenAiCompatibleClient(
 
         return Request.Builder()
             .url(endpoint)
+            .header("User-Agent", settings.resolvedUserAgent())
             .addHeader("Content-Type", "application/json")
             .apply {
                 if (stream) {
@@ -903,6 +903,7 @@ class OpenAiCompatibleClient(
 
         return Request.Builder()
             .url(endpoint)
+            .header("User-Agent", settings.resolvedUserAgent())
             .addHeader("Content-Type", "application/json")
             .apply {
                 if (stream) {
@@ -965,6 +966,7 @@ class OpenAiCompatibleClient(
 
         return Request.Builder()
             .url(endpoint)
+            .header("User-Agent", settings.resolvedUserAgent())
             .addHeader("Content-Type", "application/json")
             .addHeader("Accept", if (stream) "text/event-stream" else "application/json")
             .addHeader("x-api-key", trimmedApiKey)
@@ -1050,6 +1052,7 @@ class OpenAiCompatibleClient(
 
         return Request.Builder()
             .url(endpoint)
+            .header("User-Agent", settings.resolvedUserAgent())
             .addHeader("Content-Type", "application/json")
             .apply {
                 if (stream) {
@@ -1274,7 +1277,8 @@ class OpenAiCompatibleClient(
             "message",
             "function_call",
             "function_call_output",
-            "reasoning" -> {
+            "reasoning",
+            "image_generation_call" -> {
                 if (!normalized.has("status") || normalized.optString("status").isBlank()) {
                     normalized.put("status", "completed")
                 }
@@ -1438,12 +1442,38 @@ class OpenAiCompatibleClient(
         onStreamActivity: suspend () -> Unit,
         isTerminalEventData: (String) -> Boolean = { false },
         isTerminalChunk: (JSONObject) -> Boolean = { false },
+    ): ChatCompletionResult =
+        executeLlmCallWithTlsFallback(httpClient, request) { client, candidateRequest ->
+            executeStreamingRequestOnce(
+                client = client,
+                request = candidateRequest,
+                parseJsonResponse = parseJsonResponse,
+                consumeSseChunk = consumeSseChunk,
+                buildStreamResult = buildStreamResult,
+                inactivityTimeoutSeconds = inactivityTimeoutSeconds,
+                onStreamActivity = onStreamActivity,
+                isTerminalEventData = isTerminalEventData,
+                isTerminalChunk = isTerminalChunk,
+            )
+        }
+
+    private suspend fun executeStreamingRequestOnce(
+        client: OkHttpClient,
+        request: Request,
+        parseJsonResponse: (JSONObject) -> ChatCompletionResult,
+        consumeSseChunk: suspend (JSONObject) -> Unit,
+        buildStreamResult: () -> ChatCompletionResult,
+        inactivityTimeoutSeconds: Int,
+        onStreamActivity: suspend () -> Unit,
+        isTerminalEventData: (String) -> Boolean,
+        isTerminalChunk: (JSONObject) -> Boolean,
     ): ChatCompletionResult = withContext(Dispatchers.IO) {
         val timeoutMillis = inactivityTimeoutSeconds.coerceAtLeast(1) * 1000L
         val lastActivityAt = AtomicLong(monotonicTimeMillis())
         val inactivityFailure = AtomicReference<IOException?>(null)
         var streamCompleted = false
-        val call = httpClientForStreaming(inactivityTimeoutSeconds).newCall(request)
+        var responseStarted = false
+        val call = httpClientForStreaming(client, inactivityTimeoutSeconds).newCall(request)
         val cancellationHandle = currentCoroutineContext().job.invokeOnCompletion { cause ->
             if (cause is CancellationException) {
                 call.cancel()
@@ -1473,6 +1503,7 @@ class OpenAiCompatibleClient(
 
         try {
             call.execute().use { response ->
+                responseStarted = true
                 lastActivityAt.set(monotonicTimeMillis())
                 val responseBody = response.body ?: error("Missing response body.")
                 val contentType = response.header("Content-Type").orEmpty()
@@ -1533,7 +1564,11 @@ class OpenAiCompatibleClient(
                 buildStreamResult()
             }
         } catch (ioException: IOException) {
-            throw inactivityFailure.get() ?: ioException
+            val failure = inactivityFailure.get() ?: ioException
+            if (responseStarted) {
+                throw LlmNonRetryableIOException(failure)
+            }
+            throw failure
         } finally {
             watchdogExecutor.shutdownNow()
             cancellationHandle.dispose()
@@ -1541,10 +1576,11 @@ class OpenAiCompatibleClient(
     }
 
     private fun httpClientForStreaming(
+        client: OkHttpClient,
         inactivityTimeoutSeconds: Int,
     ): OkHttpClient {
         val timeoutSeconds = inactivityTimeoutSeconds.coerceAtLeast(1).toLong()
-        return httpClient.newBuilder()
+        return client.newBuilder()
             .connectTimeout(DefaultStreamingConnectTimeoutMillis, TimeUnit.MILLISECONDS)
             .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
             .writeTimeout(DefaultStreamingWriteTimeoutMillis, TimeUnit.MILLISECONDS)
@@ -1553,8 +1589,16 @@ class OpenAiCompatibleClient(
     }
 
     private suspend fun executeRequest(request: Request): HttpResponsePayload =
+        executeLlmCallWithTlsFallback(httpClient, request) { client, candidateRequest ->
+            executeRequestOnce(client, candidateRequest)
+        }
+
+    private suspend fun executeRequestOnce(
+        client: OkHttpClient,
+        request: Request,
+    ): HttpResponsePayload =
         suspendCancellableCoroutine { continuation ->
-            val call = httpClient.newCall(request)
+            val call = client.newCall(request)
             continuation.invokeOnCancellation { call.cancel() }
             call.enqueue(
                 object : Callback {
@@ -1676,6 +1720,75 @@ class OpenAiCompatibleClient(
 
 private fun monotonicTimeMillis(): Long = System.nanoTime() / 1_000_000L
 
+internal fun buildDefaultLlmHttpClient(): OkHttpClient =
+    OkHttpClient.Builder()
+        .connectTimeout(DefaultHttpConnectTimeoutMillis, TimeUnit.MILLISECONDS)
+        .readTimeout(DefaultHttpReadTimeoutMillis, TimeUnit.MILLISECONDS)
+        .writeTimeout(DefaultHttpWriteTimeoutMillis, TimeUnit.MILLISECONDS)
+        .callTimeout(DefaultHttpCallTimeoutMillis, TimeUnit.MILLISECONDS)
+        .build()
+
+internal fun buildHttp1LlmHttpClient(baseClient: OkHttpClient): OkHttpClient =
+    baseClient.newBuilder()
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .build()
+
+internal fun buildTls12Http1LlmHttpClient(baseClient: OkHttpClient): OkHttpClient =
+    baseClient.newBuilder()
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .connectionSpecs(listOf(LlmTls12ConnectionSpec, ConnectionSpec.CLEARTEXT))
+        .build()
+
+internal suspend fun <T> executeLlmCallWithTlsFallback(
+    baseClient: OkHttpClient,
+    request: Request,
+    executeOnce: suspend (OkHttpClient, Request) -> T,
+): T {
+    val failures = mutableListOf<IOException>()
+    for (mode in LlmHttpCompatibilityMode.entries) {
+        val client = when (mode) {
+            LlmHttpCompatibilityMode.Default -> baseClient
+            LlmHttpCompatibilityMode.Http1 -> buildHttp1LlmHttpClient(baseClient)
+            LlmHttpCompatibilityMode.Tls12Http1 -> buildTls12Http1LlmHttpClient(baseClient)
+        }
+        try {
+            return executeOnce(client, request)
+        } catch (nonRetryable: LlmNonRetryableIOException) {
+            throw nonRetryable.cause as? IOException ?: nonRetryable
+        } catch (ioException: IOException) {
+            if (!isClientHelloTlsHandshakeFailure(ioException)) {
+                throw ioException
+            }
+            failures += ioException
+            if (mode == LlmHttpCompatibilityMode.Tls12Http1) {
+                throw LlmTlsCompatibilityException(ioException, failures)
+            }
+        }
+    }
+    error("Unreachable TLS compatibility mode state.")
+}
+
+internal fun isClientHelloTlsHandshakeFailure(throwable: Throwable): Boolean {
+    var current: Throwable? = throwable
+    while (current != null) {
+        val message = current.message.orEmpty()
+        val isTlsHandshakeFailure = current is SSLHandshakeException ||
+            current is SSLProtocolException ||
+            message.contains("SSLV3_ALERT_HANDSHAKE_FAILURE", ignoreCase = true) ||
+            message.contains("HANDSHAKE_FAILURE_ON_CLIENT_HELLO", ignoreCase = true)
+        if (
+            isTlsHandshakeFailure &&
+            ClientHelloHandshakeFailureSignals.any { signal ->
+                message.contains(signal, ignoreCase = true)
+            }
+        ) {
+            return true
+        }
+        current = current.cause
+    }
+    return false
+}
+
 internal class LlmHttpException(
     val statusCode: Int,
     override val message: String,
@@ -1688,6 +1801,41 @@ internal class LlmHttpException(
             statusCode == 429 ||
             statusCode in 500..599
 }
+
+internal class LlmTlsCompatibilityException(
+    cause: IOException,
+    failures: List<IOException>,
+) : IOException(
+    "TLS handshake failed before the server returned a response. " +
+        "Aether retried with HTTP/1.1 and TLS 1.2 compatibility, but the endpoint still rejected the ClientHello. " +
+        "If this is a third-party relay, its TLS reverse proxy must support Android clients, SNI, TLS 1.2/1.3, " +
+        "and common cipher suites. Original error: ${cause.message.orEmpty()}",
+    cause,
+) {
+    val attemptCount: Int = failures.size
+}
+
+internal class LlmNonRetryableIOException(
+    cause: IOException,
+) : IOException(cause.message, cause)
+
+internal enum class LlmHttpCompatibilityMode {
+    Default,
+    Http1,
+    Tls12Http1,
+}
+
+private val LlmTls12ConnectionSpec: ConnectionSpec =
+    ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+        .tlsVersions(TlsVersion.TLS_1_2)
+        .build()
+
+private val ClientHelloHandshakeFailureSignals = listOf(
+    "HANDSHAKE_FAILURE_ON_CLIENT_HELLO",
+    "SSLV3_ALERT_HANDSHAKE_FAILURE",
+    "handshake_failure",
+    "handshake failure",
+)
 
 internal fun preferredRetryDelayMillis(throwable: Throwable): Long? {
     var current: Throwable? = throwable
@@ -1830,6 +1978,7 @@ private class OpenAiResponsesStreamAccumulator(
     private val messageContent = mutableListOf<JSONObject>()
     private val toolCalls = linkedMapOf<Int, MutableToolCallAccumulator>()
     private val completedFunctionCalls = linkedMapOf<Int, JSONObject>()
+    private val completedImageGenerationCalls = linkedMapOf<Int, JSONObject>()
     private val usageTracker = UsageTracker()
 
     suspend fun consume(chunk: JSONObject) {
@@ -1845,7 +1994,7 @@ private class OpenAiResponsesStreamAccumulator(
 
             "response.output_item.added" -> {
                 consumeOutputItem(
-                    index = chunk.optInt("output_index", completedFunctionCalls.size),
+                    index = chunk.optInt("output_index", completedFunctionCalls.size + completedImageGenerationCalls.size),
                     item = chunk.optJSONObject("item"),
                     overwriteArguments = false,
                 )
@@ -1853,7 +2002,7 @@ private class OpenAiResponsesStreamAccumulator(
 
             "response.output_item.done" -> {
                 consumeOutputItem(
-                    index = chunk.optInt("output_index", completedFunctionCalls.size),
+                    index = chunk.optInt("output_index", completedFunctionCalls.size + completedImageGenerationCalls.size),
                     item = chunk.optJSONObject("item"),
                     overwriteArguments = true,
                 )
@@ -1873,6 +2022,14 @@ private class OpenAiResponsesStreamAccumulator(
                     accumulator.arguments.setLength(0)
                     accumulator.arguments.append(arguments)
                 }
+            }
+
+            "response.image_generation_call.completed",
+            "response.image_generation_call.done" -> {
+                consumeImageGenerationCall(
+                    index = chunk.optInt("output_index", completedImageGenerationCalls.size),
+                    chunk = chunk,
+                )
             }
         }
     }
@@ -1898,7 +2055,9 @@ private class OpenAiResponsesStreamAccumulator(
                     }
                 )
             }
-            completedFunctionCalls.toSortedMap().values.forEach(::put)
+            (completedFunctionCalls.entries + completedImageGenerationCalls.entries)
+                .sortedBy { it.key }
+                .forEach { put(it.value) }
         }
         return buildOpenAiResponsesResult(responseItems).copy(usage = usageTracker.resolve())
     }
@@ -1915,6 +2074,8 @@ private class OpenAiResponsesStreamAccumulator(
                 for (contentIndex in 0 until content.length()) {
                     val block = content.optJSONObject(contentIndex) ?: continue
                     if (block.optString("type") == "output_text" && block.optString("text").isNotBlank()) {
+                        messageContent += JSONObject(block.toString())
+                    } else if (extractOpenAiImageMarkdown(block, contentIndex).isNotBlank()) {
                         messageContent += JSONObject(block.toString())
                     }
                 }
@@ -1945,6 +2106,33 @@ private class OpenAiResponsesStreamAccumulator(
                     }
                 }
             }
+
+            "image_generation_call" -> {
+                if (overwriteArguments || extractOpenAiImageMarkdown(item, index).isNotBlank()) {
+                    completedImageGenerationCalls[index] = JSONObject(item.toString())
+                }
+            }
+        }
+    }
+
+    private fun consumeImageGenerationCall(
+        index: Int,
+        chunk: JSONObject,
+    ) {
+        val result = chunk.optNullableString("result")
+            ?.ifBlank { chunk.optNullableString("b64_json").orEmpty() }
+            .orEmpty()
+        if (result.isBlank()) return
+        completedImageGenerationCalls[index] = JSONObject().apply {
+            put("type", "image_generation_call")
+            put("status", "completed")
+            chunk.optString("item_id").trim()
+                .ifBlank { chunk.optString("id").trim() }
+                .takeIf { it.isNotBlank() }
+                ?.let { put("id", it) }
+            put("result", result)
+            chunk.optNullableString("mime_type")?.let { put("mime_type", it) }
+            chunk.optNullableString("output_format")?.let { put("output_format", it) }
         }
     }
 }
@@ -2104,25 +2292,7 @@ private class VertexStreamAccumulator(
 }
 
 private fun extractTextDelta(message: JSONObject): String =
-    when (val content = message.opt("content")) {
-        is String -> content
-        is JSONArray -> buildString {
-            for (index in 0 until content.length()) {
-                when (val item = content.opt(index)) {
-                    is JSONObject -> {
-                        append(
-                            item.optString("text")
-                                .ifBlank { item.optString("content") }
-                        )
-                    }
-
-                    is String -> append(item)
-                }
-            }
-        }
-
-        else -> ""
-    }
+    buildOpenAiContentMarkdown(message.opt("content"))
 
 private fun extractReasoningDelta(message: JSONObject): String =
     when (val value = message.opt("reasoning")) {
@@ -2218,6 +2388,196 @@ private fun JSONObject.optNullableString(key: String): String? {
     }
 }
 
+private fun buildOpenAiContentMarkdown(content: Any?): String {
+    val builder = StringBuilder()
+    var separateTextFromPreviousImage = false
+
+    fun appendText(text: String) {
+        if (text.isBlank()) return
+        if (separateTextFromPreviousImage) {
+            builder.appendOpenAiMarkdownBlockSeparator()
+        }
+        builder.append(text)
+        separateTextFromPreviousImage = false
+    }
+
+    fun appendImage(markdown: String) {
+        if (markdown.isBlank()) return
+        builder.appendOpenAiMarkdownImageBlock(markdown)
+        separateTextFromPreviousImage = true
+    }
+
+    when (content) {
+        is String -> appendText(content)
+        is JSONArray -> {
+            for (index in 0 until content.length()) {
+                when (val item = content.opt(index)) {
+                    is JSONObject -> {
+                        appendText(extractOpenAiContentPartText(item))
+                        appendImage(extractOpenAiImageMarkdown(item, index))
+                    }
+                    is String -> appendText(item)
+                }
+            }
+        }
+    }
+
+    return builder.toString()
+}
+
+private fun extractOpenAiContentPartText(part: JSONObject): String =
+    part.optNullableString("text").orEmpty()
+        .ifBlank { part.optNullableString("content").orEmpty() }
+
+private fun buildOpenAiImageDataResult(
+    imageData: JSONArray,
+    usage: TokenUsage?,
+): ChatCompletionResult {
+    val assistantText = buildString {
+        for (index in 0 until imageData.length()) {
+            val item = imageData.optJSONObject(index) ?: continue
+            appendOpenAiMarkdownImageBlock(extractOpenAiImageMarkdown(item, index))
+        }
+    }
+    return ChatCompletionResult(
+        assistantText = assistantText,
+        toolCalls = emptyList(),
+        assistantMessage = buildOpenAiAssistantMessage(
+            assistantText = assistantText,
+            toolCalls = emptyList(),
+        ),
+        usage = usage,
+    )
+}
+
+private fun StringBuilder.appendOpenAiResponseTextBlock(text: String) {
+    if (text.isBlank()) return
+    if (isNotEmpty()) append('\n')
+    append(text)
+}
+
+private fun StringBuilder.appendOpenAiMarkdownImageBlock(markdown: String) {
+    if (markdown.isBlank()) return
+    appendOpenAiMarkdownBlockSeparator()
+    append(markdown)
+}
+
+private fun StringBuilder.appendOpenAiMarkdownBlockSeparator() {
+    if (isEmpty()) return
+    var newlineCount = 0
+    var index = length - 1
+    while (index >= 0 && this[index] == '\n' && newlineCount < 2) {
+        newlineCount += 1
+        index -= 1
+    }
+    repeat(2 - newlineCount) { append('\n') }
+}
+
+private fun extractOpenAiImageMarkdown(
+    source: JSONObject,
+    index: Int,
+): String {
+    extractOpenAiImageUrl(source)?.let { imageUrl ->
+        return buildOpenAiMarkdownImage(imageUrl, index)
+    }
+
+    val base64Data = extractOpenAiImageBase64(source)
+    if (base64Data.isBlank()) return ""
+    val imageUrl = if (base64Data.startsWith("data:", ignoreCase = true)) {
+        base64Data
+    } else {
+        "data:${extractOpenAiImageMimeType(source)};base64,$base64Data"
+    }
+    return buildOpenAiMarkdownImage(imageUrl, index)
+}
+
+private fun extractOpenAiImageUrl(source: JSONObject): String? {
+    OpenAiImageUrlKeys.forEach { key ->
+        when (val value = source.opt(key)) {
+            is String -> value.trim().takeIf { it.isNotBlank() }?.let { return it }
+            is JSONObject -> value.optNullableString("url")
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { return it }
+        }
+    }
+    OpenAiNestedImageKeys.forEach { key ->
+        source.optJSONObject(key)?.let { nested ->
+            extractOpenAiImageUrl(nested)?.let { return it }
+        }
+    }
+    return null
+}
+
+private fun extractOpenAiImageBase64(source: JSONObject): String {
+    OpenAiImageBase64Keys.forEach { key ->
+        source.optNullableString(key)
+            ?.let(::normalizeOpenAiImageBase64)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+    }
+    OpenAiNestedImageKeys.forEach { key ->
+        source.optJSONObject(key)?.let { nested ->
+            extractOpenAiImageBase64(nested).takeIf { it.isNotBlank() }?.let { return it }
+        }
+    }
+    return ""
+}
+
+private fun normalizeOpenAiImageBase64(value: String): String {
+    val trimmed = value.trim()
+    if (trimmed.startsWith("data:", ignoreCase = true)) return trimmed
+    return trimmed.replace(Regex("\\s+"), "")
+}
+
+private fun extractOpenAiImageMimeType(source: JSONObject): String {
+    OpenAiImageMimeTypeKeys.forEach { key ->
+        source.optNullableString(key)
+            ?.let(::normalizeOpenAiImageMimeType)
+            ?.let { return it }
+    }
+    source.optNullableString("output_format")
+        ?.let(::normalizeOpenAiImageMimeType)
+        ?.let { return it }
+    OpenAiNestedImageKeys.forEach { key ->
+        source.optJSONObject(key)?.let { nested ->
+            val nestedMimeType = extractOpenAiImageMimeType(nested)
+            if (nestedMimeType.isNotBlank()) return nestedMimeType
+        }
+    }
+    return "image/png"
+}
+
+private fun normalizeOpenAiImageMimeType(value: String): String? {
+    val normalized = value.substringBefore(';').trim().lowercase()
+    return when {
+        normalized.startsWith("image/") -> normalized
+        normalized == "jpg" || normalized == "jpeg" -> "image/jpeg"
+        normalized == "png" -> "image/png"
+        normalized == "webp" -> "image/webp"
+        normalized == "gif" -> "image/gif"
+        else -> null
+    }
+}
+
+private fun buildOpenAiMarkdownImage(
+    imageUrl: String,
+    index: Int,
+): String {
+    val altText = "Generated image"
+    return "![${escapeOpenAiMarkdownImageAlt(altText)}](${buildOpenAiMarkdownLinkDestination(imageUrl)})"
+}
+
+private fun buildOpenAiMarkdownLinkDestination(imageUrl: String): String {
+    val trimmed = imageUrl.trim()
+    if (trimmed.startsWith("data:", ignoreCase = true)) return trimmed
+    val needsAngleWrapping = trimmed.any { it.isWhitespace() || it == '(' || it == ')' }
+    return if (needsAngleWrapping) "<${trimmed.replace(">", "%3E")}>" else trimmed
+}
+
+private fun escapeOpenAiMarkdownImageAlt(value: String): String =
+    value.replace("\\", "\\\\").replace("]", "\\]")
+
 private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult {
     val assistantText = StringBuilder()
     val toolCalls = mutableListOf<ChatCompletionToolCall>()
@@ -2235,10 +2595,18 @@ private fun buildOpenAiResponsesResult(output: JSONArray): ChatCompletionResult 
                         "output_text", "text" -> block.optString("text")
                         else -> ""
                     }
-                    if (text.isBlank()) continue
-                    if (assistantText.isNotEmpty()) assistantText.append('\n')
-                    assistantText.append(text)
+                    assistantText.appendOpenAiResponseTextBlock(text)
+                    assistantText.appendOpenAiMarkdownImageBlock(
+                        extractOpenAiImageMarkdown(block, contentIndex)
+                    )
                 }
+            }
+
+            "image_generation_call", "output_image", "image" -> {
+                assistantItems.put(normalizeOpenAiResponsesOutputItem(item))
+                assistantText.appendOpenAiMarkdownImageBlock(
+                    extractOpenAiImageMarkdown(item, index)
+                )
             }
 
             "function_call" -> {
@@ -2272,7 +2640,8 @@ private fun normalizeOpenAiResponsesOutputItem(item: JSONObject): JSONObject {
         "message",
         "function_call",
         "function_call_output",
-        "reasoning" -> {
+        "reasoning",
+        "image_generation_call" -> {
             if (!normalized.has("status") || normalized.optString("status").isBlank()) {
                 normalized.put("status", "completed")
             }
@@ -2639,6 +3008,30 @@ private fun jsonValueToStringTopLevel(value: Any?): String = when (value) {
     else -> JSONObject.wrap(value)?.toString() ?: value.toString()
 }
 
+private val OpenAiImageUrlKeys = listOf(
+    "image_url",
+    "url",
+)
+
+private val OpenAiImageBase64Keys = listOf(
+    "result",
+    "b64_json",
+    "base64",
+    "image_base64",
+)
+
+private val OpenAiImageMimeTypeKeys = listOf(
+    "mime_type",
+    "mimeType",
+    "media_type",
+    "mediaType",
+)
+
+private val OpenAiNestedImageKeys = listOf(
+    "image",
+    "output_image",
+)
+
 private val RetryAfterMessageRegex = Regex(
     "try again in\\s+(\\d+(?:\\.\\d+)?)\\s*(milliseconds?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)",
     RegexOption.IGNORE_CASE,
@@ -2652,5 +3045,15 @@ private const val DefaultStreamingConnectTimeoutMillis = 30_000L
 private const val DefaultStreamingWriteTimeoutMillis = 30_000L
 private const val DefaultAnthropicMaxTokens = 4096
 private const val AnthropicVersion = "2023-06-01"
+internal const val DefaultLlmUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 private const val OpenAiResponsesItemsKey = "aether_response_items"
 private const val LlmLogTag = "AetherLLM"
+
+internal fun AppSettings.resolvedUserAgent(): String =
+    userAgent.toSafeHttpHeaderValue().ifBlank { DefaultLlmUserAgent }
+
+internal fun String.toSafeHttpHeaderValue(): String =
+    trim()
+        .takeIf { value -> value.all { it.code in 0x20..0x7E } }
+        .orEmpty()

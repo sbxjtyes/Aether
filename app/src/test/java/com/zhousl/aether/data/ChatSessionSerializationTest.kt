@@ -92,4 +92,99 @@ class ChatSessionSerializationTest {
         assertEquals(0L, restored.lastOpenedAtMillis)
         assertEquals(0L, restored.lastActivityAtMillis)
     }
+
+    @Test
+    fun missingEnabledToolGroupsDefaultToAllGroups() {
+        val restored = parseChatSessionObject(
+            JSONObject(
+                "{\"id\":\"s3\",\"title\":\"t\",\"preview\":\"p\",\"messages\":[]}"
+            )
+        )
+
+        assertEquals(ChatToolGroups.DefaultEnabled, restored.enabledToolGroups)
+    }
+
+    @Test
+    fun missingPlanModeDefaultsToFalse() {
+        val restored = parseChatSessionObject(
+            JSONObject(
+                "{\"id\":\"plan-missing\",\"title\":\"t\",\"preview\":\"p\",\"messages\":[]}"
+            )
+        )
+
+        assertEquals(false, restored.planModeEnabled)
+    }
+
+    @Test
+    fun explicitPlanModeRoundTrips() {
+        val enabledSession = ChatSession(
+            id = "plan-enabled",
+            title = "plan",
+            preview = "",
+            messages = emptyList(),
+            planModeEnabled = true,
+        )
+        val disabledSession = ChatSession(
+            id = "plan-disabled",
+            title = "plan",
+            preview = "",
+            messages = emptyList(),
+            planModeEnabled = false,
+        )
+
+        assertEquals(true, parseChatSessionObject(enabledSession.toJson()).planModeEnabled)
+        assertEquals(false, parseChatSessionObject(disabledSession.toJson()).planModeEnabled)
+    }
+
+    @Test
+    fun taskGoalRoundTripsForSlashGoal() {
+        val session = ChatSession(
+            id = "goal-session",
+            title = "goal",
+            preview = "",
+            messages = emptyList(),
+            taskState = AgentTaskState(
+                goal = "Finish slash commands",
+                status = AgentTaskStatus.InProgress,
+                summary = "Goal set from /goal.",
+                updatedAtMillis = 99L,
+            ),
+        )
+
+        val restored = parseChatSessionObject(session.toJson())
+
+        assertEquals("Finish slash commands", restored.taskState.goal)
+        assertEquals(AgentTaskStatus.InProgress, restored.taskState.status)
+        assertEquals("Goal set from /goal.", restored.taskState.summary)
+        assertEquals(99L, restored.taskState.updatedAtMillis)
+    }
+
+    @Test
+    fun explicitEnabledToolGroupsRoundTrip() {
+        val session = ChatSession(
+            id = "session-tools",
+            title = "tools",
+            preview = "",
+            messages = emptyList(),
+            enabledToolGroups = listOf(ChatToolGroups.FilesImages, ChatToolGroups.Web),
+        )
+
+        val restored = parseChatSessionObject(session.toJson())
+
+        assertEquals(
+            listOf(ChatToolGroups.FilesImages, ChatToolGroups.Web),
+            restored.enabledToolGroups,
+        )
+    }
+
+    @Test
+    fun explicitEmptyEnabledToolGroupsArePreserved() {
+        val restored = parseChatSessionObject(
+            JSONObject(
+                "{\"id\":\"s4\",\"title\":\"t\",\"preview\":\"p\",\"messages\":[],\"enabledToolGroups\":[]}"
+            )
+        )
+
+        assertEquals(emptyList<String>(), restored.enabledToolGroups)
+    }
 }

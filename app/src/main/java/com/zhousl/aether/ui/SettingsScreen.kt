@@ -124,7 +124,9 @@ import com.zhousl.aether.data.enabledModels
 import com.zhousl.aether.data.findModelOption
 import com.zhousl.aether.data.normalizeLlmInactivityReconnectTimeoutSeconds
 import com.zhousl.aether.data.quickActionLabel
+import com.zhousl.aether.data.requiresApiKey
 import com.zhousl.aether.data.resolveAutomaticModelKey
+import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
 import com.zhousl.aether.ui.theme.AetherBackground
 import com.zhousl.aether.ui.theme.AetherOnSurface
@@ -233,6 +235,222 @@ private fun settingsTopOverlayTailGradient(): Brush = Brush.verticalGradient(
         1.0f to Color.Transparent,
     )
 )
+
+
+private enum class SettingsStatusTone {
+    Neutral,
+    Positive,
+    Warning,
+    Danger,
+    Accent,
+}
+
+private data class SettingsOverviewSectionState(
+    val title: String,
+    val subtitle: String,
+    val tone: SettingsStatusTone = SettingsStatusTone.Neutral,
+)
+
+private data class ProviderSummaryState(
+    val enabledProviderCount: Int,
+    val enabledModelCount: Int,
+    val hasIncompleteProvider: Boolean,
+    val defaultChatLabel: String,
+)
+
+private fun providerStatusTone(isReady: Boolean, hasAttention: Boolean = false): SettingsStatusTone = when {
+    hasAttention -> SettingsStatusTone.Warning
+    isReady -> SettingsStatusTone.Positive
+    else -> SettingsStatusTone.Neutral
+}
+
+@Composable
+private fun SettingsStatusPill(
+    label: String,
+    tone: SettingsStatusTone,
+    modifier: Modifier = Modifier,
+) {
+    val (containerColor, contentColor) = when (tone) {
+        SettingsStatusTone.Positive -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.82f) to MaterialTheme.colorScheme.primary
+        SettingsStatusTone.Warning -> Color(0xFFFFE9B3) to Color(0xFF8A5B00)
+        SettingsStatusTone.Danger -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.88f) to MaterialTheme.colorScheme.error
+        SettingsStatusTone.Accent -> AetherSurface to AetherOnSurface
+        SettingsStatusTone.Neutral -> AetherSurface to AetherOnSurfaceVariant
+    }
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(containerColor)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = contentColor,
+        )
+    }
+}
+
+@Composable
+private fun SettingsOverviewCard(
+    title: String,
+    subtitle: String,
+    tone: SettingsStatusTone,
+    actions: @Composable () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(AetherSurfaceHigh)
+            .padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Top,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = AetherOnSurface,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            SettingsStatusPill(
+                label = when (tone) {
+                    SettingsStatusTone.Positive -> tr(rememberAetherStrings(), "Ready", "就绪")
+                    SettingsStatusTone.Warning -> tr(rememberAetherStrings(), "Attention", "注意")
+                    SettingsStatusTone.Danger -> tr(rememberAetherStrings(), "Issue", "异常")
+                    SettingsStatusTone.Accent -> tr(rememberAetherStrings(), "Active", "活动中")
+                    SettingsStatusTone.Neutral -> tr(rememberAetherStrings(), "Review", "查看")
+                },
+                tone = tone,
+            )
+        }
+        actions()
+    }
+}
+
+@Composable
+private fun SettingsQuickActionRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    tone: SettingsStatusTone = SettingsStatusTone.Neutral,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(AetherSurface)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = AetherOnSurfaceVariant,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = AetherOnSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = AetherOnSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.width(10.dp))
+        SettingsStatusPill(
+            label = when (tone) {
+                SettingsStatusTone.Positive -> tr(rememberAetherStrings(), "Ready", "就绪")
+                SettingsStatusTone.Warning -> tr(rememberAetherStrings(), "Needs setup", "需设置")
+                SettingsStatusTone.Danger -> tr(rememberAetherStrings(), "Issue", "异常")
+                SettingsStatusTone.Accent -> tr(rememberAetherStrings(), "Active", "活动中")
+                SettingsStatusTone.Neutral -> tr(rememberAetherStrings(), "Open", "打开")
+            },
+            tone = tone,
+        )
+    }
+}
+
+@Composable
+internal fun SettingsExpandablePanel(
+    title: String,
+    subtitle: String,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(AetherSurface)
+            .animateContentSize(),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onExpandedChange(!expanded) }
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = AetherOnSurface,
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            Icon(
+                imageVector = if (expanded) Icons.Rounded.ArrowDropDown else Icons.AutoMirrored.Rounded.ArrowForwardIos,
+                contentDescription = title,
+                tint = AetherOnSurfaceVariant,
+                modifier = Modifier.size(18.dp),
+            )
+        }
+        AnimatedVisibility(visible = expanded) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 14.dp, end = 14.dp, bottom = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                content()
+            }
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Root composable - drop-in replacement for the old SettingsScreen in AetherApp
@@ -457,15 +675,52 @@ fun SettingsScreen(
     var currentPage by rememberSaveable { mutableStateOf(SettingsPage.Hub.name) }
     val page = SettingsPage.valueOf(currentPage)
     var rootSetupReturnPage by rememberSaveable { mutableStateOf(SettingsPage.Termux.name) }
+    var defaultModelsReturnPage by rememberSaveable { mutableStateOf(SettingsPage.Providers.name) }
+    var defaultModelSelectionReturnPage by rememberSaveable { mutableStateOf(SettingsPage.DefaultModels.name) }
 
     fun rootSetupReturnPageValue(): SettingsPage =
         runCatching { SettingsPage.valueOf(rootSetupReturnPage) }
             .getOrDefault(SettingsPage.Termux)
 
+    fun defaultModelsReturnPageValue(): SettingsPage =
+        runCatching { SettingsPage.valueOf(defaultModelsReturnPage) }
+            .getOrDefault(SettingsPage.Providers)
+            .let { returnPage ->
+                when (returnPage) {
+                    SettingsPage.Hub,
+                    SettingsPage.Providers -> returnPage
+                    else -> SettingsPage.Providers
+                }
+            }
+
+    fun defaultModelSelectionReturnPageValue(): SettingsPage =
+        runCatching { SettingsPage.valueOf(defaultModelSelectionReturnPage) }
+            .getOrDefault(SettingsPage.DefaultModels)
+            .let { returnPage ->
+                when (returnPage) {
+                    SettingsPage.Hub,
+                    SettingsPage.DefaultModels -> returnPage
+                    else -> SettingsPage.DefaultModels
+                }
+            }
+
     fun openRootSetupProgress(returnPage: SettingsPage) {
         rootSetupReturnPage = returnPage.name
         currentPage = SettingsPage.RootSetupProgress.name
         onStartRootSetupFromSettings(returnPage.toRootSetupProgressReturnPage())
+    }
+
+    fun openDefaultModels(returnPage: SettingsPage) {
+        defaultModelsReturnPage = returnPage.name
+        currentPage = SettingsPage.DefaultModels.name
+    }
+
+    fun openDefaultModelSelection(
+        targetPage: SettingsPage,
+        returnPage: SettingsPage,
+    ) {
+        defaultModelSelectionReturnPage = returnPage.name
+        currentPage = targetPage.name
     }
 
     fun closeRootSetupProgress() {
@@ -485,8 +740,8 @@ fun SettingsScreen(
 
     // Determine parent page for back navigation
     fun parentPage(): SettingsPage = when (page) {
-        SettingsPage.DefaultModels -> SettingsPage.Providers
-        SettingsPage.DefaultChatModel, SettingsPage.DefaultTitleModel, SettingsPage.DefaultNamingModel -> SettingsPage.DefaultModels
+        SettingsPage.DefaultModels -> defaultModelsReturnPageValue()
+        SettingsPage.DefaultChatModel, SettingsPage.DefaultTitleModel, SettingsPage.DefaultNamingModel -> defaultModelSelectionReturnPageValue()
         SettingsPage.AddProvider, SettingsPage.EditProvider -> SettingsPage.Providers
         SettingsPage.AddSkill -> SettingsPage.Skills
         SettingsPage.AddMcpServer, SettingsPage.EditMcpServer -> SettingsPage.McpServers
@@ -519,46 +774,106 @@ fun SettingsScreen(
         label = "settings_page_transition",
     ) { targetPage ->
         when (targetPage) {
-            SettingsPage.Hub -> SettingsHub(
-                strings = strings,
-                generalSettingsSummary = strings.generalSettingsSummary(
+            SettingsPage.Hub -> {
+                val enabledProviders = providerConfigs.filter { it.isEnabled }
+                val enabledModelCount = enabledProviders.sumOf { it.enabledModels().size }
+                val defaultChatLabel = enabledModelOptions.findModelOption(defaultChatModelKeyValue)?.fullLabel
+                    ?: enabledModelOptions.findModelOption(
+                        enabledModelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Chat)
+                    )?.fullLabel
+                    ?: tr(strings, "Automatic", "自动选择")
+                val hasIncompleteProvider = enabledProviders.any { config ->
+                    config.baseUrl.trim().isBlank() ||
+                        config.providerId.trim().isBlank() ||
+                        config.enabledModels().isEmpty() ||
+                        (config.providerType.requiresApiKey(config.baseUrl) && config.apiKey.trim().isBlank())
+                }
+                val enabledSkillCount = installedSkills.count { it.isEnabled }
+                val enabledMcpCount = mcpServers.count { it.isEnabled }
+                val generalSummary = strings.generalSettingsSummary(
                     language = languageValue,
                     themeMode = themeModeValue,
-                ),
-                activeProviderName = providerConfigs.count { it.isEnabled }.let { enabledCount ->
-                    when {
-                        enabledCount > 1 -> tr(strings, "$enabledCount providers enabled", "已启用 $enabledCount 个 Provider")
-                        enabledCount == 1 -> providerConfigs.firstOrNull { it.isEnabled }?.name.orEmpty()
-                        enabledModelOptions.isNotEmpty() -> enabledModelOptions.first().fullLabel
-                        else -> provider.displayName
-                    }
-                },
-                systemPromptSnippet = systemPromptValue.text.take(60),
-                tavilyConfigured = tavilyApiKeyValue.text.isNotBlank(),
-                reliabilitySummary = buildString {
-                    append(
-                        "Reconnect after ${
-                            normalizeLlmInactivityReconnectTimeoutSeconds(
-                                llmInactivityReconnectTimeoutValue.text.trim().toIntOrNull()
-                            )
-                        }s"
-                    )
-                    append(" · ")
-                    append(
-                        if (keepTasksRunningInBackgroundValue) {
-                            "Background runs on"
-                        } else {
-                            "Background runs off"
+                )
+                val personalizationSummary = if (systemPromptValue.text.isBlank()) {
+                    strings.customInstructions
+                } else {
+                    systemPromptValue.text.trim().lineSequence().firstOrNull().orEmpty().take(64)
+                }
+                val runtimeSummary = strings.reliabilitySummary(
+                    reconnectAfterSeconds = normalizeLlmInactivityReconnectTimeoutSeconds(
+                        llmInactivityReconnectTimeoutValue.text.trim().toIntOrNull()
+                    ),
+                    keepTasksRunningInBackground = keepTasksRunningInBackgroundValue,
+                )
+                SettingsHub(
+                    strings = strings,
+                    modelState = ProviderSummaryState(
+                        enabledProviderCount = enabledProviders.size,
+                        enabledModelCount = enabledModelCount,
+                        hasIncompleteProvider = hasIncompleteProvider,
+                        defaultChatLabel = defaultChatLabel,
+                    ),
+                    defaultTitleModelLabel = enabledModelOptions.findModelOption(defaultTitleModelKeyValue)?.fullLabel
+                        ?: enabledModelOptions.findModelOption(
+                            enabledModelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Title)
+                                .ifBlank { enabledModelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Chat) }
+                        )?.fullLabel
+                        ?: tr(strings, "Automatic", "自动选择"),
+                    defaultNamingModelLabel = enabledModelOptions.findModelOption(defaultNamingModelKeyValue)?.fullLabel
+                        ?: enabledModelOptions.findModelOption(
+                            enabledModelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Naming)
+                                .ifBlank { enabledModelOptions.resolveAutomaticModelKey(AutomaticModelPurpose.Chat) }
+                        )?.fullLabel
+                        ?: tr(strings, "Automatic", "自动选择"),
+                    toolsSummary = SettingsOverviewSectionState(
+                        title = tr(strings, "Tools & Extensions", "工具与扩展"),
+                        subtitle = buildString {
+                            append(if (tavilyApiKeyValue.text.isNotBlank()) strings.tavilyConfigured else strings.tavilyNotConfigured)
+                            append(" / ")
+                            append(strings.skillCountSummary(enabledSkillCount))
+                            append(" / ")
+                            append(strings.serverCountSummary(enabledMcpCount))
+                        },
+                        tone = if (tavilyApiKeyValue.text.isNotBlank() || enabledSkillCount > 0 || enabledMcpCount > 0) SettingsStatusTone.Positive else SettingsStatusTone.Neutral,
+                    ),
+                    runtimeState = SettingsOverviewSectionState(
+                        title = tr(strings, "Runtime", "运行环境"),
+                        subtitle = buildString {
+                            append(if (termuxSetupState.isReady) tr(strings, "Termux ready", "Termux 已就绪") else tr(strings, "Termux needs setup", "Termux 需设置"))
+                            append(" / ")
+                            append(if (agentModeAuthorizationEnabledValue && agentModeAuthorizationState.isReady) tr(strings, "Agent Mode ready", "Agent Mode 已就绪") else tr(strings, "Agent Mode review", "Agent Mode 待检查"))
+                            append(" / ")
+                            append(runtimeSummary)
+                        },
+                        tone = when {
+                            rootSetupState.isRunning -> SettingsStatusTone.Accent
+                            !termuxSetupState.isReady || (agentModeAuthorizationEnabledValue && !agentModeAuthorizationState.isReady) -> SettingsStatusTone.Warning
+                            else -> SettingsStatusTone.Positive
+                        },
+                    ),
+                    experienceState = SettingsOverviewSectionState(
+                        title = tr(strings, "Experience", "体验"),
+                        subtitle = "$generalSummary / $personalizationSummary",
+                        tone = if (systemPromptValue.text.isNotBlank()) SettingsStatusTone.Accent else SettingsStatusTone.Neutral,
+                    ),
+                    dataState = SettingsOverviewSectionState(
+                        title = tr(strings, "Data & About", "数据与关于"),
+                        subtitle = "Release ${BuildConfig.VERSION_NAME}",
+                        tone = if (appUpdate.availableRelease != null) SettingsStatusTone.Warning else SettingsStatusTone.Neutral,
+                    ),
+                    onReplayOnboarding = ::persistAndReplayOnboarding,
+                    onNavigate = { destination ->
+                        when (destination) {
+                            SettingsPage.DefaultModels -> openDefaultModels(SettingsPage.Hub)
+                            SettingsPage.DefaultChatModel,
+                            SettingsPage.DefaultTitleModel,
+                            SettingsPage.DefaultNamingModel -> openDefaultModelSelection(destination, SettingsPage.Hub)
+                            else -> currentPage = destination.name
                         }
-                    )
-                },
-                termuxReady = termuxSetupState.isReady,
-                skillCount = installedSkills.size,
-                mcpServerCount = mcpServers.size,
-                onReplayOnboarding = ::persistAndReplayOnboarding,
-                onNavigate = { currentPage = it.name },
-                onBack = ::persistAndExit,
-            )
+                    },
+                    onBack = ::persistAndExit,
+                )
+            }
 
             SettingsPage.General -> GeneralSettingsPageV2(
                 strings = strings,
@@ -578,7 +893,7 @@ fun SettingsScreen(
             SettingsPage.Providers -> ProvidersListPage(
                 providerConfigs = providerConfigs,
                 onSetProviderEnabled = onSetProviderEnabled,
-                onOpenDefaultModels = { currentPage = SettingsPage.DefaultModels.name },
+                onOpenDefaultModels = { openDefaultModels(SettingsPage.Providers) },
                 onEdit = { id ->
                     editingProviderId = id
                     currentPage = SettingsPage.EditProvider.name
@@ -593,10 +908,16 @@ fun SettingsScreen(
                 defaultChatModelKey = defaultChatModelKeyValue,
                 defaultTitleModelKey = defaultTitleModelKeyValue,
                 defaultNamingModelKey = defaultNamingModelKeyValue,
-                onOpenDefaultChatModel = { currentPage = SettingsPage.DefaultChatModel.name },
-                onOpenDefaultTitleModel = { currentPage = SettingsPage.DefaultTitleModel.name },
-                onOpenDefaultNamingModel = { currentPage = SettingsPage.DefaultNamingModel.name },
-                onBack = { currentPage = SettingsPage.Providers.name },
+                onOpenDefaultChatModel = {
+                    openDefaultModelSelection(SettingsPage.DefaultChatModel, SettingsPage.DefaultModels)
+                },
+                onOpenDefaultTitleModel = {
+                    openDefaultModelSelection(SettingsPage.DefaultTitleModel, SettingsPage.DefaultModels)
+                },
+                onOpenDefaultNamingModel = {
+                    openDefaultModelSelection(SettingsPage.DefaultNamingModel, SettingsPage.DefaultModels)
+                },
+                onBack = { currentPage = defaultModelsReturnPageValue().name },
             )
 
             SettingsPage.DefaultChatModel -> ModelSelectionListPage(
@@ -610,7 +931,7 @@ fun SettingsScreen(
                     ?: tr(strings, "Automatic", "自动选择"),
                 automaticSubtitle = tr(strings, "Prioritize the SOTA models", "优先选择前沿模型"),
                 onSelected = { defaultChatModelKeyValue = it },
-                onBack = { currentPage = SettingsPage.DefaultModels.name },
+                onBack = { currentPage = defaultModelSelectionReturnPageValue().name },
             )
 
             SettingsPage.DefaultTitleModel -> ModelSelectionListPage(
@@ -625,7 +946,7 @@ fun SettingsScreen(
                     ?: tr(strings, "Automatic", "自动选择"),
                 automaticSubtitle = tr(strings, "Prioritize the SOTA models", "优先选择前沿模型"),
                 onSelected = { defaultTitleModelKeyValue = it },
-                onBack = { currentPage = SettingsPage.DefaultModels.name },
+                onBack = { currentPage = defaultModelSelectionReturnPageValue().name },
             )
 
             SettingsPage.DefaultNamingModel -> ModelSelectionListPage(
@@ -640,7 +961,7 @@ fun SettingsScreen(
                     ?: tr(strings, "Automatic", "自动选择"),
                 automaticSubtitle = tr(strings, "Prioritize the SOTA models", "优先选择前沿模型"),
                 onSelected = { defaultNamingModelKeyValue = it },
-                onBack = { currentPage = SettingsPage.DefaultModels.name },
+                onBack = { currentPage = defaultModelSelectionReturnPageValue().name },
             )
 
             SettingsPage.AddProvider -> ProviderEditPage(
@@ -842,14 +1163,13 @@ fun SettingsScreen(
 @Composable
 private fun SettingsHub(
     strings: AetherStrings,
-    generalSettingsSummary: String,
-    activeProviderName: String,
-    systemPromptSnippet: String,
-    tavilyConfigured: Boolean,
-    reliabilitySummary: String,
-    termuxReady: Boolean,
-    skillCount: Int,
-    mcpServerCount: Int,
+    modelState: ProviderSummaryState,
+    defaultTitleModelLabel: String,
+    defaultNamingModelLabel: String,
+    toolsSummary: SettingsOverviewSectionState,
+    runtimeState: SettingsOverviewSectionState,
+    experienceState: SettingsOverviewSectionState,
+    dataState: SettingsOverviewSectionState,
     onReplayOnboarding: () -> Unit,
     onNavigate: (SettingsPage) -> Unit,
     onBack: () -> Unit,
@@ -880,118 +1200,162 @@ private fun SettingsHub(
                     .padding(horizontal = 20.dp)
                     .imePadding()
                     .navigationBarsPadding(),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 Spacer(Modifier.height(6.dp))
-                SettingsCardGroup {
-                    SettingsNavRow(
-                        icon = Icons.Rounded.AutoAwesome,
-                        title = strings.generalSettings,
-                        subtitle = generalSettingsSummary.ifBlank { strings.generalSettingsHubHint },
-                        onClick = { onNavigate(SettingsPage.General) },
-                    )
+
+                SettingsOverviewCard(
+                    title = tr(strings, "Models", "\u6a21\u578b"),
+                    subtitle = buildString {
+                        append(
+                            if (modelState.enabledProviderCount == 0) {
+                                tr(strings, "No providers enabled", "\u6ca1\u6709\u542f\u7528\u7684 Provider")
+                            } else {
+                                tr(strings, "${modelState.enabledProviderCount} providers / ${modelState.enabledModelCount} enabled models", "${modelState.enabledProviderCount} 个 Provider / ${modelState.enabledModelCount} 个已启用模型")
+                            }
+                        )
+                        append(" / ")
+                        append(modelState.defaultChatLabel)
+                    },
+                    tone = if (modelState.hasIncompleteProvider) SettingsStatusTone.Warning else if (modelState.enabledProviderCount > 0) SettingsStatusTone.Positive else SettingsStatusTone.Neutral,
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Cloud,
+                            title = strings.modelProviders,
+                            subtitle = if (modelState.hasIncompleteProvider) {
+                                tr(strings, "Some providers still need setup", "\u90e8\u5206 Provider \u4ecd\u9700\u914d\u7f6e")
+                            } else {
+                                tr(strings, "Manage providers and enabled models", "\u7ba1\u7406 Provider \u548c\u542f\u7528\u6a21\u578b")
+                            },
+                            tone = if (modelState.hasIncompleteProvider) SettingsStatusTone.Warning else SettingsStatusTone.Neutral,
+                            onClick = { onNavigate(SettingsPage.Providers) },
+                        )
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.AutoAwesome,
+                            title = tr(strings, "Default Chat Model", "\u9ed8\u8ba4\u804a\u5929\u6a21\u578b"),
+                            subtitle = modelState.defaultChatLabel,
+                            tone = SettingsStatusTone.Accent,
+                            onClick = { onNavigate(SettingsPage.DefaultChatModel) },
+                        )
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Edit,
+                            title = tr(strings, "Default Title / Naming", "\u9ed8\u8ba4\u6807\u9898 / \u547d\u540d"),
+                            subtitle = "$defaultTitleModelLabel / $defaultNamingModelLabel",
+                            tone = SettingsStatusTone.Neutral,
+                            onClick = { onNavigate(SettingsPage.DefaultModels) },
+                        )
+                    }
                 }
 
-                Spacer(Modifier.height(16.dp))
+                SettingsOverviewCard(
+                    title = toolsSummary.title,
+                    subtitle = toolsSummary.subtitle,
+                    tone = toolsSummary.tone,
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Link,
+                            title = strings.webTools,
+                            subtitle = toolsSummary.subtitle,
+                            tone = if (toolsSummary.subtitle.contains(strings.tavilyConfigured)) SettingsStatusTone.Positive else SettingsStatusTone.Neutral,
+                            onClick = { onNavigate(SettingsPage.WebTools) },
+                        )
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Extension,
+                            title = strings.agentSkills,
+                            subtitle = tr(strings, "Installed skills and action bundles", "\u5df2\u5b89\u88c5\u6280\u80fd\u4e0e\u52a8\u4f5c\u5305"),
+                            onClick = { onNavigate(SettingsPage.Skills) },
+                        )
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Code,
+                            title = strings.mcpServers,
+                            subtitle = tr(strings, "HTTP and stdio tool connections", "HTTP \u4e0e stdio \u5de5\u5177\u8fde\u63a5"),
+                            onClick = { onNavigate(SettingsPage.McpServers) },
+                        )
+                    }
+                }
 
-            // Configuration card
-            SettingsCardGroup {
-                SettingsNavRow(
-                    icon = Icons.Rounded.Cloud,
-                    title = strings.modelProviders,
-                    subtitle = activeProviderName,
-                    onClick = { onNavigate(SettingsPage.Providers) },
-                )
-                CardDivider()
-                SettingsNavRow(
-                    icon = Icons.Rounded.Person,
-                    title = strings.personalization,
-                    subtitle = systemPromptSnippet.ifBlank { strings.customInstructions },
-                    onClick = { onNavigate(SettingsPage.Personalization) },
-                )
-                CardDivider()
-                SettingsNavRow(
-                    icon = Icons.Rounded.Link,
-                    title = strings.webTools,
-                    subtitle = if (tavilyConfigured) {
-                        strings.tavilyConfigured
-                    } else {
-                        strings.tavilyNotConfigured
-                    },
-                    onClick = { onNavigate(SettingsPage.WebTools) },
-                )
-                CardDivider()
-                SettingsNavRow(
-                    icon = Icons.Rounded.Refresh,
-                    title = strings.reliability,
-                    subtitle = reliabilitySummary,
-                    onClick = { onNavigate(SettingsPage.Reliability) },
-                )
-            }
+                SettingsOverviewCard(
+                    title = runtimeState.title,
+                    subtitle = runtimeState.subtitle,
+                    tone = runtimeState.tone,
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Terminal,
+                            title = strings.termux,
+                            subtitle = tr(strings, "Shell command runtime and permission probe", "Shell \u547d\u4ee4\u8fd0\u884c\u73af\u5883\u4e0e\u6743\u9650\u63a2\u6d4b"),
+                            tone = if (runtimeState.subtitle.contains(tr(strings, "Termux ready", "Termux \u5c31\u7eea"))) SettingsStatusTone.Positive else SettingsStatusTone.Warning,
+                            onClick = { onNavigate(SettingsPage.Termux) },
+                        )
+                        SettingsQuickActionRow(
+                            icon = LucideIcons.MousePointer2,
+                            title = strings.agentMode,
+                            subtitle = tr(strings, "Authorization and virtual display status", "\u6388\u6743\u4e0e\u865a\u62df\u663e\u793a\u72b6\u6001"),
+                            tone = if (runtimeState.subtitle.contains(tr(strings, "Agent Mode ready", "Agent Mode \u5c31\u7eea"))) SettingsStatusTone.Positive else SettingsStatusTone.Neutral,
+                            onClick = { onNavigate(SettingsPage.AgentMode) },
+                        )
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Refresh,
+                            title = strings.reliability,
+                            subtitle = tr(strings, "Background execution, reconnect, and completion alerts", "\u540e\u53f0\u8fd0\u884c\u3001\u91cd\u8fde\u4e0e\u5b8c\u6210\u63d0\u9192"),
+                            onClick = { onNavigate(SettingsPage.Reliability) },
+                        )
+                    }
+                }
 
-            Spacer(Modifier.height(16.dp))
+                SettingsOverviewCard(
+                    title = experienceState.title,
+                    subtitle = experienceState.subtitle,
+                    tone = experienceState.tone,
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.AutoAwesome,
+                            title = strings.generalSettings,
+                            subtitle = strings.generalSettingsHubHint,
+                            onClick = { onNavigate(SettingsPage.General) },
+                        )
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Person,
+                            title = strings.personalization,
+                            subtitle = tr(strings, "System prompt and custom assistant behavior", "\u7cfb\u7edf\u63d0\u793a\u8bcd\u4e0e\u81ea\u5b9a\u4e49\u52a9\u624b\u884c\u4e3a"),
+                            tone = if (experienceState.tone == SettingsStatusTone.Accent) SettingsStatusTone.Accent else SettingsStatusTone.Neutral,
+                            onClick = { onNavigate(SettingsPage.Personalization) },
+                        )
+                    }
+                }
 
-            // Extensions card
-            SettingsCardGroup {
-                SettingsNavRow(
-                    icon = Icons.Rounded.Extension,
-                    title = strings.agentSkills,
-                    subtitle = strings.skillCountSummary(skillCount),
-                    onClick = { onNavigate(SettingsPage.Skills) },
-                )
-                CardDivider()
-                SettingsNavRow(
-                    icon = Icons.Rounded.Code,
-                    title = strings.mcpServers,
-                    subtitle = strings.serverCountSummary(mcpServerCount),
-                    onClick = { onNavigate(SettingsPage.McpServers) },
-                )
-                CardDivider()
-                SettingsNavRow(
-                    icon = Icons.Rounded.Terminal,
-                    title = strings.termux,
-                    subtitle = if (termuxReady) strings.connected else strings.setupRequired,
-                    onClick = { onNavigate(SettingsPage.Termux) },
-                )
-                CardDivider()
-                SettingsNavRow(
-                    icon = LucideIcons.MousePointer2,
-                    title = strings.agentMode,
-                    subtitle = strings.agentModeSubtitle,
-                    onClick = { onNavigate(SettingsPage.AgentMode) },
-                )
-            }
+                SettingsOverviewCard(
+                    title = dataState.title,
+                    subtitle = dataState.subtitle,
+                    tone = dataState.tone,
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Code,
+                            title = strings.developerSettings,
+                            subtitle = strings.developerSettingsSubtitle,
+                            onClick = { onNavigate(SettingsPage.Developer) },
+                        )
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.AutoAwesome,
+                            title = strings.getStartedTour,
+                            subtitle = strings.getStartedTourSubtitle,
+                            onClick = onReplayOnboarding,
+                        )
+                        SettingsQuickActionRow(
+                            icon = Icons.Rounded.Info,
+                            title = strings.about,
+                            subtitle = dataState.subtitle,
+                            tone = dataState.tone,
+                            onClick = { onNavigate(SettingsPage.About) },
+                        )
+                    }
+                }
 
-            Spacer(Modifier.height(16.dp))
-
-            // About card
-            SettingsCardGroup {
-                SettingsNavRow(
-                    icon = Icons.Rounded.AutoAwesome,
-                    title = strings.getStartedTour,
-                    subtitle = strings.getStartedTourSubtitle,
-                    onClick = onReplayOnboarding,
-                )
-                CardDivider()
-                SettingsNavRow(
-                    icon = Icons.Rounded.Code,
-                    title = strings.developerSettings,
-                    subtitle = strings.developerSettingsSubtitle,
-                    onClick = { onNavigate(SettingsPage.Developer) },
-                )
-            }
-
-            Spacer(Modifier.height(16.dp))
-
-            SettingsCardGroup {
-                SettingsNavRow(
-                    icon = Icons.Rounded.Info,
-                    title = strings.about,
-                    subtitle = "Release ${BuildConfig.VERSION_NAME}",
-                    onClick = { onNavigate(SettingsPage.About) },
-                )
-            }
-
-            Spacer(Modifier.height(32.dp))
+                Spacer(Modifier.height(32.dp))
             }
 
             SettingsTopBarOverlay(

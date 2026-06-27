@@ -116,10 +116,13 @@ private const val DefaultTextBlockMaxHeightDp = 2048
 private const val PreviewDialogMinHeightDp = 320
 private const val PreviewDialogMaxHeightDp = 820
 private const val MarkdownBlockCacheMaxEntries = 96
+private const val MarkdownImageLoadCacheMaxEntries = 16
+private const val MaxMarkdownImagePreviewDimensionPx = 1600
 private val MarkdownTableMinColumnWidth = 128.dp
 private val MarkdownTableDescriptionMinColumnWidth = 160.dp
 private val MarkdownTableScrollableColumnWidth = 148.dp
 private val MarkdownBlockCache = LruCache<String, List<MarkdownBlock>>(MarkdownBlockCacheMaxEntries)
+private val MarkdownImageLoadCache = LruCache<String, MarkdownImageLoadResult>(MarkdownImageLoadCacheMaxEntries)
 private val MarkdownImageHttpClient: OkHttpClient by lazy {
     OkHttpClient.Builder()
         .followRedirects(true)
@@ -645,6 +648,13 @@ private fun MarkdownImageBlock(
     val context = LocalContext.current
     val workspaceFileBridge = remember(context) { WorkspaceFileBridge(context) }
     val resolvedUrl = remember(image.url) { normalizeMarkdownImageUrl(image.url).orEmpty() }
+    val imageCacheKey = remember(resolvedUrl, workspaceDirectory, allowRootImageRead) {
+        markdownImageLoadCacheKey(
+            rawUrl = resolvedUrl,
+            workspaceDirectory = workspaceDirectory,
+            allowRootImageRead = allowRootImageRead,
+        )
+    }
     val originalLinkTarget = remember(resolvedUrl, workspaceDirectory) {
         buildMarkdownImageOriginalLinkTarget(
             rawUrl = resolvedUrl,
@@ -653,12 +663,17 @@ private fun MarkdownImageBlock(
         )
     }
     val imageState by produceState(
-        initialValue = MarkdownImageLoadResult(),
-        key1 = resolvedUrl,
+        initialValue = MarkdownImageLoadCache.get(imageCacheKey) ?: MarkdownImageLoadResult(),
+        key1 = imageCacheKey,
         key2 = workspaceDirectory,
         key3 = allowRootImageRead,
     ) {
-        value = withContext(Dispatchers.IO) {
+        val cached = MarkdownImageLoadCache.get(imageCacheKey)
+        if (cached != null) {
+            value = cached
+            return@produceState
+        }
+        val loaded = withContext(Dispatchers.IO) {
             loadMarkdownImage(
                 context = context,
                 workspaceFileBridge = workspaceFileBridge,
@@ -667,6 +682,10 @@ private fun MarkdownImageBlock(
                 allowRootImageRead = allowRootImageRead,
             )
         }
+        if (loaded.error == null) {
+            MarkdownImageLoadCache.put(imageCacheKey, loaded)
+        }
+        value = loaded
     }
     var showPreview by remember(resolvedUrl) { mutableStateOf(false) }
     val htmlSnapshot = imageState.html
@@ -1318,7 +1337,83 @@ private sealed interface MarkdownBlock {
 }
 
 private fun normalizeMarkdownSource(markdown: String): String =
-    markdown.replace("\r\n", "\n")
+    markdown
+        .replace("\r\n", "\n")
+        .replace('\r', '\n')
+        .lineSequence()
+        .flatMap(::normalizeMarkdownLine)
+        .joinToString("\n")
+
+private fun normalizeMarkdownLine(line: String): Sequence<String> = sequence {
+    val trimmedStart = line.trimStart()
+    val leadingWhitespace = line.take(line.length - trimmedStart.length)
+
+    normalizeMarkdownHeadingLine(trimmedStart, leadingWhitespace)?.forEach { yield(it) }
+        ?: yield(normalizeMarkdownListOrQuoteLine(line, trimmedStart, leadingWhitespace))
+}
+
+private fun normalizeMarkdownHeadingLine(
+    trimmedStart: String,
+    leadingWhitespace: String,
+): List<String>? {
+    val match = compactHeadingPattern.matchEntire(trimmedStart) ?: return null
+    val marker = match.groupValues[1]
+    val content = match.groupValues[2].trimStart()
+    if (content.isBlank()) return null
+
+    val splitIndex = firstHeadingAttachmentIndex(content)
+    if (splitIndex <= 0) {
+        return listOf("$leadingWhitespace$marker $content")
+    }
+
+    val headingText = content.substring(0, splitIndex).trimEnd()
+    val attachedBlock = content.substring(splitIndex).trimStart()
+    return buildList {
+        if (headingText.isNotBlank()) {
+            add("$leadingWhitespace$marker $headingText")
+        }
+        if (attachedBlock.isNotBlank()) {
+            add(normalizeMarkdownListOrQuoteLine(attachedBlock, attachedBlock, ""))
+        }
+    }
+}
+
+private fun firstHeadingAttachmentIndex(content: String): Int {
+    val candidates = listOf(
+        content.indexOf("![").takeIf { it > 0 },
+        content.indexOf('>').takeIf { it > 0 },
+        headingTableStartIndex(content),
+    ).filterNotNull()
+    return candidates.minOrNull() ?: -1
+}
+
+private fun headingTableStartIndex(content: String): Int? {
+    val pipeIndex = content.indexOf('|')
+    if (pipeIndex <= 0) return null
+    val tableSegment = content.substring(pipeIndex)
+    if (!tableSegment.startsWith("|")) return null
+    return pipeIndex.takeIf { splitMarkdownTableCells(tableSegment).size >= 2 }
+}
+
+private fun normalizeMarkdownListOrQuoteLine(
+    line: String,
+    trimmedStart: String,
+    leadingWhitespace: String,
+): String {
+    if (trimmedStart == "---" || trimmedStart == "***") return line
+
+    val listMatch = compactUnorderedPattern.matchEntire(trimmedStart)
+    if (listMatch != null) {
+        return "$leadingWhitespace${listMatch.groupValues[1]} ${listMatch.groupValues[2]}"
+    }
+
+    val quoteMatch = compactQuotePattern.matchEntire(trimmedStart)
+    if (quoteMatch != null) {
+        return "$leadingWhitespace> ${quoteMatch.groupValues[1]}"
+    }
+
+    return line
+}
 
 private fun parseMarkdownCached(normalizedMarkdown: String): List<MarkdownBlock> {
     MarkdownBlockCache.get(normalizedMarkdown)?.let { return it }
@@ -1566,8 +1661,11 @@ private fun beginsSpecialBlock(
 }
 
 private val headingPattern = Regex("^(#{1,6})\\s+(.+)$")
+private val compactHeadingPattern = Regex("^(#{1,6})\\s*(\\S.*)$")
 private val unorderedPattern = Regex("^[-*+]\\s+(.+)$")
+private val compactUnorderedPattern = Regex("^([-*+])([^\\s\\d].*)$")
 private val orderedPattern = Regex("^(\\d+)[.)]\\s+(.+)$")
+private val compactQuotePattern = Regex("^>(\\S.*)$")
 private val markdownTableSeparatorPattern = Regex("^:?-{3,}:?$")
 private val autoLinkPattern = Regex("""^(https?://\S+|www\.\S+)""")
 
@@ -2219,6 +2317,36 @@ private suspend fun loadMarkdownImage(
     )
 }
 
+private fun markdownImageLoadCacheKey(
+    rawUrl: String,
+    workspaceDirectory: String?,
+    allowRootImageRead: Boolean,
+): String {
+    val normalizedUrl = normalizeMarkdownImageUrl(rawUrl).orEmpty()
+    val compactUrl = if (normalizedUrl.startsWith("data:", ignoreCase = true)) {
+        "data:${sha256Hex(normalizedUrl.toByteArray(Charsets.UTF_8))}"
+    } else {
+        normalizedUrl
+    }
+    val localPath = parseAssistantLocalFileLink(normalizedUrl)
+        ?: normalizedUrl.removePrefix("file://")
+    val localFile = File(localPath)
+    val localStamp = if (localFile.exists() && localFile.isFile) {
+        "${localFile.length()}:${localFile.lastModified()}"
+    } else {
+        ""
+    }
+    return buildString {
+        append(compactUrl)
+        append("|wd=")
+        append(workspaceDirectory.orEmpty())
+        append("|root=")
+        append(allowRootImageRead)
+        append("|file=")
+        append(localStamp)
+    }
+}
+
 private suspend fun loadWorkspaceImageBinary(
     workspaceFileBridge: WorkspaceFileBridge,
     rawPath: String,
@@ -2429,11 +2557,41 @@ private fun ByteArray.startsWith(prefix: ByteArray): Boolean =
     size >= prefix.size && copyOfRange(0, prefix.size).contentEquals(prefix)
 
 private fun decodeMarkdownBitmap(bytes: ByteArray): ImageBitmap? {
-    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it.asImageBitmap() }
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+    if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = calculateMarkdownImageSampleSize(bounds.outWidth, bounds.outHeight)
+        }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions)?.let { return it.asImageBitmap() }
+    } else {
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it.asImageBitmap() }
+    }
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
     return runCatching {
-        ImageDecoder.decodeBitmap(ImageDecoder.createSource(ByteBuffer.wrap(bytes))).asImageBitmap()
+        ImageDecoder.decodeBitmap(ImageDecoder.createSource(ByteBuffer.wrap(bytes))) { decoder, info, _ ->
+            val sampleSize = calculateMarkdownImageSampleSize(
+                width = info.size.width,
+                height = info.size.height,
+            )
+            if (sampleSize > 1) {
+                decoder.setTargetSampleSize(sampleSize)
+            }
+        }.asImageBitmap()
     }.getOrNull()
+}
+
+internal fun calculateMarkdownImageSampleSize(
+    width: Int,
+    height: Int,
+    maxDimension: Int = MaxMarkdownImagePreviewDimensionPx,
+): Int {
+    if (width <= 0 || height <= 0 || maxDimension <= 0) return 1
+    var sampleSize = 1
+    while (maxOf(width / sampleSize, height / sampleSize) > maxDimension) {
+        sampleSize *= 2
+    }
+    return sampleSize.coerceAtLeast(1)
 }
 
 private fun looksLikeSvgDocument(bytes: ByteArray): Boolean {
@@ -2655,6 +2813,11 @@ private fun markdownImageCacheKey(
     digest.update(bytes)
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
+
+private fun sha256Hex(bytes: ByteArray): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(bytes)
+        .joinToString("") { "%02x".format(it) }
 
 private fun guessMimeTypeFromPath(rawUrl: String): String? {
     val candidatePath = rawUrl

@@ -31,6 +31,8 @@ internal class QueuedTurnRequestBuilder(
                 activeSkills = updatedSession.activeSkills,
                 activeMcpServerIds = updatedSession.activeMcpServerIds,
                 agentModeEnabled = updatedSession.agentModeEnabled,
+                enabledToolGroups = updatedSession.enabledToolGroups,
+                planModeEnabled = updatedSession.planModeEnabled,
                 selectedModelKey = updatedSession.selectedModelKey,
                 taskState = updatedSession.taskState,
             )
@@ -53,6 +55,8 @@ internal class QueuedTurnRequestBuilder(
             activeSkills = selection.activeSkills,
             activeMcpServerIds = selection.activeMcpServerIds,
             agentModeEnabled = selection.agentModeEnabled,
+            enabledToolGroups = selection.enabledToolGroups,
+            planModeEnabled = selection.planModeEnabled,
             taskState = selection.taskState,
         )
     }
@@ -63,6 +67,8 @@ internal class QueuedTurnRequestBuilder(
         val activeSkills: List<ActiveSkillContext> = emptyList(),
         val activeMcpServerIds: List<String> = emptyList(),
         val agentModeEnabled: Boolean = false,
+        val enabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
+        val planModeEnabled: Boolean = false,
         val selectedModelKey: String = "",
         val taskState: AgentTaskState = AgentTaskState(),
     )

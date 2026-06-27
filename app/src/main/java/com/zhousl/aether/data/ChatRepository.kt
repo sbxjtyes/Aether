@@ -246,6 +246,14 @@ internal fun parseChatSessionObject(
     activeSkills = parseActiveSkillContexts(session.optString("activeSkillsJson")),
     activeMcpServerIds = parseStringList(session.optJSONArray("activeMcpServerIds")),
     agentModeEnabled = session.optBoolean("agentModeEnabled", false),
+    enabledToolGroups = chatToolGroupsFromStored(
+        if (session.has("enabledToolGroups")) {
+            parseStringList(session.optJSONArray("enabledToolGroups"))
+        } else {
+            null
+        },
+    ),
+    planModeEnabled = session.optBoolean("planModeEnabled", false),
     selectedModelKey = session.optString("selectedModelKey"),
     taskState = parseAgentTaskState(session.optJSONObject("taskState")),
     lastOpenedAtMillis = session.optLong("lastOpenedAtMillis"),
@@ -290,8 +298,10 @@ internal fun ChatSession.toJson(): JSONObject = JSONObject().apply {
     put("isPinned", isPinned)
     put("isArchived", isArchived)
     put("agentModeEnabled", agentModeEnabled)
+    put("planModeEnabled", planModeEnabled)
     put("selectedModelKey", selectedModelKey)
     put("selectedSkillIds", JSONArray().apply { selectedSkillIds.forEach(::put) })
+    put("enabledToolGroups", JSONArray().apply { normalizeChatToolGroups(enabledToolGroups).forEach(::put) })
     put("messages", JSONArray().apply { syncActiveBranches(messages).forEach { put(it.toJson()) } })
     put("activeSkillsJson", serializeActiveSkillContexts(activeSkills))
     put("activeMcpServerIds", JSONArray().apply { activeMcpServerIds.forEach(::put) })

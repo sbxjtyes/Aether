@@ -142,11 +142,13 @@ import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AgentModeDisplayState
 import com.zhousl.aether.data.AgentTaskState
 import com.zhousl.aether.data.AgentTaskStatus
+import com.zhousl.aether.data.ChatToolGroups
 import com.zhousl.aether.data.McpServerConfig
 import com.zhousl.aether.data.McpTransportConfig
 import com.zhousl.aether.data.PendingSessionInput
 import com.zhousl.aether.data.ProviderModelOption
 import com.zhousl.aether.data.SessionFollowUpMode
+import com.zhousl.aether.data.normalizeChatToolGroups
 import com.zhousl.aether.data.quickActionLabel
 import com.zhousl.aether.termux.TermuxSetupState
 import com.zhousl.aether.ui.theme.AetherBackground
@@ -233,6 +235,8 @@ internal data class ConversationScreenState(
     val selectedMcpServerIds: List<String>,
     val agentModeAvailable: Boolean,
     val agentModeSelected: Boolean,
+    val enabledToolGroups: List<String>,
+    val planModeSelected: Boolean,
     val agentModeDisplayState: AgentModeDisplayState,
     val allowRootImageRead: Boolean,
     val isEditing: Boolean,
@@ -256,6 +260,9 @@ internal data class ConversationScreenActions(
     val onSetSkillSelected: (String, Boolean) -> Unit,
     val onSetMcpServerSelected: (String, Boolean) -> Unit,
     val onSetAgentModeSelected: (Boolean) -> Unit,
+    val onSetToolGroupEnabled: (String, Boolean) -> Unit,
+    val onSetPlanModeEnabled: (Boolean) -> Unit,
+    val onSlashCommand: (ComposerSlashCommandId, String) -> Unit,
     val onCancelEdit: () -> Unit,
     val onSend: () -> Unit,
     val onQueueFollowUp: () -> Unit,
@@ -320,6 +327,8 @@ internal fun ConversationScreen(
         selectedMcpServerIds = state.selectedMcpServerIds,
         agentModeAvailable = state.agentModeAvailable,
         agentModeSelected = state.agentModeSelected,
+        enabledToolGroups = state.enabledToolGroups,
+        planModeSelected = state.planModeSelected,
         agentModeDisplayState = state.agentModeDisplayState,
         allowRootImageRead = state.allowRootImageRead,
         isEditing = state.isEditing,
@@ -339,6 +348,9 @@ internal fun ConversationScreen(
         onSetSkillSelected = actions.onSetSkillSelected,
         onSetMcpServerSelected = actions.onSetMcpServerSelected,
         onSetAgentModeSelected = actions.onSetAgentModeSelected,
+        onSetToolGroupEnabled = actions.onSetToolGroupEnabled,
+        onSetPlanModeEnabled = actions.onSetPlanModeEnabled,
+        onSlashCommand = actions.onSlashCommand,
         onCancelEdit = actions.onCancelEdit,
         onSend = actions.onSend,
         onQueueFollowUp = actions.onQueueFollowUp,
@@ -464,6 +476,8 @@ private fun ConversationScreen(
     selectedMcpServerIds: List<String>,
     agentModeAvailable: Boolean,
     agentModeSelected: Boolean,
+    enabledToolGroups: List<String>,
+    planModeSelected: Boolean,
     agentModeDisplayState: AgentModeDisplayState,
     allowRootImageRead: Boolean = false,
     isEditing: Boolean,
@@ -483,6 +497,9 @@ private fun ConversationScreen(
     onSetSkillSelected: (String, Boolean) -> Unit,
     onSetMcpServerSelected: (String, Boolean) -> Unit,
     onSetAgentModeSelected: (Boolean) -> Unit,
+    onSetToolGroupEnabled: (String, Boolean) -> Unit,
+    onSetPlanModeEnabled: (Boolean) -> Unit,
+    onSlashCommand: (ComposerSlashCommandId, String) -> Unit,
     onCancelEdit: () -> Unit,
     onSend: () -> Unit,
     onQueueFollowUp: () -> Unit,
@@ -953,6 +970,10 @@ private fun ConversationScreen(
                     selectedMcpServerIds = selectedMcpServerIds,
                     agentModeAvailable = agentModeAvailable,
                     agentModeSelected = agentModeSelected,
+                    enabledToolGroups = enabledToolGroups,
+                    planModeSelected = planModeSelected,
+                    modelOptions = modelOptions,
+                    selectedModelKey = selectedModelKey,
                     isEditing = isEditing,
                     termuxSetupState = termuxSetupState,
                     taskState = taskState,
@@ -964,6 +985,10 @@ private fun ConversationScreen(
                     onSetSkillSelected = onSetSkillSelected,
                     onSetMcpServerSelected = onSetMcpServerSelected,
                     onSetAgentModeSelected = onSetAgentModeSelected,
+                    onSetToolGroupEnabled = onSetToolGroupEnabled,
+                    onSetPlanModeEnabled = onSetPlanModeEnabled,
+                    onSlashCommand = onSlashCommand,
+                    onModelSelected = onModelSelected,
                     onCancelEdit = onCancelEdit,
                     onPickImages = onPickImages,
                     onPickFiles = onPickFiles,
@@ -2214,6 +2239,10 @@ private fun ConversationComposerOverlay(
     selectedMcpServerIds: List<String>,
     agentModeAvailable: Boolean,
     agentModeSelected: Boolean,
+    enabledToolGroups: List<String>,
+    planModeSelected: Boolean,
+    modelOptions: List<ProviderModelOption>,
+    selectedModelKey: String,
     isEditing: Boolean,
     termuxSetupState: TermuxSetupState,
     taskState: AgentTaskState,
@@ -2225,6 +2254,10 @@ private fun ConversationComposerOverlay(
     onSetSkillSelected: (String, Boolean) -> Unit,
     onSetMcpServerSelected: (String, Boolean) -> Unit,
     onSetAgentModeSelected: (Boolean) -> Unit,
+    onSetToolGroupEnabled: (String, Boolean) -> Unit,
+    onSetPlanModeEnabled: (Boolean) -> Unit,
+    onSlashCommand: (ComposerSlashCommandId, String) -> Unit,
+    onModelSelected: (String) -> Unit,
     onCancelEdit: () -> Unit,
     onPickImages: () -> Unit,
     onPickFiles: () -> Unit,
@@ -2273,6 +2306,10 @@ private fun ConversationComposerOverlay(
                 selectedMcpServerIds = selectedMcpServerIds,
                 agentModeAvailable = agentModeAvailable,
                 agentModeSelected = agentModeSelected,
+                enabledToolGroups = enabledToolGroups,
+                planModeSelected = planModeSelected,
+                modelOptions = modelOptions,
+                selectedModelKey = selectedModelKey,
                 isEditing = isEditing,
                 termuxSetupState = termuxSetupState,
                 taskState = taskState,
@@ -2284,6 +2321,10 @@ private fun ConversationComposerOverlay(
                 onSetSkillSelected = onSetSkillSelected,
                 onSetMcpServerSelected = onSetMcpServerSelected,
                 onSetAgentModeSelected = onSetAgentModeSelected,
+                onSetToolGroupEnabled = onSetToolGroupEnabled,
+                onSetPlanModeEnabled = onSetPlanModeEnabled,
+                onSlashCommand = onSlashCommand,
+                onModelSelected = onModelSelected,
                 onCancelEdit = onCancelEdit,
                 onPickImages = onPickImages,
                 onPickFiles = onPickFiles,
@@ -2316,6 +2357,10 @@ private fun ChatGptPromptComposerBar(
     selectedMcpServerIds: List<String>,
     agentModeAvailable: Boolean,
     agentModeSelected: Boolean,
+    enabledToolGroups: List<String>,
+    planModeSelected: Boolean,
+    modelOptions: List<ProviderModelOption>,
+    selectedModelKey: String,
     isEditing: Boolean,
     termuxSetupState: TermuxSetupState,
     taskState: AgentTaskState,
@@ -2327,6 +2372,10 @@ private fun ChatGptPromptComposerBar(
     onSetSkillSelected: (String, Boolean) -> Unit,
     onSetMcpServerSelected: (String, Boolean) -> Unit,
     onSetAgentModeSelected: (Boolean) -> Unit,
+    onSetToolGroupEnabled: (String, Boolean) -> Unit,
+    onSetPlanModeEnabled: (Boolean) -> Unit,
+    onSlashCommand: (ComposerSlashCommandId, String) -> Unit,
+    onModelSelected: (String) -> Unit,
     onCancelEdit: () -> Unit,
     onPickImages: () -> Unit,
     onPickFiles: () -> Unit,
@@ -2356,6 +2405,9 @@ private fun ChatGptPromptComposerBar(
     var toolsMenuExpanded by remember { mutableStateOf(false) }
     val toolsMenuVisibility = remember { MutableTransitionState(false) }
     toolsMenuVisibility.targetState = toolsMenuExpanded
+    var modelMenuExpanded by remember { mutableStateOf(false) }
+    val modelMenuVisibility = remember { MutableTransitionState(false) }
+    modelMenuVisibility.targetState = modelMenuExpanded
     var followUpMenuExpanded by remember { mutableStateOf(false) }
     val followUpMenuVisibility = remember { MutableTransitionState(false) }
     followUpMenuVisibility.targetState = followUpMenuExpanded
@@ -2365,6 +2417,7 @@ private fun ChatGptPromptComposerBar(
 
     BackHandler(enabled = attachmentMenuExpanded) { attachmentMenuExpanded = false }
     BackHandler(enabled = toolsMenuExpanded) { toolsMenuExpanded = false }
+    BackHandler(enabled = modelMenuExpanded) { modelMenuExpanded = false }
     BackHandler(enabled = followUpMenuExpanded) { followUpMenuExpanded = false }
     LaunchedEffect(textFieldFocused) {
         onFocusChanged(textFieldFocused)
@@ -2377,23 +2430,51 @@ private fun ChatGptPromptComposerBar(
 
     val selectedSkillSet = remember(selectedSkillIds) { selectedSkillIds.toSet() }
     val selectedMcpServerSet = remember(selectedMcpServerIds) { selectedMcpServerIds.toSet() }
-    val selectedSkillActions = remember(availableSkills, selectedSkillSet) {
-        availableSkills.filter { selectedSkillSet.contains(it.id) }
+    val normalizedToolGroups = remember(enabledToolGroups) { normalizeChatToolGroups(enabledToolGroups) }
+    val selectedToolGroupSet = remember(normalizedToolGroups) { normalizedToolGroups.toSet() }
+    val extensionsEnabled = selectedToolGroupSet.contains(ChatToolGroups.Extensions)
+    val selectedSkillActions = remember(availableSkills, selectedSkillSet, extensionsEnabled) {
+        if (extensionsEnabled) {
+            availableSkills.filter { selectedSkillSet.contains(it.id) }
+        } else {
+            emptyList()
+        }
     }
-    val selectedMcpActions = remember(availableMcpServers, selectedMcpServerSet) {
-        availableMcpServers.filter { selectedMcpServerSet.contains(it.id) }
+    val selectedMcpActions = remember(availableMcpServers, selectedMcpServerSet, extensionsEnabled) {
+        if (extensionsEnabled) {
+            availableMcpServers.filter { selectedMcpServerSet.contains(it.id) }
+        } else {
+            emptyList()
+        }
     }
     val allSkillsSelected = availableSkills.isNotEmpty() && availableSkills.all { selectedSkillSet.contains(it.id) }
     val allMcpServersSelected = availableMcpServers.isNotEmpty() && availableMcpServers.all { selectedMcpServerSet.contains(it.id) }
-    val hasSelectedActions = selectedSkillActions.isNotEmpty() || selectedMcpActions.isNotEmpty() || agentModeSelected
-    val selectedActionCount = selectedSkillActions.size + selectedMcpActions.size + if (agentModeSelected) 1 else 0
     val hasDraft = value.isNotBlank() || attachments.isNotEmpty()
     val canSendDraft = attachments.all { it.workspaceState == AttachmentWorkspaceState.Ready }
     val showPauseButton = isSending && !hasDraft
     val showSubmitButton = !isSending || hasDraft
+    val slashQuery = remember(value) {
+        val trimmed = value.trimStart()
+        if (trimmed.startsWith("/") && trimmed.drop(1).none { it.isWhitespace() }) {
+            slashCommandQuery(value)
+        } else {
+            null
+        }
+    }
+    val slashCommands = remember(strings.appLanguage) { composerSlashCommandItems(strings.appLanguage) }
+    val visibleSlashCommands = remember(slashCommands, slashQuery) {
+        if (slashQuery == null) {
+            emptyList()
+        } else {
+            slashCommands.filter { command ->
+                command.name.contains(slashQuery, ignoreCase = true) ||
+                    command.title.contains(slashQuery, ignoreCase = true)
+            }
+        }
+    }
     val textLineCount = if (value.isBlank()) 1 else maxOf(value.count { it == '\n' } + 1, measuredTextLineCount).coerceIn(1, 5)
     val cardMinHeight by animateDpAsState(
-        targetValue = maxOf(116.dp, measuredTextHeight + 74.dp + if (hasSelectedActions) 40.dp else 0.dp),
+        targetValue = maxOf(116.dp, measuredTextHeight + 74.dp),
         animationSpec = tween(durationMillis = 260, easing = ChatGptMotionEasing),
         label = "chatgpt_prompt_min_height",
     )
@@ -2408,11 +2489,39 @@ private fun ChatGptPromptComposerBar(
         ),
     )
 
-    fun applyPromptSelection(prompt: String) {
-        composerFieldValue = TextFieldValue(prompt, selection = TextRange(prompt.length))
-        onValueChange(prompt)
-        focusRequester.requestFocus()
-        keyboardController?.show()
+    fun executeComposerSlashCommand(
+        commandId: ComposerSlashCommandId,
+        inlineText: String,
+    ) {
+        attachmentMenuExpanded = false
+        toolsMenuExpanded = false
+        modelMenuExpanded = false
+        followUpMenuExpanded = false
+        onSlashCommand(commandId, inlineText)
+    }
+
+    fun submitComposerDraft() {
+        val parsedCommand = parseComposerSlashCommand(value)
+        if (parsedCommand != null) {
+            when (parsedCommand.id) {
+                ComposerSlashCommandId.Model -> {
+                    modelMenuExpanded = true
+                    composerFieldValue = TextFieldValue("")
+                    onValueChange("")
+                }
+
+                ComposerSlashCommandId.Tools,
+                ComposerSlashCommandId.Permissions -> {
+                    toolsMenuExpanded = true
+                    composerFieldValue = TextFieldValue("")
+                    onValueChange("")
+                }
+
+                else -> executeComposerSlashCommand(parsedCommand.id, parsedCommand.inlineText)
+            }
+        } else {
+            onSend()
+        }
     }
 
     Column(
@@ -2451,6 +2560,48 @@ private fun ChatGptPromptComposerBar(
                 actionEnabled = true,
             )
         }
+        ComposerSlashCommandPanel(
+            visible = textFieldFocused && visibleSlashCommands.isNotEmpty(),
+            commands = visibleSlashCommands,
+            onCommandSelected = { command ->
+                when (command.id) {
+                    ComposerSlashCommandId.Plan,
+                    ComposerSlashCommandId.Goal -> {
+                        val inserted = "/${command.name} "
+                        composerFieldValue = TextFieldValue(inserted, selection = TextRange(inserted.length))
+                        onValueChange(inserted)
+                        focusRequester.requestFocus()
+                        keyboardController?.show()
+                    }
+
+                    ComposerSlashCommandId.Model -> {
+                        modelMenuExpanded = true
+                        composerFieldValue = TextFieldValue("")
+                        onValueChange("")
+                    }
+
+                    ComposerSlashCommandId.Tools,
+                    ComposerSlashCommandId.Permissions -> {
+                        toolsMenuExpanded = true
+                        composerFieldValue = TextFieldValue("")
+                        onValueChange("")
+                    }
+
+                    ComposerSlashCommandId.Status,
+                    ComposerSlashCommandId.Review -> executeComposerSlashCommand(command.id, "")
+                }
+            },
+        )
+        ComposerModelCommandPanel(
+            visibleState = modelMenuVisibility,
+            modelOptions = modelOptions,
+            selectedModelKey = selectedModelKey,
+            onDismiss = { modelMenuExpanded = false },
+            onModelSelected = { modelKey ->
+                modelMenuExpanded = false
+                onModelSelected(modelKey)
+            },
+        )
         if (attachments.isNotEmpty()) {
             key(attachmentRevision) {
                 ComposerAttachmentTray(
@@ -2484,24 +2635,8 @@ private fun ChatGptPromptComposerBar(
                         keyboardController?.show()
                     }
                     .padding(start = 16.dp, end = 14.dp, top = 18.dp, bottom = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(if (hasSelectedActions) 10.dp else 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                AnimatedVisibility(
-                    visible = hasSelectedActions,
-                    enter = fadeIn(animationSpec = tween(durationMillis = 180, easing = ChatGptMotionEasing)),
-                    exit = fadeOut(animationSpec = tween(durationMillis = 140, easing = ChatGptMotionEasing)),
-                ) {
-                    ComposerActionTray(
-                        modifier = Modifier.fillMaxWidth(),
-                        skills = selectedSkillActions,
-                        mcpServers = selectedMcpActions,
-                        agentModeSelected = agentModeSelected,
-                        onRemoveSkill = { skillId -> onSetSkillSelected(skillId, false) },
-                        onRemoveMcpServer = { serverId -> onSetMcpServerSelected(serverId, false) },
-                        onRemoveAgentMode = { onSetAgentModeSelected(false) },
-                    )
-                }
-
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -2577,8 +2712,8 @@ private fun ChatGptPromptComposerBar(
 
                     Box {
                         ComposerToolsButton(
-                            selected = toolsMenuExpanded || hasSelectedActions,
-                            selectedCount = selectedActionCount,
+                            selected = toolsMenuExpanded || planModeSelected,
+                            planModeSelected = planModeSelected,
                             onClick = {
                                 attachmentMenuExpanded = false
                                 toolsMenuExpanded = !toolsMenuExpanded
@@ -2588,6 +2723,8 @@ private fun ChatGptPromptComposerBar(
                             visibleState = toolsMenuVisibility,
                             agentModeAvailable = agentModeAvailable,
                             agentModeSelected = agentModeSelected,
+                            planModeSelected = planModeSelected,
+                            enabledToolGroups = normalizedToolGroups,
                             allSkillsSelected = allSkillsSelected,
                             allMcpServersSelected = allMcpServersSelected,
                             availableSkills = availableSkills,
@@ -2595,11 +2732,9 @@ private fun ChatGptPromptComposerBar(
                             selectedSkillSet = selectedSkillSet,
                             selectedMcpServerSet = selectedMcpServerSet,
                             onDismiss = { toolsMenuExpanded = false },
-                            onPromptSelected = { prompt ->
-                                toolsMenuExpanded = false
-                                applyPromptSelection(prompt)
-                            },
+                            onSetToolGroupEnabled = onSetToolGroupEnabled,
                             onSetAgentModeSelected = onSetAgentModeSelected,
+                            onSetPlanModeEnabled = onSetPlanModeEnabled,
                             onSetSkillSelected = onSetSkillSelected,
                             onSetMcpServerSelected = onSetMcpServerSelected,
                         )
@@ -2634,7 +2769,7 @@ private fun ChatGptPromptComposerBar(
                                 isSending = isSending,
                                 onClick = {
                                     if (!hasDraft || !canSendDraft) return@ComposerSubmitButton
-                                    if (isSending) followUpMenuExpanded = true else onSend()
+                                    if (isSending) followUpMenuExpanded = true else submitComposerDraft()
                                 },
                             )
                             ComposerFollowUpPopup(
@@ -2652,6 +2787,157 @@ private fun ChatGptPromptComposerBar(
                             )
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+private data class ComposerSlashCommandItem(
+    val id: ComposerSlashCommandId,
+    val name: String,
+    val title: String,
+    val subtitle: String,
+    val icon: ImageVector,
+)
+
+private fun composerSlashCommandItems(language: AppLanguage): List<ComposerSlashCommandItem> {
+    val isChinese = language == AppLanguage.SimplifiedChinese
+    return listOf(
+        ComposerSlashCommandItem(
+            id = ComposerSlashCommandId.Plan,
+            name = "plan",
+            title = if (isChinese) "Plan Mode" else "Plan Mode",
+            subtitle = if (isChinese) "Read-only planning before implementation" else "Read-only planning before implementation",
+            icon = Icons.Rounded.Lightbulb,
+        ),
+        ComposerSlashCommandItem(
+            id = ComposerSlashCommandId.Goal,
+            name = "goal",
+            title = if (isChinese) "Goal" else "Goal",
+            subtitle = if (isChinese) "Set, pause, resume, or clear the thread goal" else "Set, pause, resume, or clear the thread goal",
+            icon = Icons.Rounded.AutoAwesome,
+        ),
+        ComposerSlashCommandItem(
+            id = ComposerSlashCommandId.Status,
+            name = "status",
+            title = if (isChinese) "Status" else "Status",
+            subtitle = if (isChinese) "Show model, tools, modes, and task state" else "Show model, tools, modes, and task state",
+            icon = Icons.Rounded.Search,
+        ),
+        ComposerSlashCommandItem(
+            id = ComposerSlashCommandId.Review,
+            name = "review",
+            title = if (isChinese) "Review" else "Review",
+            subtitle = if (isChinese) "Ask Aether to review current workspace changes" else "Ask Aether to review current workspace changes",
+            icon = Icons.Rounded.Check,
+        ),
+        ComposerSlashCommandItem(
+            id = ComposerSlashCommandId.Model,
+            name = "model",
+            title = if (isChinese) "Model" else "Model",
+            subtitle = if (isChinese) "Switch the current chat model" else "Switch the current chat model",
+            icon = Icons.Rounded.ArrowDropDown,
+        ),
+        ComposerSlashCommandItem(
+            id = ComposerSlashCommandId.Tools,
+            name = "tools",
+            title = if (isChinese) "Tools" else "Tools",
+            subtitle = if (isChinese) "Open tools, Skills, and MCP controls" else "Open tools, Skills, and MCP controls",
+            icon = Icons.Rounded.Tune,
+        ),
+        ComposerSlashCommandItem(
+            id = ComposerSlashCommandId.Permissions,
+            name = "permissions",
+            title = if (isChinese) "Permissions" else "Permissions",
+            subtitle = if (isChinese) "Review read-only and workspace tool access" else "Review read-only and workspace tool access",
+            icon = Icons.Rounded.Terminal,
+        ),
+    )
+}
+
+@Composable
+private fun ComposerSlashCommandPanel(
+    visible: Boolean,
+    commands: List<ComposerSlashCommandItem>,
+    onCommandSelected: (ComposerSlashCommandItem) -> Unit,
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn() + slideInVertically(initialOffsetY = { it / 10 }),
+        exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 10 }),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .shadow(14.dp, RoundedCornerShape(22.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+                .clip(RoundedCornerShape(22.dp))
+                .background(AetherSurface)
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            commands.take(7).forEach { command ->
+                ChatGptToolMenuRow(
+                    title = "/${command.name}  ${command.title}",
+                    subtitle = command.subtitle,
+                    icon = command.icon,
+                    trailing = null,
+                    selected = false,
+                    onClick = { onCommandSelected(command) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ComposerModelCommandPanel(
+    visibleState: MutableTransitionState<Boolean>,
+    modelOptions: List<ProviderModelOption>,
+    selectedModelKey: String,
+    onDismiss: () -> Unit,
+    onModelSelected: (String) -> Unit,
+) {
+    AnimatedVisibility(
+        visibleState = visibleState,
+        enter = fadeIn() +
+            scaleIn(initialScale = 0.96f, transformOrigin = TransformOrigin(0f, 1f)) +
+            slideInVertically(initialOffsetY = { it / 12 }),
+        exit = fadeOut() +
+            scaleOut(targetScale = 0.97f, transformOrigin = TransformOrigin(0f, 1f)) +
+            slideOutVertically(targetOffsetY = { it / 14 }),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .shadow(14.dp, RoundedCornerShape(22.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
+                .clip(RoundedCornerShape(22.dp))
+                .background(AetherSurface)
+                .heightIn(max = 320.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            ComposerToolsSectionLabel(text = "Model")
+            if (modelOptions.isEmpty()) {
+                ChatGptToolMenuRow(
+                    title = "No models available",
+                    icon = Icons.Rounded.Close,
+                    trailing = null,
+                    selected = false,
+                    enabled = false,
+                    onClick = onDismiss,
+                )
+            } else {
+                modelOptions.forEach { option ->
+                    ChatGptToolMenuRow(
+                        title = option.chatLabel,
+                        subtitle = option.providerName,
+                        icon = Icons.Rounded.AutoAwesome,
+                        trailing = if (option.key == selectedModelKey) "On" else null,
+                        selected = option.key == selectedModelKey,
+                        onClick = { onModelSelected(option.key) },
+                    )
                 }
             }
         }
@@ -2684,10 +2970,9 @@ private fun ComposerIconButton(
 @Composable
 private fun ComposerToolsButton(
     selected: Boolean,
-    selectedCount: Int,
+    planModeSelected: Boolean,
     onClick: () -> Unit,
 ) {
-    val strings = rememberAetherStrings()
     Row(
         modifier = Modifier
             .height(38.dp)
@@ -2705,29 +2990,16 @@ private fun ComposerToolsButton(
             modifier = Modifier.size(20.dp),
         )
         Text(
-            text = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "工具" else "Tools",
+            text = composerToolsEntryLabel(planModeSelected),
             style = MaterialTheme.typography.bodyLarge.copy(fontSize = 16.sp, lineHeight = 20.sp),
             color = AetherOnSurface,
             maxLines = 1,
         )
-        if (selectedCount > 0) {
-            Box(
-                modifier = Modifier
-                    .size(20.dp)
-                    .clip(CircleShape)
-                    .background(AetherOnSurface),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = selectedCount.coerceAtMost(9).toString(),
-                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                    color = AetherSurface,
-                    maxLines = 1,
-                )
-            }
-        }
     }
 }
+
+internal fun composerToolsEntryLabel(planModeSelected: Boolean): String =
+    if (planModeSelected) "Plan" else "Auto"
 
 @Composable
 private fun ComposerAttachmentPopup(
@@ -2787,6 +3059,8 @@ private fun ComposerToolsPopup(
     visibleState: MutableTransitionState<Boolean>,
     agentModeAvailable: Boolean,
     agentModeSelected: Boolean,
+    planModeSelected: Boolean,
+    enabledToolGroups: List<String>,
     allSkillsSelected: Boolean,
     allMcpServersSelected: Boolean,
     availableSkills: List<InstalledSkill>,
@@ -2794,14 +3068,36 @@ private fun ComposerToolsPopup(
     selectedSkillSet: Set<String>,
     selectedMcpServerSet: Set<String>,
     onDismiss: () -> Unit,
-    onPromptSelected: (String) -> Unit,
+    onSetToolGroupEnabled: (String, Boolean) -> Unit,
     onSetAgentModeSelected: (Boolean) -> Unit,
+    onSetPlanModeEnabled: (Boolean) -> Unit,
     onSetSkillSelected: (String, Boolean) -> Unit,
     onSetMcpServerSelected: (String, Boolean) -> Unit,
 ) {
     if (!visibleState.currentState && !visibleState.targetState) return
     val strings = rememberAetherStrings()
     val isChinese = strings.appLanguage == AppLanguage.SimplifiedChinese
+    val normalizedToolGroups = remember(enabledToolGroups) { normalizeChatToolGroups(enabledToolGroups) }
+    val enabledGroupSet = remember(normalizedToolGroups) { normalizedToolGroups.toSet() }
+    val extensionsEnabled = enabledGroupSet.contains(ChatToolGroups.Extensions)
+    val activeExtensionSelectionCount = if (extensionsEnabled) {
+        selectedSkillSet.size + selectedMcpServerSet.size
+    } else {
+        0
+    }
+    val activeCapabilityCount = normalizedToolGroups.size +
+        activeExtensionSelectionCount +
+        (if (agentModeSelected) 1 else 0) +
+        (if (planModeSelected) 1 else 0)
+    fun groupEnabled(groupId: String): Boolean = enabledGroupSet.contains(groupId)
+    fun toggleGroup(groupId: String) {
+        onSetToolGroupEnabled(groupId, !groupEnabled(groupId))
+    }
+    fun onOffLabel(enabled: Boolean): String = if (enabled) {
+        if (isChinese) "开启" else "On"
+    } else {
+        if (isChinese) "关闭" else "Off"
+    }
     val density = LocalDensity.current
     Popup(
         alignment = Alignment.BottomStart,
@@ -2810,7 +3106,7 @@ private fun ComposerToolsPopup(
         properties = PopupProperties(
             focusable = false,
             dismissOnBackPress = true,
-            dismissOnClickOutside = false,
+            dismissOnClickOutside = true,
         ),
     ) {
         AnimatedVisibility(
@@ -2833,47 +3129,73 @@ private fun ComposerToolsPopup(
                     .padding(horizontal = 14.dp, vertical = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                ChatGptToolMenuRow(
-                    title = if (isChinese) "生成图片" else "Create an image",
-                    icon = Icons.Rounded.Brush,
-                    onClick = { onPromptSelected(if (isChinese) "生成一张图片，内容是：" else "Create an image of ") },
+                ComposerToolsSummaryCard(
+                    title = if (planModeSelected) "Plan" else "Auto",
+                    subtitle = if (isChinese) {
+                        if (planModeSelected) "只读探索并输出计划" else "按需使用已启用能力"
+                    } else {
+                        if (planModeSelected) "Explore read-only and propose a plan" else "Use enabled capabilities as needed"
+                    },
+                    trailing = if (isChinese) {
+                        "$activeCapabilityCount 项"
+                    } else {
+                        "$activeCapabilityCount on"
+                    },
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                ComposerToolsSectionLabel(
+                    text = if (isChinese) "能力" else "Capabilities",
                 )
                 ChatGptToolMenuRow(
-                    title = if (isChinese) "搜索网页" else "Search the web",
-                    icon = Icons.Rounded.Public,
-                    onClick = { onPromptSelected(if (isChinese) "搜索网页：" else "Search the web for ") },
-                )
-                ChatGptToolMenuRow(
-                    title = if (isChinese) "写作或编程" else "Write or code",
-                    icon = Icons.Rounded.Edit,
-                    onClick = { onPromptSelected(if (isChinese) "帮我写作或编程：" else "Help me write or code ") },
-                )
-                ChatGptToolMenuRow(
-                    title = if (isChinese) "深度研究" else "Run deep research",
-                    icon = Icons.Rounded.TravelExplore,
-                    trailing = if (isChinese) "剩余 5 次" else "5 left",
-                    onClick = { onPromptSelected(if (isChinese) "对这个主题进行深度研究：" else "Run deep research on ") },
-                )
-                ChatGptToolMenuRow(
-                    title = if (isChinese) "深入思考" else "Think for longer",
+                    title = if (isChinese) "计划模式" else "Plan Mode",
                     icon = Icons.Rounded.Lightbulb,
-                    onClick = { onPromptSelected(if (isChinese) "请认真思考这个问题：" else "Think carefully about ") },
+                    trailing = onOffLabel(planModeSelected),
+                    selected = planModeSelected,
+                    onClick = { onSetPlanModeEnabled(!planModeSelected) },
                 )
-                if (agentModeAvailable || availableSkills.isNotEmpty() || availableMcpServers.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                }
-                if (agentModeAvailable) {
-                    ChatGptToolMenuRow(
-                        title = strings.agentMode,
-                        icon = LucideIcons.MousePointer2,
-                        selected = agentModeSelected,
-                        onClick = {
-                            onDismiss()
-                            onSetAgentModeSelected(!agentModeSelected)
-                        },
-                    )
-                }
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "文件与图片" else "Files & Images",
+                    icon = Icons.Rounded.AttachFile,
+                    trailing = onOffLabel(groupEnabled(ChatToolGroups.FilesImages)),
+                    selected = groupEnabled(ChatToolGroups.FilesImages),
+                    onClick = { toggleGroup(ChatToolGroups.FilesImages) },
+                )
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "终端" else "Terminal",
+                    icon = Icons.Rounded.Terminal,
+                    trailing = onOffLabel(groupEnabled(ChatToolGroups.Terminal)),
+                    selected = groupEnabled(ChatToolGroups.Terminal),
+                    onClick = { toggleGroup(ChatToolGroups.Terminal) },
+                )
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "网页" else "Web",
+                    icon = Icons.Rounded.Public,
+                    trailing = onOffLabel(groupEnabled(ChatToolGroups.Web)),
+                    selected = groupEnabled(ChatToolGroups.Web),
+                    onClick = { toggleGroup(ChatToolGroups.Web) },
+                )
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "技能 / MCP" else "Skills / MCP",
+                    icon = Icons.Rounded.Extension,
+                    trailing = onOffLabel(groupEnabled(ChatToolGroups.Extensions)),
+                    selected = groupEnabled(ChatToolGroups.Extensions),
+                    onClick = { toggleGroup(ChatToolGroups.Extensions) },
+                )
+                ChatGptToolMenuRow(
+                    title = strings.agentMode,
+                    icon = LucideIcons.MousePointer2,
+                    trailing = when {
+                        !agentModeAvailable -> if (isChinese) "不可用" else "Unavailable"
+                        agentModeSelected -> onOffLabel(true)
+                        else -> onOffLabel(false)
+                    },
+                    selected = agentModeSelected,
+                    enabled = agentModeAvailable,
+                    onClick = { onSetAgentModeSelected(!agentModeSelected) },
+                )
                 if (availableSkills.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    ComposerToolsSectionLabel(text = "Skills")
                     ChatGptToolMenuRow(
                         title = if (allSkillsSelected) {
                             if (isChinese) "清空技能选择" else "Clear selected skills"
@@ -2881,9 +3203,14 @@ private fun ComposerToolsPopup(
                             if (isChinese) "全选技能" else "Select all skills"
                         },
                         icon = Icons.Rounded.Check,
-                        selected = allSkillsSelected,
+                        trailing = if (!extensionsEnabled) {
+                            if (isChinese) "已暂停" else "Paused"
+                        } else {
+                            null
+                        },
+                        selected = extensionsEnabled && allSkillsSelected,
+                        enabled = extensionsEnabled,
                         onClick = {
-                            onDismiss()
                             availableSkills.forEach { skill -> onSetSkillSelected(skill.id, !allSkillsSelected) }
                         },
                     )
@@ -2893,14 +3220,16 @@ private fun ComposerToolsPopup(
                     ChatGptToolMenuRow(
                         title = skill.quickActionLabel(),
                         icon = Icons.Rounded.Extension,
-                        selected = selected,
+                        selected = extensionsEnabled && selected,
+                        enabled = extensionsEnabled,
                         onClick = {
-                            onDismiss()
                             onSetSkillSelected(skill.id, !selected)
                         },
                     )
                 }
                 if (availableMcpServers.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    ComposerToolsSectionLabel(text = "MCP")
                     ChatGptToolMenuRow(
                         title = if (allMcpServersSelected) {
                             if (isChinese) "清空 MCP 选择" else "Clear selected MCP"
@@ -2908,9 +3237,14 @@ private fun ComposerToolsPopup(
                             if (isChinese) "全选 MCP" else "Select all MCP"
                         },
                         icon = Icons.Rounded.Check,
-                        selected = allMcpServersSelected,
+                        trailing = if (!extensionsEnabled) {
+                            if (isChinese) "已暂停" else "Paused"
+                        } else {
+                            null
+                        },
+                        selected = extensionsEnabled && allMcpServersSelected,
+                        enabled = extensionsEnabled,
                         onClick = {
-                            onDismiss()
                             availableMcpServers.forEach { server -> onSetMcpServerSelected(server.id, !allMcpServersSelected) }
                         },
                     )
@@ -2921,9 +3255,9 @@ private fun ComposerToolsPopup(
                     ChatGptToolMenuRow(
                         title = server.quickActionLabel(),
                         icon = if (isStdIo) Icons.Rounded.Terminal else Icons.Rounded.Cloud,
-                        selected = selected,
+                        selected = extensionsEnabled && selected,
+                        enabled = extensionsEnabled,
                         onClick = {
-                            onDismiss()
                             onSetMcpServerSelected(server.id, !selected)
                         },
                     )
@@ -2934,19 +3268,91 @@ private fun ComposerToolsPopup(
 }
 
 @Composable
-private fun ChatGptToolMenuRow(
+private fun ComposerToolsSummaryCard(
     title: String,
-    icon: ImageVector,
-    onClick: () -> Unit,
-    trailing: String? = null,
-    selected: Boolean = false,
+    subtitle: String,
+    trailing: String,
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(AetherSurfaceHigh)
+            .padding(horizontal = 12.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .clip(CircleShape)
+                .background(AetherSurface),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Tune,
+                contentDescription = null,
+                tint = AetherOnSurface,
+                modifier = Modifier.size(19.dp),
+            )
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                color = AetherOnSurface,
+                maxLines = 1,
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = AetherOnSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Text(
+            text = trailing,
+            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium),
+            color = AetherOnSurfaceVariant,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun ComposerToolsSectionLabel(
+    text: String,
+) {
+    Text(
+        text = text,
+        modifier = Modifier.padding(start = 8.dp, top = 2.dp, bottom = 2.dp),
+        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+        color = AetherOnSurfaceVariant,
+        maxLines = 1,
+    )
+}
+
+@Composable
+private fun ChatGptToolMenuRow(
+    title: String,
+    subtitle: String? = null,
+    icon: ImageVector,
+    onClick: () -> Unit,
+    trailing: String? = null,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+) {
+    val contentAlpha = if (enabled) 1f else 0.42f
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
-            .background(if (selected) AetherSurfaceHigh else Color.Transparent)
-            .clickable(onClick = onClick)
+            .background(if (selected && enabled) AetherSurfaceHigh else Color.Transparent)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 8.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -2954,26 +3360,39 @@ private fun ChatGptToolMenuRow(
         Icon(
             imageVector = icon,
             contentDescription = null,
-            tint = AetherOnSurface,
+            tint = AetherOnSurface.copy(alpha = contentAlpha),
             modifier = Modifier.size(21.dp),
         )
-        Text(
-            text = title,
+        Column(
             modifier = Modifier.weight(1f),
-            style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 22.sp),
-            color = AetherOnSurface,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp, lineHeight = 22.sp),
+                color = AetherOnSurface.copy(alpha = contentAlpha),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (!subtitle.isNullOrBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 12.sp, lineHeight = 16.sp),
+                    color = AetherOnSurfaceVariant.copy(alpha = contentAlpha),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
         if (trailing != null) {
             Text(
                 text = trailing,
                 style = MaterialTheme.typography.bodyMedium,
-                color = AetherOnSurfaceVariant,
+                color = AetherOnSurfaceVariant.copy(alpha = contentAlpha),
                 maxLines = 1,
             )
         }
-        if (selected) {
+        if (selected && enabled) {
             Icon(
                 imageVector = Icons.Rounded.Check,
                 contentDescription = null,
@@ -3670,9 +4089,11 @@ private fun ComposerSubmitButton(
 @Composable
 private fun ComposerActionTray(
     modifier: Modifier = Modifier,
+    enabledToolGroups: List<String> = emptyList(),
     skills: List<InstalledSkill>,
     mcpServers: List<McpServerConfig>,
     agentModeSelected: Boolean,
+    onRemoveToolGroup: (String) -> Unit = {},
     onRemoveSkill: (String) -> Unit,
     onRemoveMcpServer: (String) -> Unit,
     onRemoveAgentMode: () -> Unit,
@@ -3685,6 +4106,13 @@ private fun ComposerActionTray(
             .padding(end = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        enabledToolGroups.forEach { groupId ->
+            ComposerActionChip(
+                label = toolGroupLabel(groupId, strings.appLanguage),
+                icon = toolGroupIcon(groupId),
+                onRemove = { onRemoveToolGroup(groupId) },
+            )
+        }
         if (agentModeSelected) {
             ComposerActionChip(
                 label = strings.agentMode,
@@ -3883,6 +4311,25 @@ private fun formatPendingAgentModeToolLabel(toolInvocation: ChatToolInvocation):
 
 private fun parseJsonObject(rawValue: String): JSONObject? =
     if (rawValue.isBlank()) null else runCatching { JSONObject(rawValue) }.getOrNull()
+
+private fun toolGroupLabel(
+    groupId: String,
+    language: AppLanguage,
+): String = when (groupId) {
+    ChatToolGroups.FilesImages -> if (language == AppLanguage.SimplifiedChinese) "\u6587\u4ef6\u4e0e\u56fe\u7247" else "Files & images"
+    ChatToolGroups.Terminal -> if (language == AppLanguage.SimplifiedChinese) "\u7ec8\u7aef" else "Terminal"
+    ChatToolGroups.Web -> if (language == AppLanguage.SimplifiedChinese) "\u7f51\u9875" else "Web"
+    ChatToolGroups.Extensions -> if (language == AppLanguage.SimplifiedChinese) "\u6280\u80fd / MCP" else "Skills / MCP"
+    else -> groupId
+}
+
+private fun toolGroupIcon(groupId: String): ImageVector = when (groupId) {
+    ChatToolGroups.FilesImages -> Icons.Rounded.AttachFile
+    ChatToolGroups.Terminal -> Icons.Rounded.Terminal
+    ChatToolGroups.Web -> Icons.Rounded.Public
+    ChatToolGroups.Extensions -> Icons.Rounded.Extension
+    else -> Icons.Rounded.AutoAwesome
+}
 
 private fun agentModePreviewBackdropBrush(): Brush = Brush.linearGradient(
     colorStops = arrayOf(

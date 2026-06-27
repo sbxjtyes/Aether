@@ -2,11 +2,18 @@ package com.zhousl.aether.data
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
+import java.util.concurrent.TimeUnit
 
 object LlmApiClient {
+    private val httpClient: OkHttpClient = buildDefaultLlmHttpClient()
+        .newBuilder()
+        .connectTimeout(15_000, TimeUnit.MILLISECONDS)
+        .readTimeout(30_000, TimeUnit.MILLISECONDS)
+        .callTimeout(30_000, TimeUnit.MILLISECONDS)
+        .build()
 
     data class FetchModelsResult(
         val models: List<String>,
@@ -26,7 +33,7 @@ object LlmApiClient {
         }
     }
 
-    private fun fetchOpenAiModels(config: LlmProviderConfig): FetchModelsResult {
+    private suspend fun fetchOpenAiModels(config: LlmProviderConfig): FetchModelsResult {
         val baseUrl = config.baseUrl.trimEnd('/')
         val modelsUrl = when {
             baseUrl.endsWith("/responses") -> baseUrl.replace("/responses", "/models")
@@ -35,40 +42,27 @@ object LlmApiClient {
             else -> "$baseUrl/models"
         }
 
-        val connection = URL(modelsUrl).openConnection() as HttpURLConnection
-        connection.requestMethod = "GET"
-        connection.setRequestProperty("Authorization", "Bearer ${config.apiKey}")
-        connection.setRequestProperty("Content-Type", "application/json")
-        connection.connectTimeout = 15_000
-        connection.readTimeout = 30_000
+        val request = Request.Builder()
+            .url(modelsUrl)
+            .header("User-Agent", config.resolvedUserAgent())
+            .header("Authorization", "Bearer ${config.apiKey}")
+            .header("Content-Type", "application/json")
+            .get()
+            .build()
+        val response = executeModelsRequest(request)
 
-        return try {
-            if (connection.responseCode == 200) {
-                val responseText = connection.inputStream.bufferedReader().readText()
-                val json = JSONObject(responseText)
-                val dataArray = json.optJSONArray("data")
-                val models = mutableListOf<String>()
-                if (dataArray != null) {
-                    for (i in 0 until dataArray.length()) {
-                        val modelObj = dataArray.optJSONObject(i)
-                        val modelId = modelObj?.optString("id")
-                        if (!modelId.isNullOrBlank()) {
-                            models.add(modelId)
-                        }
-                    }
-                }
-                // Sort models: prefer chat/gpt models first
-                models.sortWith(compareBy(
+        return if (response.code == 200) {
+            val models = parseModelIds(response.body)
+            // Sort models: prefer chat/gpt models first
+            val sortedModels = models.sortedWith(
+                compareBy(
                     { if (it.contains("gpt") || it.contains("chat")) 0 else 1 },
-                    { it }
-                ))
-                FetchModelsResult(models)
-            } else {
-                val errorText = connection.errorStream?.bufferedReader()?.readText() ?: "HTTP ${connection.responseCode}"
-                FetchModelsResult(emptyList(), errorText)
-            }
-        } finally {
-            connection.disconnect()
+                    { it },
+                )
+            )
+            FetchModelsResult(sortedModels)
+        } else {
+            FetchModelsResult(emptyList(), response.body.ifBlank { "HTTP ${response.code}" })
         }
     }
 
@@ -90,7 +84,7 @@ object LlmApiClient {
         return FetchModelsResult(defaultModels)
     }
 
-    private fun fetchAnthropicModels(config: LlmProviderConfig): FetchModelsResult {
+    private suspend fun fetchAnthropicModels(config: LlmProviderConfig): FetchModelsResult {
         val baseUrl = config.baseUrl.trimEnd('/')
         val modelsUrl = when {
             baseUrl.endsWith("/messages") -> baseUrl.replace("/messages", "/models")
@@ -98,41 +92,50 @@ object LlmApiClient {
             else -> "$baseUrl/models"
         }
 
-        val connection = URL(modelsUrl).openConnection() as HttpURLConnection
-        connection.requestMethod = "GET"
-        connection.setRequestProperty("x-api-key", config.apiKey)
-        connection.setRequestProperty("anthropic-version", "2023-06-01")
-        connection.setRequestProperty("Content-Type", "application/json")
-        connection.connectTimeout = 15_000
-        connection.readTimeout = 30_000
+        val request = Request.Builder()
+            .url(modelsUrl)
+            .header("User-Agent", config.resolvedUserAgent())
+            .header("x-api-key", config.apiKey)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .get()
+            .build()
+        val response = executeModelsRequest(request)
 
-        return try {
-            if (connection.responseCode == 200) {
-                val responseText = connection.inputStream.bufferedReader().readText()
-                val json = JSONObject(responseText)
-                val dataArray = json.optJSONArray("data")
-                val models = mutableListOf<String>()
-                if (dataArray != null) {
-                    for (i in 0 until dataArray.length()) {
-                        val modelObj = dataArray.optJSONObject(i)
-                        val modelId = modelObj?.optString("id")
-                        if (!modelId.isNullOrBlank()) {
-                            models.add(modelId)
-                        }
-                    }
-                }
-                if (models.isEmpty()) {
-                    FetchModelsResult(defaultAnthropicModels())
-                } else {
-                    FetchModelsResult(models.sorted())
-                }
+        return if (response.code == 200) {
+            val models = parseModelIds(response.body)
+            if (models.isEmpty()) {
+                FetchModelsResult(defaultAnthropicModels())
             } else {
-                val errorText = connection.errorStream?.bufferedReader()?.readText() ?: "HTTP ${connection.responseCode}"
-                FetchModelsResult(defaultAnthropicModels(), errorText)
+                FetchModelsResult(models.sorted())
             }
-        } finally {
-            connection.disconnect()
+        } else {
+            FetchModelsResult(defaultAnthropicModels(), response.body.ifBlank { "HTTP ${response.code}" })
         }
+    }
+
+    private suspend fun executeModelsRequest(request: Request): ModelsHttpResponse =
+        executeLlmCallWithTlsFallback(httpClient, request) { client, candidateRequest ->
+            client.newCall(candidateRequest).execute().use { response ->
+                ModelsHttpResponse(
+                    code = response.code,
+                    body = response.body?.string().orEmpty(),
+                )
+            }
+        }
+
+    private fun parseModelIds(responseText: String): List<String> {
+        val json = JSONObject(responseText)
+        val dataArray = json.optJSONArray("data") ?: return emptyList()
+        val models = mutableListOf<String>()
+        for (i in 0 until dataArray.length()) {
+            val modelObj = dataArray.optJSONObject(i)
+            val modelId = modelObj?.optString("id")
+            if (!modelId.isNullOrBlank()) {
+                models.add(modelId)
+            }
+        }
+        return models
     }
 
     private fun defaultAnthropicModels(): List<String> = listOf(
@@ -140,4 +143,12 @@ object LlmApiClient {
         "claude-sonnet-4-5",
         "claude-haiku-4-5",
     )
+
+    private data class ModelsHttpResponse(
+        val code: Int,
+        val body: String,
+    )
 }
+
+internal fun LlmProviderConfig.resolvedUserAgent(): String =
+    userAgent.toSafeHttpHeaderValue().ifBlank { DefaultLlmUserAgent }

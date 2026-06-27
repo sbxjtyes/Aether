@@ -214,6 +214,8 @@ private fun AetherAppContent(
     val selectedSkillIds = activeSession?.selectedSkillIds ?: uiState.draftSelectedSkillIds
     val selectedMcpServerIds = activeSession?.activeMcpServerIds ?: uiState.draftSelectedMcpServerIds
     val agentModeSelected = activeSession?.agentModeEnabled ?: uiState.draftAgentModeEnabled
+    val enabledToolGroups = activeSession?.enabledToolGroups ?: uiState.draftEnabledToolGroups
+    val planModeSelected = activeSession?.planModeEnabled ?: uiState.draftPlanModeEnabled
     val currentTaskSnapshot = remember(
         activeSession,
         currentSessionExecution,
@@ -464,14 +466,8 @@ private fun AetherAppContent(
             ConversationDrawer(
                 sessions = uiState.sessions,
                 selectedSessionId = uiState.currentSessionId,
-                sessionExecutionStates = executionStates,
-                unviewedCompletedSessionIds = uiState.unviewedCompletedSessionIds,
                 onNewChat = {
                     viewModel.startNewChat()
-                    scope.launch { drawerState.close() }
-                },
-                onInboxSelected = {
-                    viewModel.openInbox()
                     scope.launch { drawerState.close() }
                 },
                 onSessionSelected = { sessionId ->
@@ -484,8 +480,6 @@ private fun AetherAppContent(
                 onUnpinSessions = viewModel::unpinSessions,
                 onArchiveSession = viewModel::archiveSession,
                 onArchiveSessions = viewModel::archiveSessions,
-                onUnarchiveSession = viewModel::unarchiveSession,
-                onUnarchiveSessions = viewModel::unarchiveSessions,
                 onExportSession = { session ->
                     pendingSessionExportId = session.id
                     sessionExportLauncher.launch("${session.title.ifBlank { "aether-session" }}.json")
@@ -617,6 +611,8 @@ private fun AetherAppContent(
                             selectedMcpServerIds = selectedMcpServerIds,
                             agentModeAvailable = uiState.settings.agentModeAuthorizationEnabled,
                             agentModeSelected = agentModeSelected,
+                            enabledToolGroups = enabledToolGroups,
+                            planModeSelected = planModeSelected,
                             agentModeDisplayState = uiState.agentModeDisplayState,
                             allowRootImageRead = uiState.rootSetupState.isReady ||
                                 (
@@ -664,6 +660,9 @@ private fun AetherAppContent(
                             onSetSkillSelected = viewModel::setComposerSkillSelected,
                             onSetMcpServerSelected = viewModel::setComposerMcpServerSelected,
                             onSetAgentModeSelected = viewModel::setComposerAgentModeSelected,
+                            onSetToolGroupEnabled = viewModel::setComposerToolGroupEnabled,
+                            onSetPlanModeEnabled = viewModel::setComposerPlanModeEnabled,
+                            onSlashCommand = viewModel::handleComposerSlashCommand,
                             onCancelEdit = viewModel::cancelMessageEdit,
                             onSend = viewModel::sendCurrentMessage,
                             onQueueFollowUp = viewModel::queueCurrentMessage,
@@ -1161,6 +1160,7 @@ private fun buildConversationModelOptions(
             apiKey = settings.apiKey,
             baseUrl = settings.baseUrl,
             modelId = settings.modelId,
+            userAgent = settings.userAgent,
             basicFunctionCallingCompatibilityMode = settings.basicFunctionCallingCompatibilityMode,
             fullLabel = "${settings.provider.storageValue}/${settings.modelId}",
             chatLabel = settings.modelId,

@@ -155,6 +155,7 @@ data class AppSettings(
     val modelId: String = LlmProvider.OpenAiCompatible.defaultModelId,
     val systemPrompt: String = DefaultSystemPrompt,
     val tavilyApiKey: String = "",
+    val userAgent: String = "",
     val llmInactivityReconnectTimeoutSeconds: Int = DefaultLlmInactivityReconnectTimeoutSeconds,
     val keepTasksRunningInBackground: Boolean = true,
     val notifyOnTaskCompletion: Boolean = true,
@@ -305,6 +306,7 @@ data class LlmProviderConfig(
     val apiKey: String,
     val baseUrl: String,
     val modelId: String,
+    val userAgent: String = "",
     val cachedModels: List<String> = listOf(modelId),
     val enabledModelIds: List<String> = cachedModels,
     val isEnabled: Boolean = true,
@@ -321,6 +323,7 @@ internal fun LlmProviderConfig.toJson(): JSONObject = JSONObject().apply {
     put("apiKey", apiKey)
     put("baseUrl", baseUrl)
     put("modelId", modelId)
+    put("userAgent", userAgent)
     put("cachedModels", JSONArray().apply { cachedModels.forEach(::put) })
     put("enabledModelIds", JSONArray().apply { enabledModelIds.forEach(::put) })
     put("isEnabled", isEnabled)
@@ -363,6 +366,7 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
                         apiKey = json.optString("apiKey"),
                         baseUrl = baseUrl,
                         modelId = modelId,
+                        userAgent = json.optString("userAgent"),
                         cachedModels = cachedModels,
                         enabledModelIds = if (json.has("enabledModelIds")) {
                             normalizeStringList(enabledModelIds.filter(cachedModels::contains))
@@ -439,6 +443,7 @@ data class ProviderModelOption(
     val apiKey: String,
     val baseUrl: String,
     val modelId: String,
+    val userAgent: String,
     val basicFunctionCallingCompatibilityMode: Boolean,
     val fullLabel: String,
     val chatLabel: String,
@@ -480,6 +485,7 @@ fun List<LlmProviderConfig>.availableModelOptions(
                 apiKey = config.apiKey,
                 baseUrl = config.baseUrl.trim(),
                 modelId = normalizedModelId,
+                userAgent = config.userAgent.trim(),
                 basicFunctionCallingCompatibilityMode = config.basicFunctionCallingCompatibilityMode,
                 fullLabel = fullLabel,
                 chatLabel = if ((modelCounts[normalizedModelId] ?: 0) > 1) fullLabel else normalizedModelId,
@@ -493,6 +499,7 @@ fun AppSettings.withModelOption(option: ProviderModelOption): AppSettings = copy
     apiKey = option.apiKey.trim(),
     baseUrl = option.baseUrl.trim(),
     modelId = option.modelId.trim(),
+    userAgent = option.userAgent.trim(),
     basicFunctionCallingCompatibilityMode = option.basicFunctionCallingCompatibilityMode,
 )
 

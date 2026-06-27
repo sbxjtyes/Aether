@@ -1,4 +1,4 @@
-package com.zhousl.aether.ui
+﻿package com.zhousl.aether.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -99,7 +99,6 @@ internal enum class TaskCollectionScope {
 internal enum class TaskWorkbenchSortMode {
     NeedsAttention,
     RecentActivity,
-    LastOpened,
 }
 
 internal data class TaskSearchMatch(
@@ -144,6 +143,8 @@ private data class TaskWorkbenchSection(
     val overflowCount: Int = 0,
 )
 
+private val TaskWorkbenchChipHeight = 36.dp
+
 private fun taskWorkbenchSortComparator(
     sortMode: TaskWorkbenchSortMode,
 ): Comparator<TaskWorkbenchSnapshot> = when (sortMode) {
@@ -159,11 +160,6 @@ private fun taskWorkbenchSortComparator(
         .thenByDescending { it.lastOpenedAtMillis }
         .thenBy { it.session.title.lowercase() }
 
-    TaskWorkbenchSortMode.LastOpened -> compareBy<TaskWorkbenchSnapshot> { !it.isPinned }
-        .thenByDescending { it.lastOpenedAtMillis }
-        .thenByDescending { it.lastActivityAtMillis }
-        .thenBy { it.priority }
-        .thenBy { it.session.title.lowercase() }
 }
 
 internal fun sortTaskWorkbenchSnapshots(
@@ -202,12 +198,6 @@ internal fun sortSessionsForWorkbench(
                     else -> left.title.lowercase().compareTo(right.title.lowercase())
                 }
 
-                TaskWorkbenchSortMode.LastOpened -> when {
-                    openedOf(left) != openedOf(right) -> openedOf(right).compareTo(openedOf(left))
-                    activityOf(left) != activityOf(right) -> activityOf(right).compareTo(activityOf(left))
-                    priorityOf(left) != priorityOf(right) -> priorityOf(left).compareTo(priorityOf(right))
-                    else -> left.title.lowercase().compareTo(right.title.lowercase())
-                }
             }
         }
 )
@@ -246,6 +236,42 @@ internal fun filterTaskWorkbenchSnapshots(
         (query.isBlank() || searchMatches.containsKey(task.session.id))
 }
 
+internal data class TaskWorkbenchFilteredState(
+    val allTasks: List<TaskWorkbenchSnapshot>,
+    val selectedFilter: TaskWorkbenchFilter,
+    val query: String,
+    val searchMatches: Map<String, TaskSearchMatch>,
+    val filteredTasks: List<TaskWorkbenchSnapshot>,
+) {
+    val attentionCount: Int
+        get() = allTasks.count {
+            it.effectiveStatus == AgentTaskStatus.WaitingForUser ||
+                it.effectiveStatus == AgentTaskStatus.Blocked
+        }
+    val activeCount: Int
+        get() = allTasks.count { it.effectiveStatus == AgentTaskStatus.InProgress }
+    val completedCount: Int
+        get() = allTasks.count { it.effectiveStatus == AgentTaskStatus.Completed }
+}
+
+internal fun buildTaskWorkbenchFilteredState(
+    tasks: List<TaskWorkbenchSnapshot>,
+    selectedFilter: TaskWorkbenchFilter,
+    query: String,
+    searchMatches: Map<String, TaskSearchMatch>,
+): TaskWorkbenchFilteredState = TaskWorkbenchFilteredState(
+    allTasks = tasks,
+    selectedFilter = selectedFilter,
+    query = query,
+    searchMatches = searchMatches,
+    filteredTasks = filterTaskWorkbenchSnapshots(
+        tasks = tasks,
+        selectedFilter = selectedFilter,
+        query = query,
+        searchMatches = searchMatches,
+    ),
+)
+
 internal fun filterSessionsByScope(
     sessions: List<ChatSession>,
     scope: TaskCollectionScope,
@@ -255,6 +281,17 @@ internal fun filterSessionsByScope(
         TaskCollectionScope.Archived -> session.isArchived
     }
 }
+
+internal data class TaskWorkbenchNavigationState(
+    val scope: TaskCollectionScope,
+    val filter: TaskWorkbenchFilter,
+)
+
+internal fun taskWorkbenchDefaultNavigationStateAfterArchiveChange(): TaskWorkbenchNavigationState =
+    TaskWorkbenchNavigationState(
+        scope = TaskCollectionScope.Active,
+        filter = TaskWorkbenchFilter.All,
+    )
 
 private fun buildTaskWorkbenchSections(
     tasks: List<TaskWorkbenchSnapshot>,
@@ -416,12 +453,12 @@ internal fun taskWorkbenchEmptyStateText(
     if (query.isNotBlank()) {
         return if (hasAnySessions) {
             if (language == AppLanguage.SimplifiedChinese) {
-                "\u6ca1\u6709\u5339\u914d\u201c$query\u201d\u7684\u5bf9\u8bdd\u6216\u4efb\u52a1"
+                "\u6ca1\u6709\u5339\u914d\u201c$query\u201d\u7684\u4efb\u52a1"
             } else {
-                "No chats or tasks match \"$query\"."
+                "No tasks match \"$query\"."
             }
         } else {
-            if (language == AppLanguage.SimplifiedChinese) "\u8fd8\u6ca1\u6709\u5bf9\u8bdd" else "No conversations yet."
+            if (language == AppLanguage.SimplifiedChinese) "\u8fd8\u6ca1\u6709\u4efb\u52a1" else "No tasks yet."
         }
     }
 
@@ -462,8 +499,7 @@ internal fun taskWorkbenchEmptyStateText(
 
 @Composable
 internal fun TaskWorkbenchPanel(
-    tasks: List<TaskWorkbenchSnapshot>,
-    selectedFilter: TaskWorkbenchFilter,
+    filteredState: TaskWorkbenchFilteredState,
     selectedScope: TaskCollectionScope,
     selectedSortMode: TaskWorkbenchSortMode,
     selectedSessionId: String?,
@@ -471,40 +507,23 @@ internal fun TaskWorkbenchPanel(
     onScopeSelected: (TaskCollectionScope) -> Unit,
     onSortModeSelected: (TaskWorkbenchSortMode) -> Unit,
     onTaskClick: (String) -> Unit,
-    onTaskDetailClick: ((String) -> Unit)? = null,
     modifier: Modifier = Modifier,
     maxVisibleTasks: Int? = null,
-    query: String = "",
-    hasAnySessions: Boolean = tasks.isNotEmpty(),
-    searchMatches: Map<String, TaskSearchMatch> = emptyMap(),
+    showCompactTaskPreview: Boolean = false,
+    hasAnySessions: Boolean = filteredState.allTasks.isNotEmpty(),
 ) {
     val language = rememberAetherStrings().appLanguage
-    val filteredTasks = remember(tasks, selectedFilter, query, searchMatches) {
-        filterTaskWorkbenchSnapshots(
-            tasks = tasks,
-            selectedFilter = selectedFilter,
-            query = query,
-            searchMatches = searchMatches,
-        )
-    }
+    val tasks = filteredState.allTasks
+    val selectedFilter = filteredState.selectedFilter
+    val query = filteredState.query
+    val searchMatches = filteredState.searchMatches
+    val filteredTasks = filteredState.filteredTasks
     val visibleTasks = remember(filteredTasks, maxVisibleTasks) {
         if (maxVisibleTasks == null) filteredTasks else filteredTasks.take(maxVisibleTasks)
     }
-    val attentionCount = remember(tasks) {
-        tasks.count {
-            it.effectiveStatus == AgentTaskStatus.WaitingForUser ||
-                it.effectiveStatus == AgentTaskStatus.Blocked
-        }
-    }
-    val activeCount = remember(tasks) {
-        tasks.count {
-            it.effectiveStatus == AgentTaskStatus.InProgress ||
-                it.effectiveStatus == AgentTaskStatus.Idle
-        }
-    }
-    val completedCount = remember(tasks) {
-        tasks.count { it.effectiveStatus == AgentTaskStatus.Completed }
-    }
+    val attentionCount = filteredState.attentionCount
+    val activeCount = filteredState.activeCount
+    val completedCount = filteredState.completedCount
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -523,9 +542,9 @@ internal fun TaskWorkbenchPanel(
             Text(
                 text = if (query.isBlank()) {
                     if (language == AppLanguage.SimplifiedChinese) {
-                        "${tasks.size} \u4e2a\u7ebf\u7a0b"
+                        "${tasks.size} \u4e2a\u4efb\u52a1"
                     } else {
-                        "${tasks.size} threads"
+                        "${tasks.size} tasks"
                     }
                 } else {
                     if (language == AppLanguage.SimplifiedChinese) {
@@ -539,38 +558,54 @@ internal fun TaskWorkbenchPanel(
             )
         }
 
-        LazyRow(
-            contentPadding = PaddingValues(end = 2.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        TaskWorkbenchControlRow(
+            label = if (language == AppLanguage.SimplifiedChinese) "\u8303\u56f4" else "Scope",
         ) {
-            item(key = "scope-switcher") {
-                TaskCollectionScopeSwitcher(
-                    selectedScope = selectedScope,
-                    language = language,
-                    onScopeSelected = onScopeSelected,
-                )
+            TaskCollectionScopeSwitcher(
+                selectedScope = selectedScope,
+                language = language,
+                onScopeSelected = onScopeSelected,
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TaskWorkbenchControlLabel(
+                text = if (language == AppLanguage.SimplifiedChinese) "\u72b6\u6001" else "Status",
+            )
+            LazyRow(
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(end = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(TaskWorkbenchFilter.entries, key = { it.name }) { filter ->
+                    TaskWorkbenchFilterChip(
+                        filter = filter,
+                        selected = selectedFilter == filter,
+                        count = when (filter) {
+                            TaskWorkbenchFilter.All -> tasks.size
+                            TaskWorkbenchFilter.NeedsYou -> attentionCount
+                            TaskWorkbenchFilter.Active -> activeCount
+                            TaskWorkbenchFilter.Done -> completedCount
+                        },
+                        language = language,
+                        onClick = { onFilterSelected(filter) },
+                    )
+                }
             }
-            item(key = "sort-switcher") {
-                TaskWorkbenchSortSwitcher(
-                    selectedSortMode = selectedSortMode,
-                    language = language,
-                    onSortModeSelected = onSortModeSelected,
-                )
-            }
-            items(TaskWorkbenchFilter.entries, key = { it.name }) { filter ->
-                TaskWorkbenchFilterChip(
-                    filter = filter,
-                    selected = selectedFilter == filter,
-                    count = when (filter) {
-                        TaskWorkbenchFilter.All -> tasks.size
-                        TaskWorkbenchFilter.NeedsYou -> attentionCount
-                        TaskWorkbenchFilter.Active -> activeCount
-                        TaskWorkbenchFilter.Done -> completedCount
-                    },
-                    language = language,
-                    onClick = { onFilterSelected(filter) },
-                )
-            }
+        }
+
+        TaskWorkbenchControlRow(
+            label = if (language == AppLanguage.SimplifiedChinese) "\u6392\u5e8f" else "Sort",
+        ) {
+            TaskWorkbenchSortSwitcher(
+                selectedSortMode = selectedSortMode,
+                language = language,
+                onSortModeSelected = onSortModeSelected,
+            )
         }
 
         Row(
@@ -600,7 +635,25 @@ internal fun TaskWorkbenchPanel(
             }
         }
 
-        if (visibleTasks.isEmpty()) {
+        if (!showCompactTaskPreview) {
+            Text(
+                text = if (query.isBlank()) {
+                    if (language == AppLanguage.SimplifiedChinese) {
+                        "${filteredTasks.size} \u4e2a\u7b5b\u9009\u7ed3\u679c"
+                    } else {
+                        "${filteredTasks.size} filtered tasks"
+                    }
+                } else {
+                    if (language == AppLanguage.SimplifiedChinese) {
+                        "${filteredTasks.size} \u4e2a\u641c\u7d22\u7ed3\u679c"
+                    } else {
+                        "${filteredTasks.size} search results"
+                    }
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = AetherOnSurfaceVariant,
+            )
+        } else if (visibleTasks.isEmpty()) {
             Text(
                 text = taskWorkbenchEmptyStateText(
                     language = language,
@@ -619,14 +672,11 @@ internal fun TaskWorkbenchPanel(
                     selected = task.session.id == selectedSessionId,
                     supportingOverride = searchMatches[task.session.id]?.snippet,
                     onClick = { onTaskClick(task.session.id) },
-                    onDetailClick = onTaskDetailClick?.let { callback ->
-                        { callback(task.session.id) }
-                    },
                 )
             }
         }
 
-        if (maxVisibleTasks != null && filteredTasks.size > visibleTasks.size) {
+        if (showCompactTaskPreview && maxVisibleTasks != null && filteredTasks.size > visibleTasks.size) {
             Text(
                 text = if (language == AppLanguage.SimplifiedChinese) {
                     "+${filteredTasks.size - visibleTasks.size} \u4e2a\u66f4\u591a\u4efb\u52a1"
@@ -641,6 +691,31 @@ internal fun TaskWorkbenchPanel(
 }
 
 @Composable
+private fun TaskWorkbenchControlRow(
+    label: String,
+    content: @Composable () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        TaskWorkbenchControlLabel(text = label)
+        content()
+    }
+}
+
+@Composable
+private fun TaskWorkbenchControlLabel(text: String) {
+    Text(
+        text = text,
+        modifier = Modifier.widthIn(min = 34.dp),
+        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+        color = AetherOnSurfaceVariant,
+        maxLines = 1,
+    )
+}
+@Composable
 private fun TaskCollectionScopeSwitcher(
     selectedScope: TaskCollectionScope,
     language: AppLanguage,
@@ -649,8 +724,7 @@ private fun TaskCollectionScopeSwitcher(
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
-            .background(AetherSurface.copy(alpha = 0.94f))
-            .padding(4.dp),
+            .background(AetherSurface.copy(alpha = 0.94f)),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -662,6 +736,7 @@ private fun TaskCollectionScopeSwitcher(
                     TaskCollectionScope.Archived -> if (language == AppLanguage.SimplifiedChinese) "\u5f52\u6863" else "Archived"
                 },
                 modifier = Modifier
+                    .height(TaskWorkbenchChipHeight)
                     .clip(RoundedCornerShape(999.dp))
                     .background(
                         if (selected) AetherPrimary.copy(alpha = 0.14f) else Color.Transparent
@@ -685,8 +760,7 @@ private fun TaskWorkbenchSortSwitcher(
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
-            .background(AetherSurface.copy(alpha = 0.94f))
-            .padding(4.dp),
+            .background(AetherSurface.copy(alpha = 0.94f)),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -698,10 +772,10 @@ private fun TaskWorkbenchSortSwitcher(
                         if (language == AppLanguage.SimplifiedChinese) "\u4f18\u5148" else "Focus"
                     TaskWorkbenchSortMode.RecentActivity ->
                         if (language == AppLanguage.SimplifiedChinese) "\u6700\u65b0\u52a8\u6001" else "Recent"
-                    TaskWorkbenchSortMode.LastOpened ->
-                        if (language == AppLanguage.SimplifiedChinese) "\u6700\u8fd1\u6253\u5f00" else "Opened"
+
                 },
                 modifier = Modifier
+                    .height(TaskWorkbenchChipHeight)
                     .clip(RoundedCornerShape(999.dp))
                     .background(
                         if (selected) AetherPrimary.copy(alpha = 0.14f) else Color.Transparent
@@ -863,29 +937,20 @@ internal fun TaskInboxScreen(
             }.associateBy { it.session.id }
         }
     }
-    val filteredTasks = remember(taskSnapshots, selectedFilter, searchQuery, searchMatches) {
-        filterTaskWorkbenchSnapshots(
+    val filteredState = remember(taskSnapshots, selectedFilter, searchQuery, searchMatches) {
+        buildTaskWorkbenchFilteredState(
             tasks = taskSnapshots,
             selectedFilter = selectedFilter,
             query = searchQuery,
             searchMatches = searchMatches,
         )
     }
+    val filteredTasks = filteredState.filteredTasks
     val detailTask = remember(detailSessionId, taskSnapshots) {
         taskSnapshots.firstOrNull { it.session.id == detailSessionId }
     }
     val detailSession = remember(detailSessionId, sessions) {
         sessions.firstOrNull { it.id == detailSessionId }
-    }
-    val spotlightTask = remember(filteredTasks) { filteredTasks.firstOrNull() }
-    val groupedSections = remember(taskSnapshots, selectedFilter, searchQuery, searchMatches, strings.appLanguage) {
-        buildTaskWorkbenchSections(
-            tasks = taskSnapshots,
-            selectedFilter = selectedFilter,
-            query = searchQuery,
-            searchMatches = searchMatches,
-            language = strings.appLanguage,
-        )
     }
     val selectableTaskIds = remember(visibleSessions) { visibleSessions.map { it.id }.toSet() }
     LaunchedEffect(selectableTaskIds) {
@@ -895,6 +960,14 @@ internal fun TaskInboxScreen(
     val shouldPinSelection = remember(selectedTaskIds, visibleSessions, selectedScope) {
         selectedScope == TaskCollectionScope.Active &&
             selectedTaskIds.any { id -> visibleSessions.firstOrNull { it.id == id }?.isPinned != true }
+    }
+
+    fun resetTaskWorkbenchNavigationAfterArchiveChange() {
+        val defaultState = taskWorkbenchDefaultNavigationStateAfterArchiveChange()
+        selectedScopeName = defaultState.scope.name
+        selectedFilterName = defaultState.filter.name
+        selectedTaskIds = emptySet()
+        searchQuery = ""
     }
 
     BackHandler { onBack() }
@@ -932,8 +1005,12 @@ internal fun TaskInboxScreen(
             onToggleArchived = {
                 detailSessionId = null
                 if (session.isArchived) onRestoreTasks(setOf(session.id)) else onArchiveTasks(setOf(session.id))
+                resetTaskWorkbenchNavigationAfterArchiveChange()
             },
-            onExport = { onExportTask(session) },
+            onExport = {
+                detailSessionId = null
+                onExportTask(session)
+            },
             onDelete = {
                 detailSessionId = null
                 pendingDeleteTaskIds = setOf(session.id)
@@ -1037,12 +1114,12 @@ internal fun TaskInboxScreen(
                                 tint = if (selectedScope == TaskCollectionScope.Active) Color(0xFF6D28D9) else AetherPrimary,
                                 onClick = {
                                     val ids = selectedTaskIds
-                                    selectedTaskIds = emptySet()
                                     if (selectedScope == TaskCollectionScope.Active) {
                                         onArchiveTasks(ids)
                                     } else {
                                         onRestoreTasks(ids)
                                     }
+                                    resetTaskWorkbenchNavigationAfterArchiveChange()
                                 },
                             )
                             InboxSelectionActionPill(
@@ -1084,26 +1161,17 @@ internal fun TaskInboxScreen(
                     verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
                     TaskWorkbenchPanel(
-                        tasks = taskSnapshots,
-                        selectedFilter = selectedFilter,
+                        filteredState = filteredState,
                         selectedScope = selectedScope,
                         selectedSortMode = selectedSortMode,
                         selectedSessionId = if (isSelectionMode) null else selectedSessionId,
                         onFilterSelected = { filter ->
-                            selectedFilterName =
-                                if (selectedFilter == filter) TaskWorkbenchFilter.All.name else filter.name
+                            selectedFilterName = filter.name
                         },
                         onScopeSelected = { scope -> selectedScopeName = scope.name },
                         onSortModeSelected = { sortMode -> selectedSortModeName = sortMode.name },
                         onTaskClick = onTaskSelected,
-                        onTaskDetailClick = if (isSelectionMode) {
-                            null
-                        } else {
-                            { sessionId -> detailSessionId = sessionId }
-                        },
-                        query = searchQuery,
                         hasAnySessions = visibleSessions.isNotEmpty(),
-                        searchMatches = searchMatches,
                     )
 
                     LazyColumn(
@@ -1113,61 +1181,42 @@ internal fun TaskInboxScreen(
                         contentPadding = PaddingValues(bottom = 18.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
                     ) {
-                        spotlightTask?.let { task ->
-                            item(key = "spotlight") {
-                                TaskWorkbenchSpotlightCard(
-                                    task = task,
-                                    language = strings.appLanguage,
-                                    onClick = {
-                                        if (isSelectionMode) {
-                                            selectedTaskIds = selectedTaskIds.toggleSelectedTaskId(task.session.id)
-                                        } else {
-                                            onTaskSelected(task.session.id)
-                                        }
-                                    },
-                                    onLongClick = {
-                                        if (isSelectionMode) {
-                                            selectedTaskIds = selectedTaskIds + task.session.id
-                                        } else {
-                                            detailSessionId = task.session.id
-                                        }
-                                    },
-                                    onDetailClick = if (isSelectionMode) {
-                                        null
-                                    } else {
-                                        { detailSessionId = task.session.id }
-                                    },
+                        if (filteredTasks.isEmpty()) {
+                            item(key = "empty") {
+                                Text(
+                                    text = taskWorkbenchEmptyStateText(
+                                        language = strings.appLanguage,
+                                        filter = selectedFilter,
+                                        query = searchQuery,
+                                        hasAnySessions = visibleSessions.isNotEmpty(),
+                                        scope = selectedScope,
+                                    ),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = AetherOnSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
                                 )
                             }
                         }
-                        items(groupedSections, key = { it.key }) { section ->
-                            TaskWorkbenchSectionCard(
-                                section = section,
-                                selectedSessionId = if (isSelectionMode) null else selectedSessionId,
+                        items(filteredTasks, key = { it.session.id }) { task ->
+                            TaskWorkbenchCard(
+                                task = task,
+                                selected = !isSelectionMode && task.session.id == selectedSessionId,
                                 selectionMode = isSelectionMode,
-                                selectedTaskIds = selectedTaskIds,
-                                searchMatches = searchMatches,
-                                onSectionSelected = { filter ->
-                                    selectedFilterName = filter.name
-                                },
-                                onTaskSelected = { sessionId ->
+                                checked = selectedTaskIds.contains(task.session.id),
+                                supportingOverride = searchMatches[task.session.id]?.snippet,
+                                onClick = {
                                     if (isSelectionMode) {
-                                        selectedTaskIds = selectedTaskIds.toggleSelectedTaskId(sessionId)
+                                        selectedTaskIds = selectedTaskIds.toggleSelectedTaskId(task.session.id)
                                     } else {
-                                        onTaskSelected(sessionId)
+                                        onTaskSelected(task.session.id)
                                     }
                                 },
-                                onTaskLongPress = { sessionId ->
+                                onLongClick = {
                                     if (isSelectionMode) {
-                                        selectedTaskIds = selectedTaskIds + sessionId
+                                        selectedTaskIds = selectedTaskIds + task.session.id
                                     } else {
-                                        detailSessionId = sessionId
+                                        detailSessionId = task.session.id
                                     }
-                                },
-                                onTaskDetailClick = if (isSelectionMode) {
-                                    null
-                                } else {
-                                    { sessionId -> detailSessionId = sessionId }
                                 },
                             )
                         }
@@ -1187,6 +1236,7 @@ private fun InboxSelectionActionPill(
     Text(
         text = label,
         modifier = Modifier
+            .height(TaskWorkbenchChipHeight)
             .clip(RoundedCornerShape(999.dp))
             .background(tint.copy(alpha = 0.14f))
             .clickable(onClick = onClick)
@@ -1272,6 +1322,7 @@ private fun TaskWorkbenchFilterChip(
     }
     Row(
         modifier = Modifier
+            .height(TaskWorkbenchChipHeight)
             .clip(RoundedCornerShape(999.dp))
             .background(if (selected) tint.copy(alpha = 0.16f) else AetherSurface.copy(alpha = 0.94f))
             .clickable(onClick = onClick)
@@ -1346,26 +1397,6 @@ private fun TaskWorkbenchMetaPill(
     )
 }
 
-@Composable
-private fun TaskWorkbenchActionPill(
-    label: String,
-    tint: Color,
-    onClick: () -> Unit,
-) {
-    Text(
-        text = label,
-        modifier = Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(tint.copy(alpha = 0.12f))
-            .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 7.dp),
-        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
-        color = tint,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
-    )
-}
-
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun TaskWorkbenchSpotlightCard(
@@ -1373,22 +1404,13 @@ private fun TaskWorkbenchSpotlightCard(
     language: AppLanguage,
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
-    onDetailClick: (() -> Unit)? = null,
 ) {
     val accent = taskWorkbenchStatusAccent(task.effectiveStatus)
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .shadow(14.dp, RoundedCornerShape(28.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
             .clip(RoundedCornerShape(28.dp))
-            .background(
-                Brush.linearGradient(
-                    colors = listOf(
-                        accent.copy(alpha = 0.18f),
-                        AetherSurface.copy(alpha = 0.98f),
-                    )
-                )
-            )
+            .background(accent.copy(alpha = 0.10f))
             .combinedClickable(
                 onClick = onClick,
                 onLongClick = onLongClick,
@@ -1459,18 +1481,6 @@ private fun TaskWorkbenchSpotlightCard(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        onDetailClick?.let { showDetails ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-            ) {
-                TaskWorkbenchActionPill(
-                    label = if (language == AppLanguage.SimplifiedChinese) "\u8be6\u60c5" else "Details",
-                    tint = accent,
-                    onClick = showDetails,
-                )
-            }
-        }
     }
 }
 
@@ -1489,9 +1499,8 @@ private fun TaskWorkbenchSectionCard(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .shadow(10.dp, RoundedCornerShape(24.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
             .clip(RoundedCornerShape(24.dp))
-            .background(AetherSurface.copy(alpha = 0.96f))
+            .background(AetherSurfaceHigh.copy(alpha = 0.62f))
             .padding(horizontal = 14.dp, vertical = 14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
@@ -1540,11 +1549,6 @@ private fun TaskWorkbenchSectionCard(
                     supportingOverride = searchMatches[task.session.id]?.snippet,
                     onClick = { onTaskSelected(task.session.id) },
                     onLongClick = { onTaskLongPress(task.session.id) },
-                    onDetailClick = if (selectionMode) {
-                        null
-                    } else {
-                        onTaskDetailClick?.let { callback -> { callback(task.session.id) } }
-                    },
                 )
             }
         }
@@ -1568,7 +1572,6 @@ internal fun TaskWorkbenchCard(
     checked: Boolean = false,
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
-    onDetailClick: (() -> Unit)? = null,
     supportingOverride: String? = null,
 ) {
     val language = rememberAetherStrings().appLanguage
@@ -1576,11 +1579,7 @@ internal fun TaskWorkbenchCard(
     val primarySupporting = supportingOverride?.takeIf { it.isNotBlank() }
         ?: task.body.takeIf { it.isNotBlank() && it != task.headline }
     val secondarySupporting = if (supportingOverride.isNullOrBlank()) {
-        task.activityDetail.takeIf {
-            it.isNotBlank() &&
-                it != task.body &&
-                it != task.headline
-        }
+        null
     } else {
         task.activityDetail.takeIf {
             it.isNotBlank() &&
@@ -1603,9 +1602,8 @@ internal fun TaskWorkbenchCard(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .shadow(12.dp, RoundedCornerShape(22.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
-            .clip(RoundedCornerShape(22.dp))
-            .background(if (selected) AetherSurfaceHigh else AetherSurface.copy(alpha = 0.96f))
+            .clip(RoundedCornerShape(18.dp))
+            .background(if (selected) AetherSurfaceHigh else AetherSurface.copy(alpha = 0.72f))
             .combinedClickable(
                 onClick = onClick,
                 onLongClick = onLongClick,
@@ -1719,19 +1717,6 @@ internal fun TaskWorkbenchCard(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-
-            if (!selectionMode && onDetailClick != null) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                ) {
-                    TaskWorkbenchActionPill(
-                        label = if (language == AppLanguage.SimplifiedChinese) "\u8be6\u60c5" else "Details",
-                        tint = accent,
-                        onClick = onDetailClick,
-                    )
-                }
-            }
         }
     }
 }
@@ -1743,11 +1728,15 @@ internal fun ChatSession.toTaskWorkbenchSnapshot(
 ): TaskWorkbenchSnapshot? {
     val hasPendingInputs = executionState?.pendingInputs?.isNotEmpty() == true
     val isRunning = executionState?.isRunning == true
+    val hasTaskState = !taskState.isEmpty
+    val hasTaskSignal = hasTaskState || isRunning || hasPendingInputs || isUnviewedComplete
+    if (!hasTaskSignal) return null
 
     val effectiveStatus = when {
         isRunning -> AgentTaskStatus.InProgress
         taskState.status != AgentTaskStatus.Idle -> taskState.status
         hasPendingInputs -> AgentTaskStatus.WaitingForUser
+        isUnviewedComplete -> AgentTaskStatus.Completed
         else -> AgentTaskStatus.Idle
     }
     val conversationLabel = title.ifBlank {

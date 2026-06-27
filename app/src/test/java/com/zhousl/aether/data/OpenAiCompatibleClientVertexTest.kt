@@ -99,6 +99,7 @@ class OpenAiCompatibleClientVertexTest {
             assertEquals("ok", result.assistantText)
 
             val request = server.takeRequest()
+            assertEquals(DefaultLlmUserAgent, request.getHeader("User-Agent"))
             val payload = JSONObject(request.body.readUtf8())
             val contents = payload.getJSONArray("contents")
             val functionCall = contents

@@ -479,6 +479,54 @@ class OpenAiCompatibleClientStreamingTest {
     }
 
     @Test
+    fun streamOpenAiResponsesIncludesCompletedImageGenerationOutput() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody(
+                    """
+                    data: {"type":"response.output_text.delta","delta":"Done."}
+
+                    data: {"type":"response.output_item.done","output_index":1,"item":{"type":"image_generation_call","id":"ig_1","result":"YWJj","output_format":"png"}}
+
+                    data: {"type":"response.completed"}
+
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiResponses,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "gpt-image-2",
+            )
+            val textDeltas = mutableListOf<String>()
+
+            val result = client.streamChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = client.buildConversation(
+                    settings = settings,
+                    messages = listOf(LlmMessage("user", listOf(LlmTextPart("Create an image")))),
+                ),
+                onTextDelta = { textDeltas += it },
+            ).getOrThrow()
+
+            assertEquals(listOf("Done."), textDeltas)
+            assertEquals(
+                "Done.\n\n![Generated image](data:image/png;base64,YWJj)",
+                result.assistantText,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun streamChatCompletionFailsWhenOpenAiStreamClosesBeforeDoneMarker() = runBlocking {
         val server = MockWebServer()
         server.enqueue(

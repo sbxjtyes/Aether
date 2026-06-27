@@ -63,6 +63,7 @@ class OpenAiCompatibleClientProviderFormatsTest {
                 apiKey = "test-key",
                 baseUrl = server.url("/v1").toString(),
                 modelId = "deepseek-v4",
+                userAgent = "Allowed-Client/1.0",
                 basicFunctionCallingCompatibilityMode = true,
             )
             val conversation = client.buildConversation(
@@ -83,6 +84,7 @@ class OpenAiCompatibleClientProviderFormatsTest {
 
             val request = server.takeRequest()
             assertEquals("/v1/chat/completions", request.path)
+            assertEquals("Allowed-Client/1.0", request.getHeader("User-Agent"))
             val payload = JSONObject(request.body.readUtf8())
             assertEquals("auto", payload.getString("tool_choice"))
             assertFalse(payload.has("parallel_tool_calls"))
@@ -256,6 +258,7 @@ class OpenAiCompatibleClientProviderFormatsTest {
 
             val request = server.takeRequest()
             assertEquals("/v1/responses", request.path)
+            assertDefaultBrowserUserAgent(request.getHeader("User-Agent"))
             assertEquals("Bearer test-key", request.getHeader("Authorization"))
 
             val payload = JSONObject(request.body.readUtf8())
@@ -274,6 +277,125 @@ class OpenAiCompatibleClientProviderFormatsTest {
             assertEquals("read", tool.getString("name"))
             assertFalse(tool.has("function"))
             assertEquals(true, payload.getBoolean("parallel_tool_calls"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun openAiResponsesImageGenerationOutputBecomesMarkdownImage() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "output": [
+                        {
+                          "type": "message",
+                          "role": "assistant",
+                          "content": [
+                            { "type": "output_text", "text": "Here it is." }
+                          ]
+                        },
+                        {
+                          "type": "image_generation_call",
+                          "id": "ig_1",
+                          "result": "YWJj",
+                          "output_format": "png"
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiResponses,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "gpt-image-2",
+            )
+
+            val result = client.createChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("type", "message")
+                        put("role", "user")
+                        put("content", "Create an image")
+                    }
+                ),
+            ).getOrThrow()
+
+            assertEquals(
+                "Here it is.\n\n![Generated image](data:image/png;base64,YWJj)",
+                result.assistantText,
+            )
+            val responseItems = result.assistantMessage.getJSONArray("aether_response_items")
+            assertEquals("image_generation_call", responseItems.getJSONObject(1).getString("type"))
+            assertEquals("completed", responseItems.getJSONObject(1).getString("status"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun openAiChatImageContentBecomesMarkdownImage() = runBlocking {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .addHeader("Content-Type", "application/json")
+                .setBody(
+                    """
+                    {
+                      "choices": [
+                        {
+                          "message": {
+                            "role": "assistant",
+                            "content": [
+                              { "type": "text", "text": "Look." },
+                              {
+                                "type": "image_url",
+                                "image_url": { "url": "https://example.com/generated.png" }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+        )
+        server.start()
+
+        try {
+            val settings = AppSettings(
+                provider = LlmProvider.OpenAiCompatible,
+                apiKey = "test-key",
+                baseUrl = server.url("/v1").toString(),
+                modelId = "gpt-image-2",
+            )
+
+            val result = client.createChatCompletion(
+                settings = settings,
+                systemPrompt = "",
+                conversation = listOf(
+                    JSONObject().apply {
+                        put("role", "user")
+                        put("content", "Create an image")
+                    }
+                ),
+            ).getOrThrow()
+
+            assertEquals(
+                "Look.\n\n![Generated image](https://example.com/generated.png)",
+                result.assistantText,
+            )
         } finally {
             server.shutdown()
         }
@@ -356,6 +478,7 @@ class OpenAiCompatibleClientProviderFormatsTest {
 
             val request = server.takeRequest()
             assertEquals("/v1/messages", request.path)
+            assertDefaultBrowserUserAgent(request.getHeader("User-Agent"))
             assertEquals("test-key", request.getHeader("x-api-key"))
             assertEquals("2023-06-01", request.getHeader("anthropic-version"))
 
@@ -426,6 +549,7 @@ class OpenAiCompatibleClientProviderFormatsTest {
 
             val request = server.takeRequest()
             assertEquals("/v1/messages", request.path)
+            assertDefaultBrowserUserAgent(request.getHeader("User-Agent"))
             assertEquals("text/event-stream", request.getHeader("Accept"))
             assertEquals(true, JSONObject(request.body.readUtf8()).getBoolean("stream"))
         } finally {
@@ -452,4 +576,10 @@ class OpenAiCompatibleClientProviderFormatsTest {
         }
         """.trimIndent()
     )
+
+    private fun assertDefaultBrowserUserAgent(value: String?) {
+        assertEquals(DefaultLlmUserAgent, value)
+        assertFalse(value.equals("okhttp/4.12.0", ignoreCase = true))
+        assertFalse(value.equals("Aether-Android/1.4.0", ignoreCase = true))
+    }
 }

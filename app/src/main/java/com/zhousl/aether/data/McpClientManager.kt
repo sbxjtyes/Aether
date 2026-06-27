@@ -399,7 +399,7 @@ class McpClientManager(
 
         is McpTransportConfig.StreamableHttp -> StreamableHttpMcpTransport(
             config = transportConfig,
-            protocolVersion = DefaultMcpProtocolVersion,
+            initialProtocolVersion = DefaultMcpProtocolVersion,
             httpClient = httpClient,
         )
     }
@@ -455,9 +455,11 @@ private class McpServerSession(
                     )
                 },
             )
+            val protocolVersion = initializeResult.optString("protocolVersion")
+                .ifBlank { DefaultMcpProtocolVersion }
+            transport.updateProtocolVersion(protocolVersion)
             initialized = true
             sendNotification("notifications/initialized")
-            val protocolVersion = initializeResult.optString("protocolVersion")
             val serverInfo = initializeResult.optJSONObject("serverInfo")
                 ?.let { "${it.optString("name")} ${it.optString("version")}".trim() }
                 .orEmpty()
@@ -734,14 +736,23 @@ private interface McpSessionTransport {
     suspend fun pollMessages(): List<JSONObject>
 
     suspend fun close()
+
+    fun updateProtocolVersion(version: String) = Unit
 }
 
 private class StreamableHttpMcpTransport(
     private val config: McpTransportConfig.StreamableHttp,
-    private val protocolVersion: String,
+    initialProtocolVersion: String,
     private val httpClient: OkHttpClient,
 ) : McpSessionTransport {
+    private var protocolVersion: String = initialProtocolVersion
     private var sessionId: String = ""
+
+    override fun updateProtocolVersion(version: String) {
+        if (version.isNotBlank()) {
+            protocolVersion = version
+        }
+    }
 
     override suspend fun open() = Unit
 

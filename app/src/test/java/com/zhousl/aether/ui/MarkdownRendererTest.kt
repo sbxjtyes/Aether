@@ -170,10 +170,66 @@ class MarkdownRendererTest {
         assertNull(layout.maxHeightDp)
     }
 
+    @Test
+    fun markdownImageSampleSizeKeepsLargeInlinePreviewBounded() {
+        assertEquals(1, calculateMarkdownImageSampleSize(width = 1200, height = 900))
+        assertEquals(4, calculateMarkdownImageSampleSize(width = 5000, height = 3000))
+    }
+
+    @Test
+    fun normalizeMarkdownSourceRepairsCompactStockAnalysisMarkdown() {
+        val blocks = parseNormalizedMarkdownBlocks(
+            """
+            ##科瑞技术（002957.SZ）分析![科瑞技术 K线图](https://img1.money.126.net/chart/h5/stock/kline/d/1000957.png){width=100% fit=contain}
+
+            ---
+
+            ###最新行情|指标 |数值 |
+            |---|---|
+            |最新价 | **60.15元** |
+            |涨跌幅 | **+5.32%** ↑ |
+
+            ###近期走势回顾（近一个月）
+            -从41.83元一路暴涨至61.79元
+            -5/26 -5/28连续三个交易日涨停
+            -从61.79元回调至50.10元，跌幅约 **-18.9%**
+
+            ###风险提示> ⚠️ **免责声明**：以上数据来源于公开行情，可能有延迟，不构成任何投资建议。
+            """.trimIndent(),
+        )
+        val blockNames = blocks.map { requireNotNull(it).javaClass.simpleName }
+
+        assertTrue(blockNames.contains("Heading"))
+        assertTrue(blockNames.contains("Image"))
+        assertTrue(blockNames.contains("Table"))
+        assertTrue(blockNames.contains("UnorderedList"))
+        assertTrue(blockNames.contains("Quote"))
+    }
+
+    @Test
+    fun normalizeMarkdownSourceDoesNotTurnLeadingNegativeNumbersIntoLists() {
+        val blocks = parseNormalizedMarkdownBlocks("-18.9% drawdown")
+
+        assertEquals(1, blocks.size)
+        assertEquals("Paragraph", requireNotNull(blocks.single()).javaClass.simpleName)
+    }
+
     private fun parseMarkdownBlocks(markdown: String): List<*> {
         val method = Class.forName("com.zhousl.aether.ui.MarkdownRendererKt")
             .getDeclaredMethod("parseMarkdown", String::class.java)
         method.isAccessible = true
         return method.invoke(null, markdown) as List<*>
+    }
+
+    private fun parseNormalizedMarkdownBlocks(markdown: String): List<*> {
+        val normalized = normalizeMarkdownSource(markdown)
+        return parseMarkdownBlocks(normalized)
+    }
+
+    private fun normalizeMarkdownSource(markdown: String): String {
+        val method = Class.forName("com.zhousl.aether.ui.MarkdownRendererKt")
+            .getDeclaredMethod("normalizeMarkdownSource", String::class.java)
+        method.isAccessible = true
+        return method.invoke(null, markdown) as String
     }
 }

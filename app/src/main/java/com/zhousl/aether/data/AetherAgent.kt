@@ -38,6 +38,139 @@ private const val MaxToolRoundsPerTurn = 64
 // 工具执行遇到疑似瞬时错误（网络/超时等）时的额外重试次数。
 private const val MaxTransientToolRetries = 1
 
+internal fun buildPlanModeInstructions(): String = """
+    PLAN MODE is enabled for this chat turn. You are a read-only planning agent.
+    Treat any user task/request as something to plan, not answer or perform directly.
+    Implementation requests produce an implementation plan; analysis, research, writing, debugging, and finance/stock questions produce an analysis or execution plan.
+    Do not provide the final answer, investment analysis conclusion, finished report, implementation result, or deliverable content while Plan Mode is enabled.
+    You may inspect files, search, fetch web pages, analyze images, read skill resources, and inspect MCP catalogs/resources/prompts.
+    You must not modify files, write files, run terminal commands, operate devices, call MCP tools, use Agent Mode, wait/sleep, or make changes to external systems.
+
+    Work in three phases:
+    Phase 1 - Ground in the environment: first gather facts from available read-only tools before asking the user. Resolve discoverable facts such as files, schemas, entrypoints, configs, current behavior, and public documentation through inspection instead of questions.
+    Phase 2 - Clarify intent: ask concise questions only when goal, success criteria, audience, in/out of scope, constraints, or a key tradeoff remains materially ambiguous after inspection.
+    Phase 3 - Produce the implementation plan: make the plan decision-complete, including approach, affected interfaces or data flow, edge cases/failure modes, testing and acceptance criteria, install/verification needs, and explicit assumptions/defaults.
+
+    When asking the user to choose between branches, present 2-3 short mutually exclusive text options, put the recommended option first, and mark it as "(recommended)".
+    Ask only questions that materially change the plan, confirm an important assumption, or choose between meaningful tradeoffs.
+    If user input is required before a reliable plan can be produced, call update_task_state with status=waiting_for_user and call set_conversation_status with status=waiting_for_user before ending the response.
+    If a low-risk preference is unanswered, choose the recommended default and record it in the final plan's Assumptions.
+
+    When ready, output exactly one proposed implementation, analysis, or execution plan inside a single <proposed_plan>...</proposed_plan> block.
+    Use Markdown inside the block. Prefer concise sections named Summary, Implementation Changes, Test Plan, and Assumptions unless the task needs different headings.
+    Match the user's language; for Chinese user requests, write the plan in Chinese by default.
+    Do not ask "should I proceed" in the final plan. Do not claim that implementation has been completed while Plan Mode is enabled.
+""".trimIndent()
+
+private fun looksLikeMcpToolCallName(toolName: String): Boolean =
+    toolName.startsWith("mcp__") || toolName.contains(':')
+
+private fun isPlanModeToolNameAllowed(toolName: String): Boolean = when (toolName) {
+    "set_conversation_status",
+    "update_task_state",
+    "run_tool_batch",
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "analyze_image",
+    "fetch_web_url",
+    "tavily_search",
+    "stock_market_data",
+    "activate_skill",
+    "read_skill_resource",
+    "mcp_list_tools",
+    "mcp_list_resources",
+    "mcp_read_resource",
+    "mcp_list_prompts",
+    "mcp_get_prompt" -> true
+
+    else -> false
+}
+
+internal fun buildAetherBaseToolDefinitions(
+    enabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
+    agentModeEnabled: Boolean = false,
+    planModeEnabled: Boolean = false,
+): List<JSONObject> {
+    val normalizedGroups = normalizeChatToolGroups(enabledToolGroups)
+    return buildList {
+        if (isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.FilesImages)) {
+            add(buildReadToolDefinition())
+            if (!planModeEnabled) {
+                add(buildEditToolDefinition())
+                add(buildWriteToolDefinition())
+            }
+            add(buildGrepToolDefinition())
+            add(buildFindToolDefinition())
+            add(buildLsToolDefinition())
+            add(buildAnalyzeImageToolDefinition())
+        }
+        if (!planModeEnabled && isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Terminal)) {
+            add(buildBashToolDefinition())
+            add(buildFetchBashOutputToolDefinition())
+            add(buildKillBashToolDefinition())
+            add(buildSleepToolDefinition())
+        }
+        if (isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Web)) {
+            add(buildFetchWebUrlToolDefinition())
+            add(buildTavilySearchToolDefinition())
+            add(buildStockMarketDataToolDefinition())
+        }
+        if (!planModeEnabled && agentModeEnabled) {
+            add(buildAgentModeToolDefinition())
+        }
+    }
+}
+
+internal fun isAetherToolAvailableForGroups(
+    toolName: String,
+    enabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
+    agentModeEnabled: Boolean = false,
+    planModeEnabled: Boolean = false,
+): Boolean {
+    if (planModeEnabled && !isPlanModeToolNameAllowed(toolName)) {
+        return false
+    }
+    val normalizedGroups = normalizeChatToolGroups(enabledToolGroups)
+    return when (toolName) {
+        "set_conversation_status",
+        "update_task_state",
+        "run_tool_batch" -> true
+
+        "read",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "analyze_image" -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.FilesImages)
+
+        "bash",
+        "fetch_bash_output",
+        "kill_bash",
+        "sleep" -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Terminal)
+
+        "fetch_web_url",
+        "tavily_search",
+        "stock_market_data" -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Web)
+
+        "activate_skill",
+        "read_skill_resource",
+        "mcp_list_tools",
+        "mcp_call_tool",
+        "mcp_list_resources",
+        "mcp_read_resource",
+        "mcp_list_prompts",
+        "mcp_get_prompt" -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Extensions)
+
+        "agent_display" -> agentModeEnabled
+
+        else -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Extensions) &&
+            looksLikeMcpToolCallName(toolName)
+    }
+}
+
 class AetherAgent(
     private val client: OpenAiCompatibleClient,
     private val bashTool: TermuxBashTool,
@@ -58,6 +191,8 @@ class AetherAgent(
         activeSkills: List<ActiveSkillContext> = emptyList(),
         mcpToolBindings: List<McpToolBinding> = emptyList(),
         agentModeEnabled: Boolean = false,
+        enabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
+        planModeEnabled: Boolean = false,
         taskState: AgentTaskState = AgentTaskState(),
         onToolEvent: suspend (AgentToolEvent) -> Unit = {},
         onAssistantTextDelta: suspend (String) -> Unit = {},
@@ -74,36 +209,38 @@ class AetherAgent(
             settings = settings,
             messages = messages,
         ).toMutableList()
-        val resolvedAvailableSkills = availableSkills
-            .filter { it.isEnabled }
-            .sortedBy { it.name.lowercase() }
-        val resolvedActiveSkills = activeSkills.toMutableList()
-        val baseTools = listOf(
-            buildReadToolDefinition(),
-            buildEditToolDefinition(),
-            buildWriteToolDefinition(),
-            buildGrepToolDefinition(),
-            buildFindToolDefinition(),
-            buildLsToolDefinition(),
-            buildBashToolDefinition(),
-            buildFetchBashOutputToolDefinition(),
-            buildKillBashToolDefinition(),
-            buildSleepToolDefinition(),
-            buildAnalyzeImageToolDefinition(),
-            buildFetchWebUrlToolDefinition(),
-            buildTavilySearchToolDefinition(),
-            buildStockMarketDataToolDefinition(),
-            if (agentModeEnabled) buildAgentModeToolDefinition() else null,
-        ).filterNotNull()
-        val hasMcpCatalog = mcpToolBindings.isNotEmpty() ||
-            mcpClientManager.snapshots().any { it.resources.isNotEmpty() || it.prompts.isNotEmpty() }
+        val normalizedToolGroups = normalizeChatToolGroups(enabledToolGroups)
+        val extensionsEnabled = isChatToolGroupEnabled(normalizedToolGroups, ChatToolGroups.Extensions)
+        val resolvedAvailableSkills = if (extensionsEnabled) {
+            availableSkills
+                .filter { it.isEnabled }
+                .sortedBy { it.name.lowercase() }
+        } else {
+            emptyList()
+        }
+        val resolvedActiveSkills = if (extensionsEnabled) {
+            activeSkills.toMutableList()
+        } else {
+            mutableListOf()
+        }
+        val effectiveMcpToolBindings = if (extensionsEnabled) mcpToolBindings else emptyList()
+        val baseTools = buildAetherBaseToolDefinitions(
+            enabledToolGroups = normalizedToolGroups,
+            agentModeEnabled = agentModeEnabled,
+            planModeEnabled = planModeEnabled,
+        )
+        val hasMcpCatalog = extensionsEnabled && (
+            effectiveMcpToolBindings.isNotEmpty() ||
+                mcpClientManager.snapshots().any { it.resources.isNotEmpty() || it.prompts.isNotEmpty() }
+            )
         val useBasicToolCompatibility = settings.basicFunctionCallingCompatibilityMode
         val exposeNamespacedMcpTools =
+            !planModeEnabled &&
             !useBasicToolCompatibility &&
             settings.provider in setOf(
                 LlmProvider.OpenAiResponses,
                 LlmProvider.OpenAiCompatible,
-            ) && mcpToolBindings.isNotEmpty()
+            ) && effectiveMcpToolBindings.isNotEmpty()
         var lastAssistantText = ""
         var conversationDecision = AgentConversationDecision.completed()
         var latestTaskState = taskState
@@ -142,9 +279,11 @@ class AetherAgent(
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = resolvedAvailableSkills,
                 activeSkills = resolvedActiveSkills,
-                mcpToolBindings = mcpToolBindings,
+                mcpToolBindings = effectiveMcpToolBindings,
                 exposeNamespacedMcpTools = exposeNamespacedMcpTools,
                 agentModeEnabled = agentModeEnabled,
+                enabledToolGroups = normalizedToolGroups,
+                planModeEnabled = planModeEnabled,
                 taskState = latestTaskState,
                 parallelToolCallsEnabled = parallelToolCallsEnabled,
                 basicToolCompatibilityMode = useBasicToolCompatibility,
@@ -165,9 +304,17 @@ class AetherAgent(
             }
             val effectiveTools = if (hasMcpCatalog) {
                 tools +
-                    buildMcpGenericToolDefinitions() +
+                    buildMcpGenericToolDefinitions().filter { definition ->
+                        val name = definition.getJSONObject("function").getString("name")
+                        isAetherToolAvailableForGroups(
+                            toolName = name,
+                            enabledToolGroups = normalizedToolGroups,
+                            agentModeEnabled = agentModeEnabled,
+                            planModeEnabled = planModeEnabled,
+                        )
+                    } +
                     if (exposeNamespacedMcpTools) {
-                        mcpToolBindings.map(::buildMcpToolDefinition)
+                        effectiveMcpToolBindings.map(::buildMcpToolDefinition)
                     } else {
                         emptyList()
                     }
@@ -231,6 +378,9 @@ class AetherAgent(
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = resolvedAvailableSkills,
                 activeSkills = resolvedActiveSkills,
+                enabledToolGroups = normalizedToolGroups,
+                agentModeEnabled = agentModeEnabled,
+                planModeEnabled = planModeEnabled,
                 round = round,
                 parallelToolCallsEnabled = parallelToolCallsEnabled,
                 onToolEvent = onToolEvent,
@@ -320,6 +470,9 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        enabledToolGroups: List<String>,
+        agentModeEnabled: Boolean,
+        planModeEnabled: Boolean,
         round: Int,
         parallelToolCallsEnabled: Boolean,
         onToolEvent: suspend (AgentToolEvent) -> Unit,
@@ -342,6 +495,9 @@ class AetherAgent(
                     workspaceDirectory = workspaceDirectory,
                     availableSkills = availableSkills,
                     activeSkills = activeSkills,
+                    enabledToolGroups = enabledToolGroups,
+                    agentModeEnabled = agentModeEnabled,
+                    planModeEnabled = planModeEnabled,
                     onSkillActivated = onSkillActivated,
                 )
                 if (!isInternalToolCall(result.name)) {
@@ -379,6 +535,9 @@ class AetherAgent(
                             workspaceDirectory = workspaceDirectory,
                             availableSkills = availableSkills,
                             activeSkills = activeSkills,
+                            enabledToolGroups = enabledToolGroups,
+                            agentModeEnabled = agentModeEnabled,
+                            planModeEnabled = planModeEnabled,
                             onSkillActivated = onSkillActivated,
                         )
                         if (!isInternalToolCall(result.name)) {
@@ -428,6 +587,9 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        enabledToolGroups: List<String>,
+        agentModeEnabled: Boolean,
+        planModeEnabled: Boolean,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): ExecutedToolCallResult {
         val toolCall = indexedToolCall.toolCall
@@ -441,6 +603,9 @@ class AetherAgent(
                     workspaceDirectory = workspaceDirectory,
                     availableSkills = availableSkills,
                     activeSkills = activeSkills,
+                    enabledToolGroups = enabledToolGroups,
+                    agentModeEnabled = agentModeEnabled,
+                    planModeEnabled = planModeEnabled,
                     onSkillActivated = onSkillActivated,
                 )
             } catch (cancellationException: CancellationException) {
@@ -488,8 +653,17 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        enabledToolGroups: List<String>,
+        agentModeEnabled: Boolean,
+        planModeEnabled: Boolean,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): String {
+        if (!isAetherToolAvailableForGroups(toolCall.name, enabledToolGroups, agentModeEnabled, planModeEnabled)) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Tool '${toolCall.name}' is disabled for this chat turn.")
+            }.toString()
+        }
         return when (toolCall.name) {
             "read" -> filesystemTool.executeRead(
                 injectDefaultWorkingDirectory(toolCall.arguments, workspaceDirectory)
@@ -539,6 +713,9 @@ class AetherAgent(
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = availableSkills,
                 activeSkills = activeSkills,
+                enabledToolGroups = enabledToolGroups,
+                agentModeEnabled = agentModeEnabled,
+                planModeEnabled = planModeEnabled,
                 onSkillActivated = onSkillActivated,
             )
             "mcp_list_tools" -> executeMcpListTools(toolCall.arguments)
@@ -808,6 +985,9 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        enabledToolGroups: List<String>,
+        agentModeEnabled: Boolean,
+        planModeEnabled: Boolean,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): String {
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
@@ -865,6 +1045,9 @@ class AetherAgent(
                             workspaceDirectory = workspaceDirectory,
                             availableSkills = availableSkills,
                             activeSkills = activeSkills,
+                            enabledToolGroups = enabledToolGroups,
+                            agentModeEnabled = agentModeEnabled,
+                            planModeEnabled = planModeEnabled,
                             onSkillActivated = onSkillActivated,
                         )
                     }
@@ -880,6 +1063,9 @@ class AetherAgent(
                     workspaceDirectory = workspaceDirectory,
                     availableSkills = availableSkills,
                     activeSkills = activeSkills,
+                    enabledToolGroups = enabledToolGroups,
+                    agentModeEnabled = agentModeEnabled,
+                    planModeEnabled = planModeEnabled,
                     onSkillActivated = onSkillActivated,
                 )
             }
@@ -929,6 +1115,9 @@ class AetherAgent(
         workspaceDirectory: String,
         availableSkills: List<InstalledSkill>,
         activeSkills: MutableList<ActiveSkillContext>,
+        enabledToolGroups: List<String>,
+        agentModeEnabled: Boolean,
+        planModeEnabled: Boolean,
         onSkillActivated: suspend (ActiveSkillContext) -> Unit,
     ): JSONObject {
         val rawOutput = try {
@@ -942,6 +1131,9 @@ class AetherAgent(
                 workspaceDirectory = workspaceDirectory,
                 availableSkills = availableSkills,
                 activeSkills = activeSkills,
+                enabledToolGroups = enabledToolGroups,
+                agentModeEnabled = agentModeEnabled,
+                planModeEnabled = planModeEnabled,
                 onSkillActivated = onSkillActivated,
             )
         } catch (cancellationException: CancellationException) {
@@ -2203,10 +2395,25 @@ class AetherAgent(
         mcpToolBindings: List<McpToolBinding>,
         exposeNamespacedMcpTools: Boolean,
         agentModeEnabled: Boolean,
+        enabledToolGroups: List<String>,
+        planModeEnabled: Boolean,
         taskState: AgentTaskState,
         parallelToolCallsEnabled: Boolean,
         basicToolCompatibilityMode: Boolean,
     ): String = buildString {
+        val normalizedToolGroups = normalizeChatToolGroups(enabledToolGroups)
+        val extensionsEnabled = isChatToolGroupEnabled(normalizedToolGroups, ChatToolGroups.Extensions)
+        val enabledToolGroupSummary = normalizedToolGroups
+            .joinToString(", ") { group ->
+                when (group) {
+                    ChatToolGroups.FilesImages -> "Files & Images"
+                    ChatToolGroups.Terminal -> "Terminal"
+                    ChatToolGroups.Web -> "Web"
+                    ChatToolGroups.Extensions -> "Skills/MCP"
+                    else -> group
+                }
+            }
+            .ifBlank { "none" }
         val trimmedPrompt = systemPrompt.trim()
         if (trimmedPrompt.isNotBlank()) {
             append(trimmedPrompt)
@@ -2227,33 +2434,53 @@ class AetherAgent(
                 "For tavily_search, prefer a simple query plus include_domains or max_results when useful. " +
                 "Use either time_range or start_date/end_date, never both. " +
                 "Only set country when you know Tavily supports that lowercase country value, such as china or united states; otherwise leave it null. " +
-                "Use snake_case tavily_search keys only; do not invent duplicate camelCase aliases. " +
+                "Use snake_case tavily_search keys only; do not invent duplicate camelCase aliases. "
+        )
+        if (planModeEnabled) {
+            append(
+                "Prefer read, grep, find, ls, and analyze_image for read-only filesystem and image inspection. " +
+                    "If a tool call omits working_directory, Aether will run it in the current session workspace by default. " +
+                    "The read tool reads file contents with optional line offset and limit. " +
+                    "The grep tool searches file contents. The find tool matches file paths by glob pattern. " +
+                    "The ls tool lists directory contents. " +
+                    "All filesystem tools accept ~ or ~/... to mean the Termux home directory. "
+            )
+        } else {
+            append(
                 "Prefer read, edit, write, grep, find, and ls for filesystem work. " +
-                "If a tool call omits working_directory, Aether will run it in the current session workspace by default. " +
-                "The read tool reads file contents with optional line offset and limit. " +
-                "The edit tool applies exact text replacements and should be used for precise file edits. " +
-                "For exactly one edit, call edit with {path, oldText, newText} and omit edits. " +
-                "For multiple edits, call edit with {path, edits:[{oldText, newText}, ...]} and omit top-level oldText/newText. " +
-                "Never send both edit formats together unless you intentionally want the edits array to be used. " +
-                "The write tool creates or overwrites a file with full contents. " +
-                "The grep tool searches file contents. The find tool matches file paths by glob pattern. " +
-                "The ls tool lists directory contents. " +
-                "All filesystem tools accept ~ or ~/... to mean the Termux home directory. " +
-                "For non-trivial or multi-step work, interleave concise assistant updates with tool use: briefly say what you are about to inspect or do, call the relevant tool or independent tool batch for that step, then continue with another short update before the next distinct tool step. " +
+                    "If a tool call omits working_directory, Aether will run it in the current session workspace by default. " +
+                    "The read tool reads file contents with optional line offset and limit. " +
+                    "The edit tool applies exact text replacements and should be used for precise file edits. " +
+                    "For exactly one edit, call edit with {path, oldText, newText} and omit edits. " +
+                    "For multiple edits, call edit with {path, edits:[{oldText, newText}, ...]} and omit top-level oldText/newText. " +
+                    "Never send both edit formats together unless you intentionally want the edits array to be used. " +
+                    "The write tool creates or overwrites a file with full contents. " +
+                    "The grep tool searches file contents. The find tool matches file paths by glob pattern. " +
+                    "The ls tool lists directory contents. " +
+                    "All filesystem tools accept ~ or ~/... to mean the Termux home directory. " +
+                    "The bash tool runs inside Termux on the user's phone. It watches the command for up to 45 seconds. " +
+                    "If the command finishes quickly, bash returns the final structured JSON with stdout, stderr, exit_code, err, errmsg, duration_ms, command, and working_directory. " +
+                    "If the command is still running after 45 seconds, bash returns status=running plus run_id and the latest stdout/stderr snapshot without stopping the command. " +
+                    "bash and fetch_bash_output return up to 65536 bytes from each of stdout and stderr by default; pass tail_bytes up to 262144 when you expect long command output or when stdout_truncated/stderr_truncated is true. " +
+                    "When bash returns status=running, use sleep to wait, then call fetch_bash_output with the same run_id to poll for more logs or completion. " +
+                    "If a long-running command is stuck or no longer needed, call kill_bash with the run_id. " +
+                    "Use sleep instead of busy waiting. " +
+                    "Use bash for shell commands, scripts, and tasks that are not covered by the specialized filesystem tools. " +
+                    "If the user asks you to run a bash, shell, terminal, or Termux command, you must call the bash tool instead of describing what they should run manually. " +
+                    "When you create or modify a file that the user should download, include a Markdown link that uses file:// with the absolute workspace path, for example [report.txt](file://$workspaceDirectory/report.txt). " +
+                    "Only claim you executed shell commands if you actually called bash. "
+            )
+        }
+        append(
+            "For non-trivial or multi-step work, interleave concise assistant updates with tool use: briefly say what you are about to inspect or do, call the relevant tool or independent tool batch for that step, then continue with another short update before the next distinct tool step. " +
                 "Keep these updates short and skip them for obvious single-tool lookups, purely mechanical polling, or when the user asks for no narration. " +
-                "The bash tool runs inside Termux on the user's phone. It watches the command for up to 45 seconds. " +
-                "If the command finishes quickly, bash returns the final structured JSON with stdout, stderr, exit_code, err, errmsg, duration_ms, command, and working_directory. " +
-                "If the command is still running after 45 seconds, bash returns status=running plus run_id and the latest stdout/stderr snapshot without stopping the command. " +
-                "bash and fetch_bash_output return up to 65536 bytes from each of stdout and stderr by default; pass tail_bytes up to 262144 when you expect long command output or when stdout_truncated/stderr_truncated is true. " +
-                "When bash returns status=running, use sleep to wait, then call fetch_bash_output with the same run_id to poll for more logs or completion. " +
-                "If a long-running command is stuck or no longer needed, call kill_bash with the run_id. " +
-                "Use sleep instead of busy waiting. " +
-                "Use bash for shell commands, scripts, and tasks that are not covered by the specialized filesystem tools. " +
-                "If the user asks you to run a bash, shell, terminal, or Termux command, you must call the bash tool instead of describing what they should run manually. " +
-                "When you create or modify a file that the user should download, include a Markdown link that uses file:// with the absolute workspace path, for example [report.txt](file://$workspaceDirectory/report.txt). " +
-                "Only claim you executed shell commands if you actually called bash. " +
                 "After using tools, summarize the result clearly for the user."
         )
+        if (planModeEnabled) {
+            append("\n\n")
+            append(buildPlanModeInstructions())
+        }
+        append("\nEnabled tool groups for this chat: $enabledToolGroupSummary. Disabled groups are intentionally unavailable for this turn.")
         append("\n\n")
         append(
             "Persistent task state protocol: Aether keeps a compact task board for this chat across turns. " +
@@ -2388,17 +2615,21 @@ class AetherAgent(
                 append("\n</active_skill>")
             }
         }
-        val mcpSnapshots = mcpClientManager.snapshots()
+        val mcpSnapshots = if (extensionsEnabled) mcpClientManager.snapshots() else emptyList()
         if (mcpSnapshots.isNotEmpty()) {
             append("\n\n")
             append(
                 "Connected MCP servers are also available in this session. " +
                     "Use mcp_list_tools to inspect callable MCP tools. " +
-                    "Use mcp_call_tool to invoke an MCP tool with server_id, tool_name, and arguments. " +
                     "Use mcp_list_resources and mcp_read_resource for resources. " +
                     "Use mcp_list_prompts and mcp_get_prompt for prompts. " +
                     "Never invent tool names such as server:tool."
             )
+            if (planModeEnabled) {
+                append(" Plan Mode is read-only, so MCP tool invocation is unavailable.")
+            } else {
+                append(" Use mcp_call_tool to invoke an MCP tool with server_id, tool_name, and arguments.")
+            }
             if (exposeNamespacedMcpTools) {
                 append(" If exact MCP call names are listed below as call_name=..., you may also use those exact names directly.")
             }
@@ -2636,7 +2867,4 @@ class AetherAgent(
         arguments.optString("server_id").trim().ifBlank {
             arguments.optString("serverId").trim()
         }
-
-    private fun looksLikeMcpToolCallName(toolName: String): Boolean =
-        toolName.startsWith("mcp__") || toolName.contains(':')
 }

@@ -11,12 +11,14 @@ import com.zhousl.aether.aetherRuntime
 import com.zhousl.aether.data.ActiveSkillContext
 import com.zhousl.aether.data.AetherAnalytics
 import com.zhousl.aether.data.AppUpdateManager
+import com.zhousl.aether.data.AssistantMarkdownImageExternalizer
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AppSettings
 import com.zhousl.aether.data.AppThemeMode
 import com.zhousl.aether.data.AgentTaskState
+import com.zhousl.aether.data.ChatToolGroups
 import com.zhousl.aether.data.CurrentOnboardingVersion
 import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.LlmApiClient
@@ -29,6 +31,8 @@ import com.zhousl.aether.data.McpServerConfig
 import com.zhousl.aether.data.McpTransportConfig
 import com.zhousl.aether.data.McpValidationSummary
 import com.zhousl.aether.data.generateQuickActionLabel
+import com.zhousl.aether.data.markdownMayContainDataImage
+import com.zhousl.aether.data.normalizeChatToolGroups
 import com.zhousl.aether.data.normalizeSelectableModelKey
 import com.zhousl.aether.data.normalizeLlmInactivityReconnectTimeoutSeconds
 import com.zhousl.aether.data.OnboardingStarterPrompt
@@ -48,6 +52,7 @@ import com.zhousl.aether.data.serializeMcpServerConfigs
 import com.zhousl.aether.data.serializeProviderConfigs
 import com.zhousl.aether.data.toJson
 import com.zhousl.aether.data.isProviderSetupValid
+import com.zhousl.aether.data.isChatToolGroupEnabled
 import com.zhousl.aether.data.isVersionNewer
 import com.zhousl.aether.data.isOnboardingComplete
 import com.zhousl.aether.data.shouldMarkOnboardingCompleted
@@ -98,6 +103,7 @@ class AetherViewModel(
     private val bashTool = runtime.bashTool
     private val rootSetupController = runtime.rootSetupController
     private val workspaceFileBridge = runtime.workspaceFileBridge
+    private val assistantMarkdownImageExternalizer = AssistantMarkdownImageExternalizer(workspaceFileBridge)
     private val agentModeController = runtime.agentModeController
     private val skillManager = runtime.skillManager
     private val mcpClientManager = McpClientManager(bashTool = bashTool)
@@ -105,6 +111,7 @@ class AetherViewModel(
     private var didEvaluateStartupUpdateCheck = false
     private var lastTrackedTermuxDetectedIssue: TermuxSetupIssue? = null
     private var pendingTermuxSetupSource: String? = null
+    private val generatedImageMigrationScheduledSessionIds = mutableSetOf<String>()
     private val activeModelFetchCount = AtomicInteger(0)
     @Volatile
     private var lastTermuxCommandSuccessAtMillis: Long = 0L
@@ -165,6 +172,7 @@ class AetherViewModel(
                         pendingResponseSessionId = currentExecution?.sessionId,
                     )
                 }
+                scheduleGeneratedImageMigration(persisted.sessions)
             }
         }
 
@@ -695,6 +703,8 @@ class AetherViewModel(
                     draftSelectedSkillIds = emptyList(),
                     draftSelectedMcpServerIds = emptyList(),
                     draftAgentModeEnabled = false,
+                    draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
+                    draftPlanModeEnabled = false,
                     draftWorkspaceId = null,
                     editingSessionId = null,
                     editingMessageId = null,
@@ -897,6 +907,8 @@ class AetherViewModel(
                 draftSelectedSkillIds = emptyList(),
                 draftSelectedMcpServerIds = emptyList(),
                 draftAgentModeEnabled = false,
+                draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
+                draftPlanModeEnabled = false,
                 draftWorkspaceId = null,
                 editingSessionId = null,
                 editingMessageId = null,
@@ -928,6 +940,8 @@ class AetherViewModel(
                 draftSelectedSkillIds = emptyList(),
                 draftSelectedMcpServerIds = emptyList(),
                 draftAgentModeEnabled = false,
+                draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
+                draftPlanModeEnabled = false,
                 draftWorkspaceId = null,
                 editingSessionId = null,
                 editingMessageId = null,
@@ -1100,6 +1114,7 @@ class AetherViewModel(
                 draftSelectedSkillIds = if (archivedCurrentSession) emptyList() else current.draftSelectedSkillIds,
                 draftSelectedMcpServerIds = if (archivedCurrentSession) emptyList() else current.draftSelectedMcpServerIds,
                 draftAgentModeEnabled = if (archivedCurrentSession) false else current.draftAgentModeEnabled,
+                draftPlanModeEnabled = if (archivedCurrentSession) false else current.draftPlanModeEnabled,
                 draftWorkspaceId = if (archivedCurrentSession) null else current.draftWorkspaceId,
                 editingSessionId = if (current.editingSessionId in archivedIds) null else current.editingSessionId,
                 editingMessageId = if (current.editingSessionId in archivedIds) null else current.editingMessageId,
@@ -1288,6 +1303,8 @@ class AetherViewModel(
                             draftSelectedSkillIds = emptyList(),
                             draftSelectedMcpServerIds = emptyList(),
                             draftAgentModeEnabled = false,
+                            draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
+                            draftPlanModeEnabled = false,
                             draftWorkspaceId = null,
                             editingSessionId = null,
                             editingMessageId = null,
@@ -1350,6 +1367,8 @@ class AetherViewModel(
                 draftSelectedSkillIds = emptyList(),
                 draftSelectedMcpServerIds = emptyList(),
                 draftAgentModeEnabled = false,
+                draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
+                draftPlanModeEnabled = false,
                 draftWorkspaceId = null,
                 editingSessionId = null,
                 editingMessageId = null,
@@ -1409,6 +1428,20 @@ class AetherViewModel(
                         emptyList()
                     } else {
                         current.draftSelectedMcpServerIds
+                    },
+                    draftEnabledToolGroups = if (
+                        trimmedMessages.isEmpty() && current.currentSessionId == sessionId
+                    ) {
+                        ChatToolGroups.DefaultEnabled
+                    } else {
+                        current.draftEnabledToolGroups
+                    },
+                    draftPlanModeEnabled = if (
+                        trimmedMessages.isEmpty() && current.currentSessionId == sessionId
+                    ) {
+                        false
+                    } else {
+                        current.draftPlanModeEnabled
                     },
                     draftInput = if (current.editingSessionId == sessionId) "" else current.draftInput,
                     draftAttachments = if (current.editingSessionId == sessionId) {
@@ -1476,6 +1509,8 @@ class AetherViewModel(
                 activeSkills = session.activeSkills,
                 activeMcpServerIds = session.activeMcpServerIds,
                 agentModeEnabled = session.agentModeEnabled,
+                enabledToolGroups = session.enabledToolGroups,
+                planModeEnabled = session.planModeEnabled,
                 taskState = AgentTaskState(),
             )
             val updatedSessions = current.sessions.toMutableList().apply {
@@ -1557,6 +1592,8 @@ class AetherViewModel(
                 activeSkills = updatedSession.activeSkills,
                 activeMcpServerIds = updatedSession.activeMcpServerIds,
                 agentModeEnabled = updatedSession.agentModeEnabled,
+                enabledToolGroups = updatedSession.enabledToolGroups,
+                planModeEnabled = updatedSession.planModeEnabled,
                 taskState = AgentTaskState(),
             )
 
@@ -2325,6 +2362,119 @@ class AetherViewModel(
         }
     }
 
+    fun setComposerPlanModeEnabled(enabled: Boolean) {
+        var didUpdate = false
+        var sessionIdForPersistence: String? = null
+        _uiState.update { current ->
+            if (current.currentSessionId == DraftSessionId) {
+                if (current.draftPlanModeEnabled == enabled) {
+                    current
+                } else {
+                    didUpdate = true
+                    current.copy(draftPlanModeEnabled = enabled)
+                }
+            } else {
+                val sessionIndex = current.sessions.indexOfFirst { it.id == current.currentSessionId }
+                if (sessionIndex < 0) return@update current
+                val updatedSessions = current.sessions.toMutableList()
+                val session = updatedSessions.removeAt(sessionIndex)
+                if (session.planModeEnabled == enabled) {
+                    updatedSessions.add(sessionIndex, session)
+                    current
+                } else {
+                    didUpdate = true
+                    val updatedSession = session.copy(planModeEnabled = enabled)
+                    sessionIdForPersistence = current.currentSessionId
+                    updatedSessions.add(
+                        sessionIndex.coerceAtMost(updatedSessions.size),
+                        updatedSession,
+                    )
+                    current.copy(sessions = updatedSessions)
+                }
+            }
+        }
+        val persistedSessionId = sessionIdForPersistence
+        if (didUpdate && persistedSessionId != null) {
+            persistSessionMutation(persistedSessionId) { session ->
+                if (session.planModeEnabled == enabled) {
+                    null
+                } else {
+                    session.copy(planModeEnabled = enabled)
+                }
+            }
+        }
+        if (didUpdate) {
+            captureAnalyticsEvent(
+                event = "plan mode toggled",
+                properties = mapOf("enabled" to enabled),
+            )
+        }
+    }
+
+    fun setComposerToolGroupEnabled(
+        groupId: String,
+        enabled: Boolean,
+    ) {
+        val normalizedGroupId = groupId.trim()
+        if (normalizedGroupId !in ChatToolGroups.All) return
+
+        var didUpdate = false
+        var sessionIdForPersistence: String? = null
+        _uiState.update { current ->
+            if (current.currentSessionId == DraftSessionId) {
+                val updatedGroups = updateToolGroupSelection(
+                    current.draftEnabledToolGroups,
+                    normalizedGroupId,
+                    enabled,
+                )
+                if (updatedGroups == current.draftEnabledToolGroups) {
+                    current
+                } else {
+                    didUpdate = true
+                    current.copy(draftEnabledToolGroups = updatedGroups)
+                }
+            } else {
+                val sessionIndex = current.sessions.indexOfFirst { it.id == current.currentSessionId }
+                if (sessionIndex < 0) return@update current
+                val updatedSessions = current.sessions.toMutableList()
+                val session = updatedSessions.removeAt(sessionIndex)
+                val updatedGroups = updateToolGroupSelection(
+                    session.enabledToolGroups,
+                    normalizedGroupId,
+                    enabled,
+                )
+                if (updatedGroups == session.enabledToolGroups) {
+                    updatedSessions.add(sessionIndex, session)
+                    current
+                } else {
+                    didUpdate = true
+                    val updatedSession = session.copy(enabledToolGroups = updatedGroups)
+                    sessionIdForPersistence = current.currentSessionId
+                    updatedSessions.add(
+                        sessionIndex.coerceAtMost(updatedSessions.size),
+                        updatedSession,
+                    )
+                    current.copy(sessions = updatedSessions)
+                }
+            }
+        }
+        val persistedSessionId = sessionIdForPersistence
+        if (didUpdate && persistedSessionId != null) {
+            persistSessionMutation(persistedSessionId) { session ->
+                val updatedGroups = updateToolGroupSelection(
+                    session.enabledToolGroups,
+                    normalizedGroupId,
+                    enabled,
+                )
+                if (updatedGroups == session.enabledToolGroups) {
+                    null
+                } else {
+                    session.copy(enabledToolGroups = updatedGroups)
+                }
+            }
+        }
+    }
+
     fun sendCurrentMessage() {
         submitCurrentMessage(SessionFollowUpMode.Queue)
     }
@@ -2335,6 +2485,78 @@ class AetherViewModel(
 
     fun steerCurrentMessage() {
         submitCurrentMessage(SessionFollowUpMode.Steer)
+    }
+
+    internal fun handleComposerSlashCommand(
+        commandId: ComposerSlashCommandId,
+        inlineText: String,
+    ) {
+        when (commandId) {
+            ComposerSlashCommandId.Plan -> {
+                setComposerPlanModeEnabled(true)
+                if (inlineText.isBlank()) {
+                    _uiState.update { current -> current.copy(draftInput = "") }
+                    emitTransientMessage("Plan Mode enabled")
+                } else {
+                    submitSlashPrompt(inlineText)
+                }
+            }
+
+            ComposerSlashCommandId.Goal -> handleGoalSlashCommand(inlineText)
+            ComposerSlashCommandId.Status -> appendLocalAssistantMessage(buildSlashStatusMessage(_uiState.value))
+            ComposerSlashCommandId.Review -> {
+                val snapshot = _uiState.value
+                val enabledGroups = activeEnabledToolGroups(snapshot)
+                val terminalEnabled = isChatToolGroupEnabled(enabledGroups, ChatToolGroups.Terminal)
+                if (!terminalEnabled) {
+                    emitTransientMessage("Terminal tools are disabled; review will use available context.")
+                }
+                submitSlashPrompt(buildReviewSlashPrompt(isTerminalEnabled = terminalEnabled))
+            }
+
+            ComposerSlashCommandId.Model,
+            ComposerSlashCommandId.Tools,
+            ComposerSlashCommandId.Permissions -> {
+                _uiState.update { current -> current.copy(draftInput = "") }
+            }
+        }
+    }
+
+    private fun submitSlashPrompt(prompt: String) {
+        val trimmedPrompt = prompt.trim()
+        if (trimmedPrompt.isBlank()) return
+        _uiState.update { current ->
+            current.copy(
+                draftInput = trimmedPrompt,
+                draftAttachments = emptyList(),
+                editingSessionId = null,
+                editingMessageId = null,
+            )
+        }
+        submitCurrentMessage(SessionFollowUpMode.Queue)
+    }
+
+    private fun handleGoalSlashCommand(inlineText: String) {
+        val now = System.currentTimeMillis()
+        val snapshot = _uiState.value
+        val currentTaskState = activeTaskState(snapshot)
+        if (inlineText.isBlank()) {
+            appendLocalAssistantMessage(buildGoalStatusMessage(currentTaskState))
+            _uiState.update { current -> current.copy(draftInput = "") }
+            return
+        }
+
+        val updatedTaskState = applyGoalSlashCommand(currentTaskState, inlineText, now)
+        applyTaskStateToCurrentSession(updatedTaskState, now)
+        _uiState.update { current -> current.copy(draftInput = "") }
+        emitTransientMessage(
+            when (inlineText.trim().lowercase()) {
+                "clear" -> "Goal cleared"
+                "pause" -> "Goal paused"
+                "resume" -> "Goal resumed"
+                else -> "Goal set"
+            }
+        )
     }
 
     private fun submitCurrentMessage(
@@ -2404,6 +2626,8 @@ class AetherViewModel(
         var requestActiveSkills: List<ActiveSkillContext> = emptyList()
         var requestActiveMcpServerIds: List<String> = emptyList()
         var requestAgentModeEnabled = false
+        var requestEnabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled
+        var requestPlanModeEnabled = false
         var requestModelKey = ""
         var requestTaskState = AgentTaskState()
         var shouldGenerateSessionTitle = false
@@ -2438,6 +2662,8 @@ class AetherViewModel(
                         requestActiveSkills = updated.activeSkills
                         requestActiveMcpServerIds = updated.activeMcpServerIds
                         requestAgentModeEnabled = updated.agentModeEnabled
+                        requestEnabledToolGroups = updated.enabledToolGroups
+                        requestPlanModeEnabled = updated.planModeEnabled
                         requestModelKey = updated.selectedModelKey
                         requestTaskState = AgentTaskState()
                     } else {
@@ -2460,6 +2686,8 @@ class AetherViewModel(
                     requestActiveSkills = updated.activeSkills
                     requestActiveMcpServerIds = updated.activeMcpServerIds
                     requestAgentModeEnabled = updated.agentModeEnabled
+                    requestEnabledToolGroups = updated.enabledToolGroups
+                    requestPlanModeEnabled = updated.planModeEnabled
                     requestModelKey = updated.selectedModelKey
                     requestTaskState = updated.taskState
                 } else {
@@ -2474,6 +2702,8 @@ class AetherViewModel(
                         selectedSkillIds = current.draftSelectedSkillIds,
                         activeMcpServerIds = current.draftSelectedMcpServerIds,
                         agentModeEnabled = current.draftAgentModeEnabled,
+                        enabledToolGroups = current.draftEnabledToolGroups,
+                        planModeEnabled = current.draftPlanModeEnabled,
                     )
                     shouldGenerateSessionTitle = true
                     sessionForPersistence = newSession
@@ -2483,6 +2713,8 @@ class AetherViewModel(
                     requestActiveSkills = newSession.activeSkills
                     requestActiveMcpServerIds = newSession.activeMcpServerIds
                     requestAgentModeEnabled = newSession.agentModeEnabled
+                    requestEnabledToolGroups = newSession.enabledToolGroups
+                    requestPlanModeEnabled = newSession.planModeEnabled
                     requestModelKey = newSession.selectedModelKey
                     requestTaskState = newSession.taskState
                 }
@@ -2501,6 +2733,8 @@ class AetherViewModel(
                 activeSkills = requestActiveSkills,
                 activeMcpServerIds = requestActiveMcpServerIds,
                 agentModeEnabled = requestAgentModeEnabled,
+                enabledToolGroups = requestEnabledToolGroups,
+                planModeEnabled = requestPlanModeEnabled,
                 taskState = requestTaskState,
             )
 
@@ -2513,6 +2747,8 @@ class AetherViewModel(
                 draftSelectedSkillIds = emptyList(),
                 draftSelectedMcpServerIds = emptyList(),
                 draftAgentModeEnabled = false,
+                draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
+                draftPlanModeEnabled = false,
                 draftWorkspaceId = null,
                 editingSessionId = null,
                 editingMessageId = null,
@@ -2836,6 +3072,74 @@ class AetherViewModel(
         }
     }
 
+    private fun scheduleGeneratedImageMigration(sessions: List<ChatSession>) {
+        val candidates = sessions.filter { session ->
+            session.id !in generatedImageMigrationScheduledSessionIds &&
+                session.messages.any(::messageMayContainDataImage)
+        }
+        if (candidates.isEmpty()) return
+        candidates.forEach { session ->
+            generatedImageMigrationScheduledSessionIds += session.id
+            viewModelScope.launch(Dispatchers.IO) {
+                val migratedMessages = session.messages.map { message ->
+                    externalizeGeneratedImagesInMessage(
+                        sessionId = session.id,
+                        message = message,
+                    )
+                }
+                if (migratedMessages == session.messages) return@launch
+                chatStateStore.update { persisted ->
+                    val sessionIndex = persisted.sessions.indexOfFirst { it.id == session.id }
+                    if (sessionIndex < 0) return@update persisted
+                    val currentSession = persisted.sessions[sessionIndex]
+                    if (currentSession.messages.map { it.id } != session.messages.map { it.id }) {
+                        return@update persisted
+                    }
+                    val updatedSessions = persisted.sessions.toMutableList()
+                    updatedSessions[sessionIndex] = currentSession
+                        .copy(messages = migratedMessages)
+                        .withDerivedMessages(migratedMessages)
+                    persisted.copy(sessions = updatedSessions)
+                }
+            }
+        }
+    }
+
+    private fun messageMayContainDataImage(message: ChatMessage): Boolean =
+        (message.author == MessageAuthor.Agent && markdownMayContainDataImage(message.text)) ||
+            message.branchGroup?.branches.orEmpty().any { branch ->
+                branch.any(::messageMayContainDataImage)
+            }
+
+    private suspend fun externalizeGeneratedImagesInMessage(
+        sessionId: String,
+        message: ChatMessage,
+    ): ChatMessage {
+        var updated = if (message.author == MessageAuthor.Agent && markdownMayContainDataImage(message.text)) {
+            message.copy(
+                text = assistantMarkdownImageExternalizer.externalize(
+                    sessionId = sessionId,
+                    markdown = message.text,
+                ).markdown,
+            )
+        } else {
+            message
+        }
+        val branchGroup = updated.branchGroup
+        if (branchGroup != null && branchGroup.branches.any { branch -> branch.any(::messageMayContainDataImage) }) {
+            val migratedBranches = branchGroup.branches.map { branch ->
+                branch.map { branchMessage ->
+                    externalizeGeneratedImagesInMessage(
+                        sessionId = sessionId,
+                        message = branchMessage,
+                    )
+                }
+            }
+            updated = updated.copy(branchGroup = branchGroup.copy(branches = migratedBranches))
+        }
+        return updated
+    }
+
     private fun persistCurrentSessionId(sessionId: String) {
         chatStateStore.update { persisted ->
             persisted.copy(currentSessionId = sessionId)
@@ -2977,6 +3281,8 @@ class AetherViewModel(
             activeSkills = session.activeSkills,
             activeMcpServerIds = session.activeMcpServerIds,
             agentModeEnabled = session.agentModeEnabled,
+            enabledToolGroups = session.enabledToolGroups,
+            planModeEnabled = session.planModeEnabled,
             taskState = session.taskState,
         )
     }
@@ -2994,6 +3300,7 @@ class AetherViewModel(
                 "has_attachments" to attachments.isNotEmpty(),
                 "attachment_count" to attachments.size,
                 "agent_mode_enabled" to request.agentModeEnabled,
+                "plan_mode_enabled" to request.planModeEnabled,
                 "skill_count" to request.selectedSkillIds.size,
                 "mcp_server_count" to request.activeMcpServerIds.size,
                 "is_edit" to isEdit,
@@ -3096,6 +3403,7 @@ class AetherViewModel(
         "provider_type" to request.settings.provider.storageValue,
         "source" to source,
         "agent_mode_enabled" to request.agentModeEnabled,
+        "plan_mode_enabled" to request.planModeEnabled,
         "skill_count" to request.selectedSkillIds.size,
         "mcp_server_count" to request.activeMcpServerIds.size,
     )
@@ -3134,6 +3442,161 @@ class AetherViewModel(
         )
     }
 
+    private fun activeSession(snapshot: AetherUiState = _uiState.value): ChatSession? =
+        snapshot.sessions.firstOrNull { it.id == snapshot.currentSessionId }
+
+    private fun activeTaskState(snapshot: AetherUiState): AgentTaskState =
+        activeSession(snapshot)?.taskState ?: AgentTaskState()
+
+    private fun activeEnabledToolGroups(snapshot: AetherUiState): List<String> =
+        activeSession(snapshot)?.enabledToolGroups ?: snapshot.draftEnabledToolGroups
+
+    private fun appendLocalAssistantMessage(text: String) {
+        val now = System.currentTimeMillis()
+        var sessionForPersistence: ChatSession? = null
+        var currentSessionIdForPersistence: String? = null
+        _uiState.update { current ->
+            val message = ChatMessage(
+                id = "local-$now",
+                author = MessageAuthor.Agent,
+                text = text,
+                createdAtMillis = now,
+                assistantActionsHidden = true,
+            )
+            val updatedSessions = current.sessions.toMutableList()
+            val sessionIndex = updatedSessions.indexOfFirst { it.id == current.currentSessionId }
+            val updatedSession = if (sessionIndex >= 0) {
+                val existing = updatedSessions.removeAt(sessionIndex)
+                existing.withMessages(existing.messages + message)
+            } else {
+                createSession(
+                    id = current.draftWorkspaceId?.takeIf { it.isNotBlank() } ?: "session-$now",
+                    messages = listOf(message),
+                    title = "Aether status",
+                    hasCustomTitle = true,
+                    selectedModelKey = current.draftSelectedModelKey.ifBlank {
+                        resolveDefaultChatModelKey(current.settings, current.providerConfigs)
+                    },
+                    selectedSkillIds = current.draftSelectedSkillIds,
+                    activeMcpServerIds = current.draftSelectedMcpServerIds,
+                    agentModeEnabled = current.draftAgentModeEnabled,
+                    enabledToolGroups = current.draftEnabledToolGroups,
+                    planModeEnabled = current.draftPlanModeEnabled,
+                )
+            }
+            sessionForPersistence = updatedSession
+            currentSessionIdForPersistence = updatedSession.id
+            updatedSessions.add(0, updatedSession)
+            current.copy(
+                sessions = updatedSessions,
+                currentSessionId = updatedSession.id,
+                draftInput = "",
+                draftAttachments = emptyList(),
+                draftWorkspaceId = null,
+                editingSessionId = null,
+                editingMessageId = null,
+                currentScreen = AppScreen.Chat,
+                showStarterPromptHint = false,
+            )
+        }
+        val session = sessionForPersistence ?: return
+        persistSessionSnapshot(
+            session = session,
+            currentSessionId = currentSessionIdForPersistence ?: session.id,
+            moveToFront = true,
+        )
+    }
+
+    private fun applyTaskStateToCurrentSession(
+        taskState: AgentTaskState,
+        nowMillis: Long,
+    ) {
+        var sessionForPersistence: ChatSession? = null
+        var currentSessionIdForPersistence: String? = null
+        _uiState.update { current ->
+            val updatedSessions = current.sessions.toMutableList()
+            val sessionIndex = updatedSessions.indexOfFirst { it.id == current.currentSessionId }
+            val updatedSession = if (sessionIndex >= 0) {
+                val existing = updatedSessions.removeAt(sessionIndex)
+                existing.copy(taskState = taskState)
+            } else {
+                createSession(
+                    id = current.draftWorkspaceId?.takeIf { it.isNotBlank() } ?: "session-$nowMillis",
+                    messages = emptyList(),
+                    title = taskState.goal.takeIf { it.isNotBlank() }?.let { goal -> "Goal: $goal" } ?: "New chat",
+                    hasCustomTitle = taskState.goal.isNotBlank(),
+                    selectedModelKey = current.draftSelectedModelKey.ifBlank {
+                        resolveDefaultChatModelKey(current.settings, current.providerConfigs)
+                    },
+                    selectedSkillIds = current.draftSelectedSkillIds,
+                    activeMcpServerIds = current.draftSelectedMcpServerIds,
+                    agentModeEnabled = current.draftAgentModeEnabled,
+                    enabledToolGroups = current.draftEnabledToolGroups,
+                    planModeEnabled = current.draftPlanModeEnabled,
+                    taskState = taskState,
+                )
+            }
+            sessionForPersistence = updatedSession
+            currentSessionIdForPersistence = updatedSession.id
+            updatedSessions.add(0, updatedSession)
+            current.copy(
+                sessions = updatedSessions,
+                currentSessionId = updatedSession.id,
+                currentScreen = AppScreen.Chat,
+                showStarterPromptHint = false,
+            )
+        }
+        val session = sessionForPersistence ?: return
+        persistSessionSnapshot(
+            session = session,
+            currentSessionId = currentSessionIdForPersistence ?: session.id,
+            moveToFront = true,
+        )
+    }
+
+    private fun buildGoalStatusMessage(taskState: AgentTaskState): String =
+        if (taskState.goal.isBlank()) {
+            "No active goal."
+        } else {
+            buildString {
+                appendLine("Current goal: ${taskState.goal}")
+                appendLine("Status: ${taskState.status.storageValue}")
+                if (taskState.summary.isNotBlank()) {
+                    appendLine("Summary: ${taskState.summary}")
+                }
+            }.trim()
+        }
+
+    private fun buildSlashStatusMessage(snapshot: AetherUiState): String {
+        val session = activeSession(snapshot)
+        val taskState = session?.taskState ?: AgentTaskState()
+        val enabledGroups = session?.enabledToolGroups ?: snapshot.draftEnabledToolGroups
+        val selectedModelKey = session?.selectedModelKey?.ifBlank {
+            resolveDefaultChatModelKey(snapshot.settings, snapshot.providerConfigs)
+        } ?: snapshot.draftSelectedModelKey.ifBlank {
+            resolveDefaultChatModelKey(snapshot.settings, snapshot.providerConfigs)
+        }
+        val selectedModel = snapshot.providerConfigs
+            .availableModelOptions()
+            .firstOrNull { it.key == selectedModelKey }
+        val selectedSkillNames = (session?.selectedSkillIds ?: snapshot.draftSelectedSkillIds)
+            .mapNotNull { skillId -> snapshot.installedSkills.firstOrNull { it.id == skillId }?.name }
+        val selectedMcpNames = (session?.activeMcpServerIds ?: snapshot.draftSelectedMcpServerIds)
+            .mapNotNull { serverId -> snapshot.mcpServers.firstOrNull { it.id == serverId }?.displayName }
+        val executionState = snapshot.sessionExecutionStates[session?.id ?: snapshot.currentSessionId]
+        return buildString {
+            appendLine("Aether status")
+            appendLine("Model: ${selectedModel?.chatLabel ?: selectedModelKey.ifBlank { "default" }}")
+            appendLine("Plan Mode: ${if (session?.planModeEnabled ?: snapshot.draftPlanModeEnabled) "on" else "off"}")
+            appendLine("Agent Mode: ${if (session?.agentModeEnabled ?: snapshot.draftAgentModeEnabled) "on" else "off"}")
+            appendLine("Tool groups: ${normalizeChatToolGroups(enabledGroups).joinToString().ifBlank { "none" }}")
+            appendLine("Skills: ${selectedSkillNames.joinToString().ifBlank { "none" }}")
+            appendLine("MCP: ${selectedMcpNames.joinToString().ifBlank { "none" }}")
+            appendLine("Task: ${taskState.status.storageValue}${taskState.goal.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}")
+            appendLine("Execution: ${if (executionState?.isRunning == true) "running" else "idle"}")
+        }.trim()
+    }
+
     private fun createSession(
         id: String,
         messages: List<ChatMessage>,
@@ -3144,6 +3607,9 @@ class AetherViewModel(
         activeSkills: List<ActiveSkillContext> = emptyList(),
         activeMcpServerIds: List<String> = emptyList(),
         agentModeEnabled: Boolean = false,
+        enabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
+        planModeEnabled: Boolean = false,
+        taskState: AgentTaskState = AgentTaskState(),
     ): ChatSession {
         val metadata = deriveSessionMetadata(messages)
         val lastActivityAtMillis = messages.lastOrNull()?.createdAtMillis ?: 0L
@@ -3158,6 +3624,9 @@ class AetherViewModel(
             activeSkills = activeSkills,
             activeMcpServerIds = activeMcpServerIds,
             agentModeEnabled = agentModeEnabled,
+            enabledToolGroups = normalizeChatToolGroups(enabledToolGroups),
+            planModeEnabled = planModeEnabled,
+            taskState = taskState,
             lastOpenedAtMillis = lastActivityAtMillis,
             lastActivityAtMillis = lastActivityAtMillis,
         )
@@ -3284,6 +3753,20 @@ class AetherViewModel(
         selected && currentSelection.contains(id) -> currentSelection
         selected -> currentSelection + id
         else -> currentSelection.filterNot { it == id }
+    }
+
+    private fun updateToolGroupSelection(
+        currentSelection: List<String>,
+        id: String,
+        selected: Boolean,
+    ): List<String> {
+        val selectedGroups = normalizeChatToolGroups(currentSelection).toMutableSet()
+        if (selected) {
+            selectedGroups += id
+        } else {
+            selectedGroups -= id
+        }
+        return ChatToolGroups.All.filter(selectedGroups::contains)
     }
 
     private fun deriveSessionMetadata(messages: List<ChatMessage>): SessionMetadata {

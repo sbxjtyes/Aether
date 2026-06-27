@@ -81,6 +81,8 @@ data class SessionTurnRequest(
     val activeSkills: List<ActiveSkillContext>,
     val activeMcpServerIds: List<String>,
     val agentModeEnabled: Boolean,
+    val enabledToolGroups: List<String>,
+    val planModeEnabled: Boolean = false,
     val taskState: AgentTaskState = AgentTaskState(),
     val autonomousContinuationPrompt: String = "",
 )
@@ -125,6 +127,7 @@ class SessionExecutionManager(
     private val _turnEvents = MutableSharedFlow<SessionTurnEvent>(extraBufferCapacity = 8)
     private val executionHandles = ConcurrentHashMap<String, SessionExecutionHandle>()
     private val queuedTurnRequestBuilder = QueuedTurnRequestBuilder(chatStateStore)
+    private val assistantMarkdownImageExternalizer = AssistantMarkdownImageExternalizer(workspaceFileBridge)
     private var lastForegroundEnsureMillis = 0L
 
     val executionStates: StateFlow<Map<String, SessionExecutionState>> = _executionStates.asStateFlow()
@@ -291,6 +294,7 @@ class SessionExecutionManager(
 
                 val decision = lastCompletion.conversationDecision
                 if (
+                    !activeRequest.planModeEnabled &&
                     decision.shouldContinueAutonomously &&
                     decision.nextPrompt.isNotBlank() &&
                     autonomousContinuationCount < MaxAutonomousContinuationTurns
@@ -404,6 +408,8 @@ class SessionExecutionManager(
                 activeSkills = resolvedActiveSkills,
                 mcpToolBindings = mcpClientManager.toolBindings(),
                 agentModeEnabled = request.agentModeEnabled,
+                enabledToolGroups = request.enabledToolGroups,
+                planModeEnabled = request.planModeEnabled,
                 taskState = request.taskState,
                 onToolEvent = { event ->
                     if (handle.pauseRequested) return@runTurn
@@ -567,37 +573,40 @@ class SessionExecutionManager(
                 trigger = ReasoningCompletionTrigger.TurnFinished,
             )
             val thoughtDurationMillis = (System.currentTimeMillis() - turnStartedAtMillis).coerceAtLeast(0L)
-            val completion = result.fold(
-                onSuccess = { turnResult ->
-                    appendAgentMessage(
+            val completion = if (result.isSuccess) {
+                val turnResult = result.getOrThrow()
+                val finalBlocks = ensureAssistantResponseFinalText(
+                    blocks = currentAssistantResponseBlocks(handle.sessionId),
+                    finalText = turnResult.assistantText,
+                ) { handle.nextPendingBlockId("agent-text") }
+                appendAgentMessage(
+                    sessionId = handle.sessionId,
+                    blocks = externalizeAssistantTextBlocks(
                         sessionId = handle.sessionId,
-                        blocks = ensureAssistantResponseFinalText(
-                            blocks = currentAssistantResponseBlocks(handle.sessionId),
-                            finalText = turnResult.assistantText,
-                        ) { handle.nextPendingBlockId("agent-text") },
-                        thoughtDurationMillis = thoughtDurationMillis,
-                        outcome = SessionTurnOutcome.Success,
-                        taskState = turnResult.taskState ?: handle.latestTaskState,
-                        tokenUsage = turnResult.usage.takeIf { !it.isEmpty },
-                    ).copy(conversationDecision = turnResult.conversationDecision)
-                },
-                onFailure = { throwable ->
-                    appendAgentMessage(
-                        sessionId = handle.sessionId,
-                        blocks = appendAssistantResponseText(
-                            blocks = currentAssistantResponseBlocks(handle.sessionId),
-                            delta = buildString {
-                                if (currentAssistantResponseBlocks(handle.sessionId).lastOrNull() is AssistantResponseBlock.Text) {
-                                    append("\n\n")
-                                }
-                                append("Request failed: ${formatFailureMessage(throwable)}")
-                            },
-                        ) { handle.nextPendingBlockId("agent-text") },
-                        thoughtDurationMillis = thoughtDurationMillis,
-                        outcome = SessionTurnOutcome.Failure,
-                    )
-                },
-            )
+                        blocks = finalBlocks,
+                    ),
+                    thoughtDurationMillis = thoughtDurationMillis,
+                    outcome = SessionTurnOutcome.Success,
+                    taskState = turnResult.taskState ?: handle.latestTaskState,
+                    tokenUsage = turnResult.usage.takeIf { !it.isEmpty },
+                ).copy(conversationDecision = turnResult.conversationDecision)
+            } else {
+                val throwable = result.exceptionOrNull() ?: IllegalStateException("Request failed.")
+                appendAgentMessage(
+                    sessionId = handle.sessionId,
+                    blocks = appendAssistantResponseText(
+                        blocks = currentAssistantResponseBlocks(handle.sessionId),
+                        delta = buildString {
+                            if (currentAssistantResponseBlocks(handle.sessionId).lastOrNull() is AssistantResponseBlock.Text) {
+                                append("\n\n")
+                            }
+                            append("Request failed: ${formatFailureMessage(throwable)}")
+                        },
+                    ) { handle.nextPendingBlockId("agent-text") },
+                    thoughtDurationMillis = thoughtDurationMillis,
+                    outcome = SessionTurnOutcome.Failure,
+                )
+            }
             chatStateStore.flush()
             _turnEvents.tryEmit(completion.toTurnEvent(handle.sessionId))
             completion
@@ -665,6 +674,8 @@ class SessionExecutionManager(
             activeSkills = session.activeSkills,
             activeMcpServerIds = session.activeMcpServerIds,
             agentModeEnabled = session.agentModeEnabled,
+            enabledToolGroups = session.enabledToolGroups,
+            planModeEnabled = session.planModeEnabled,
             taskState = session.taskState,
             autonomousContinuationPrompt = buildAutonomousContinuationPrompt(
                 decision = decision,
@@ -754,6 +765,27 @@ class SessionExecutionManager(
             .filter { it.isEnabled }
             .associateBy { it.id }
         return selectedServerIds.distinct().mapNotNull(serversById::get)
+    }
+
+    private suspend fun externalizeAssistantTextBlocks(
+        sessionId: String,
+        blocks: List<AssistantResponseBlock>,
+    ): List<AssistantResponseBlock> {
+        if (blocks.none { it is AssistantResponseBlock.Text && markdownMayContainDataImage(it.text) }) {
+            return blocks
+        }
+        return blocks.map { block ->
+            if (block !is AssistantResponseBlock.Text || !markdownMayContainDataImage(block.text)) {
+                block
+            } else {
+                block.copy(
+                    text = assistantMarkdownImageExternalizer.externalize(
+                        sessionId = sessionId,
+                        markdown = block.text,
+                    ).markdown,
+                )
+            }
+        }
     }
 
     private fun appendAgentMessage(

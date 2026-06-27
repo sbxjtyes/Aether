@@ -1,5 +1,7 @@
 package com.zhousl.aether.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -20,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowForwardIos
 import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Refresh
@@ -79,6 +82,7 @@ class ProviderFormState internal constructor(
     apiKey: String,
     baseUrl: String,
     modelId: String,
+    userAgent: String,
     cachedModels: List<String>,
     enabledModelIds: List<String>,
     basicFunctionCallingCompatibilityMode: Boolean,
@@ -91,6 +95,7 @@ class ProviderFormState internal constructor(
     var apiKey by mutableStateOf(apiKey)
     var baseUrl by mutableStateOf(baseUrl)
     var modelId by mutableStateOf(modelId)
+    var userAgent by mutableStateOf(userAgent)
     var cachedModels by mutableStateOf(cachedModels)
     var enabledModelIds by mutableStateOf(enabledModelIds)
     var basicFunctionCallingCompatibilityMode by mutableStateOf(basicFunctionCallingCompatibilityMode)
@@ -230,6 +235,7 @@ class ProviderFormState internal constructor(
             apiKey = apiKey.trim(),
             baseUrl = baseUrl.trim(),
             modelId = effectiveModelId.ifBlank { selectedProvider.defaultModelId },
+            userAgent = userAgent.trim(),
             cachedModels = normalizedModels,
             enabledModelIds = enabledModelIds
                 .map(String::trim)
@@ -271,6 +277,7 @@ class ProviderFormState internal constructor(
                 apiKey = existingConfig?.apiKey.orEmpty(),
                 baseUrl = existingConfig?.baseUrl ?: initialProvider.defaultBaseUrl,
                 modelId = initialModelId,
+                userAgent = existingConfig?.userAgent.orEmpty(),
                 cachedModels = initialModels,
                 enabledModelIds = initialEnabledModels,
                 basicFunctionCallingCompatibilityMode =
@@ -312,6 +319,7 @@ fun ProviderConfigurationForm(
         else -> ""
     }
     var apiKeyVisible by rememberSaveable { mutableStateOf(false) }
+    var advancedExpanded by rememberSaveable { mutableStateOf(false) }
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -356,24 +364,6 @@ fun ProviderConfigurationForm(
                 LlmProvider.VertexExpress -> providerFormTr(strings, "Use Vertex AI Express Mode generateContent.", "使用 Vertex AI Express Mode generateContent。")
                 LlmProvider.AnthropicMessages -> providerFormTr(strings, "Use Anthropic-compatible /messages endpoints.", "使用 Anthropic 兼容的 /messages 端点。")
             },
-            style = MaterialTheme.typography.bodySmall,
-            color = AetherOnSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 4.dp),
-        )
-
-        ProviderFormCard(cardColor = cardColor) {
-            ProviderCompatibilityModeField(
-                enabled = state.basicFunctionCallingCompatibilityMode,
-                onEnabledChange = { state.basicFunctionCallingCompatibilityMode = it },
-            )
-        }
-
-        Text(
-            text = providerFormTr(
-                strings,
-                "Compatibility mode uses basic function calling and disables parallel or batch tool features for providers with limited tool support.",
-                "兼容模式会使用基础函数调用，并为工具支持有限的 Provider 禁用并行或批量工具功能。",
-            ),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -436,6 +426,23 @@ fun ProviderConfigurationForm(
             )
         }
 
+        SettingsExpandablePanel(
+            title = "Advanced",
+            subtitle = providerFormTr(strings, "Compatibility and request header overrides", "兼容性与请求头覆盖"),
+            expanded = advancedExpanded,
+            onExpandedChange = { advancedExpanded = it },
+        ) {
+            ProviderCompatibilityModeField(
+                enabled = state.basicFunctionCallingCompatibilityMode,
+                onEnabledChange = { state.basicFunctionCallingCompatibilityMode = it },
+            )
+            ProviderFormTextField(
+                label = "User-Agent",
+                value = state.userAgent,
+                onValueChange = { state.userAgent = it },
+            )
+        }
+
         Text(
             text = if (selectedProvider.requiresApiKey(state.baseUrl)) {
                 providerFormTr(strings, "Enabled models appear in the chat model picker. This request format requires an API key.", "已启用模型会显示在聊天模型选择器中。此请求格式需要 API Key。")
@@ -460,6 +467,7 @@ private fun providerFormStateSaver(
             state.apiKey,
             state.baseUrl,
             state.modelId,
+            state.userAgent,
             state.cachedModels,
             state.enabledModelIds,
             state.basicFunctionCallingCompatibilityMode,
@@ -469,6 +477,7 @@ private fun providerFormStateSaver(
     },
     restore = { restored ->
         @Suppress("UNCHECKED_CAST")
+        val hasSavedUserAgent = restored.getOrNull(6) is String
         ProviderFormState(
             existingConfig = existingConfig,
             providerId = restored[0] as String,
@@ -477,13 +486,14 @@ private fun providerFormStateSaver(
             apiKey = restored[3] as String,
             baseUrl = restored[4] as String,
             modelId = restored[5] as String,
-            cachedModels = restored[6] as List<String>,
-            enabledModelIds = restored[7] as List<String>,
-            basicFunctionCallingCompatibilityMode = restored.getOrNull(8) as? Boolean
+            userAgent = if (hasSavedUserAgent) restored[6] as String else existingConfig?.userAgent.orEmpty(),
+            cachedModels = restored[if (hasSavedUserAgent) 7 else 6] as List<String>,
+            enabledModelIds = restored[if (hasSavedUserAgent) 8 else 7] as List<String>,
+            basicFunctionCallingCompatibilityMode = restored.getOrNull(if (hasSavedUserAgent) 9 else 8) as? Boolean
                 ?: existingConfig?.basicFunctionCallingCompatibilityMode
                 ?: false,
-            providerIdManuallyEdited = restored.getOrNull(9) as? Boolean ?: (existingConfig != null),
-            lastAutoGeneratedProviderId = restored.getOrNull(10) as? String ?: restored[0] as String,
+            providerIdManuallyEdited = restored.getOrNull(if (hasSavedUserAgent) 10 else 9) as? Boolean ?: (existingConfig != null),
+            lastAutoGeneratedProviderId = restored.getOrNull(if (hasSavedUserAgent) 11 else 10) as? String ?: restored[0] as String,
         )
     },
 )

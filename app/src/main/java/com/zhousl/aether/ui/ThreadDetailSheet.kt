@@ -71,15 +71,20 @@ internal fun ThreadDetailSheet(
 ) {
     val strings = rememberAetherStrings()
     val language = strings.appLanguage
-    val isRunning = state.isRunning || state.taskSnapshot?.effectiveStatus == AgentTaskStatus.InProgress
+    val hasTaskContext = state.taskSnapshot != null || state.isRunning
+    val isRunning = hasTaskContext &&
+        (state.isRunning || state.taskSnapshot?.effectiveStatus == AgentTaskStatus.InProgress)
     val canArchive = state.session.isArchived || !isRunning
-    val effectiveStatus = state.taskSnapshot?.effectiveStatus ?: if (isRunning) {
-        AgentTaskStatus.InProgress
-    } else {
-        AgentTaskStatus.Idle
+    val effectiveStatus = when {
+        state.taskSnapshot != null -> state.taskSnapshot.effectiveStatus
+        state.isRunning -> AgentTaskStatus.InProgress
+        else -> null
     }
-    val latestActivityLabel = state.taskSnapshot?.activityLabel?.takeIf { it.isNotBlank() }
-        ?: localizedThreadDetailText(
+    val latestActivityLabel = if (hasTaskContext) {
+        state.taskSnapshot?.activityLabel?.takeIf { it.isNotBlank() }
+    } else {
+        null
+    } ?: localizedThreadDetailText(
             language = language,
             english = "Conversation",
             chinese = "\u5bf9\u8bdd",
@@ -228,14 +233,16 @@ internal fun ThreadDetailSheet(
                     chinese = "\u6982\u89c8",
                 ),
             ) {
-                ThreadDetailStatusRow(
-                    label = localizedThreadDetailText(
-                        language = language,
-                        english = "Status",
-                        chinese = "\u72b6\u6001",
-                    ),
-                    value = taskWorkbenchStatusLabel(effectiveStatus, language),
-                )
+                effectiveStatus?.let { status ->
+                    ThreadDetailStatusRow(
+                        label = localizedThreadDetailText(
+                            language = language,
+                            english = "Status",
+                            chinese = "\u72b6\u6001",
+                        ),
+                        value = taskWorkbenchStatusLabel(status, language),
+                    )
+                }
                 ThreadDetailStatusRow(
                     label = localizedThreadDetailText(
                         language = language,
@@ -382,9 +389,7 @@ private fun ThreadDetailSectionCard(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(24.dp))
-            .background(AetherSurfaceHigh)
-            .padding(horizontal = 16.dp, vertical = 16.dp),
+            .padding(vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(
@@ -486,6 +491,7 @@ private fun ThreadDetailActionRow(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(18.dp))
+            .background(tint.copy(alpha = if (enabled) 0.08f else 0.04f))
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -494,7 +500,7 @@ private fun ThreadDetailActionRow(
         Box(
             modifier = Modifier
                 .clip(RoundedCornerShape(14.dp))
-                .background(tint.copy(alpha = if (enabled) 0.12f else 0.08f))
+                .background(tint.copy(alpha = if (enabled) 0.10f else 0.06f))
                 .padding(horizontal = 10.dp, vertical = 10.dp),
             contentAlignment = Alignment.Center,
         ) {
@@ -540,7 +546,7 @@ private fun ThreadDetailPill(
         text = label,
         modifier = modifier
             .clip(RoundedCornerShape(999.dp))
-            .background(tint.copy(alpha = if (enabled) 0.12f else 0.08f))
+            .background(tint.copy(alpha = if (enabled) 0.10f else 0.06f))
             .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 10.dp),
         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium),
