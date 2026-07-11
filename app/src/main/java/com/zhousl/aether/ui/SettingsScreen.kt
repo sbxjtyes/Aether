@@ -110,6 +110,7 @@ import com.zhousl.aether.data.AgentModeAuthorizationIssue
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
 import com.zhousl.aether.data.AgentModeAuthorizationState
 import com.zhousl.aether.data.AgentModeDisplayState
+import com.zhousl.aether.data.AgentLoopPolicy
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AppThemeMode
@@ -122,6 +123,8 @@ import com.zhousl.aether.data.availableModelOptions
 import com.zhousl.aether.data.availableModels
 import com.zhousl.aether.data.enabledModels
 import com.zhousl.aether.data.findModelOption
+import com.zhousl.aether.data.normalizeAgentLoopPolicy
+import com.zhousl.aether.data.normalizeAutonomousContinuationTurns
 import com.zhousl.aether.data.normalizeLlmInactivityReconnectTimeoutSeconds
 import com.zhousl.aether.data.quickActionLabel
 import com.zhousl.aether.data.requiresApiKey
@@ -467,6 +470,7 @@ fun SettingsScreen(
     llmInactivityReconnectTimeoutSeconds: Int,
     keepTasksRunningInBackground: Boolean,
     notifyOnTaskCompletion: Boolean,
+    agentLoopPolicy: AgentLoopPolicy,
     agentModeAuthorizationEnabled: Boolean,
     agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
     agentModeAuthorizationState: AgentModeAuthorizationState,
@@ -494,6 +498,7 @@ fun SettingsScreen(
         Int,
         Boolean,
         Boolean,
+        AgentLoopPolicy,
         Boolean,
         AgentModeAuthorizationMethod,
         AppLanguage,
@@ -562,6 +567,12 @@ fun SettingsScreen(
     var notifyOnTaskCompletionValue by rememberSaveable {
         mutableStateOf(notifyOnTaskCompletion)
     }
+    var autonomousContinuationEnabledValue by rememberSaveable {
+        mutableStateOf(agentLoopPolicy.autonomousContinuationEnabled)
+    }
+    var maxAutonomousContinuationTurnsValue by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(agentLoopPolicy.maxAutonomousContinuationTurns.toString()))
+    }
     var agentModeAuthorizationEnabledValue by rememberSaveable {
         mutableStateOf(agentModeAuthorizationEnabled)
     }
@@ -610,6 +621,14 @@ fun SettingsScreen(
             ),
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
+            normalizeAgentLoopPolicy(
+                AgentLoopPolicy(
+                    autonomousContinuationEnabled = autonomousContinuationEnabledValue,
+                    maxAutonomousContinuationTurns = normalizeAutonomousContinuationTurns(
+                        maxAutonomousContinuationTurnsValue.text.trim().toIntOrNull()
+                    ),
+                )
+            ),
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -635,6 +654,14 @@ fun SettingsScreen(
             ),
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
+            normalizeAgentLoopPolicy(
+                AgentLoopPolicy(
+                    autonomousContinuationEnabled = autonomousContinuationEnabledValue,
+                    maxAutonomousContinuationTurns = normalizeAutonomousContinuationTurns(
+                        maxAutonomousContinuationTurnsValue.text.trim().toIntOrNull()
+                    ),
+                )
+            ),
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -660,6 +687,14 @@ fun SettingsScreen(
             ),
             keepTasksRunningInBackgroundValue,
             notifyOnTaskCompletionValue,
+            normalizeAgentLoopPolicy(
+                AgentLoopPolicy(
+                    autonomousContinuationEnabled = autonomousContinuationEnabledValue,
+                    maxAutonomousContinuationTurns = normalizeAutonomousContinuationTurns(
+                        maxAutonomousContinuationTurnsValue.text.trim().toIntOrNull()
+                    ),
+                )
+            ),
             agentModeAuthorizationEnabledValue,
             agentModeAuthorizationMethodValue,
             languageValue,
@@ -1013,6 +1048,10 @@ fun SettingsScreen(
                 onKeepTasksRunningInBackgroundChanged = { keepTasksRunningInBackgroundValue = it },
                 notifyOnTaskCompletion = notifyOnTaskCompletionValue,
                 onNotifyOnTaskCompletionChanged = { notifyOnTaskCompletionValue = it },
+                autonomousContinuationEnabled = autonomousContinuationEnabledValue,
+                onAutonomousContinuationEnabledChanged = { autonomousContinuationEnabledValue = it },
+                maxAutonomousContinuationTurnsValue = maxAutonomousContinuationTurnsValue,
+                onMaxAutonomousContinuationTurnsChanged = { maxAutonomousContinuationTurnsValue = it },
                 onBack = { currentPage = SettingsPage.Hub.name },
             )
 
@@ -1108,7 +1147,6 @@ fun SettingsScreen(
                 agentModeAuthorizationEnabled = agentModeAuthorizationEnabledValue,
                 agentModeAuthorizationMethod = agentModeAuthorizationMethodValue,
                 agentModeAuthorizationState = agentModeAuthorizationState,
-                rootSetupState = rootSetupState,
                 onAgentModeAuthorizationEnabledChanged = { agentModeAuthorizationEnabledValue = it },
                 onAgentModeAuthorizationMethodChanged = { agentModeAuthorizationMethodValue = it },
                 agentModeDisplayState = agentModeDisplayState,
@@ -1116,8 +1154,6 @@ fun SettingsScreen(
                 onRefreshAgentModeAuthorization = onRefreshAgentModeAuthorization,
                 onOpenShizuku = onOpenShizuku,
                 onInstallShizuku = onInstallShizuku,
-                onRefreshRootSetup = onRefreshRootSetup,
-                onConfigureWithRoot = { openRootSetupProgress(SettingsPage.AgentMode) },
                 onStopAgentModeDisplay = onStopAgentModeDisplay,
                 onRefreshAgentModeDisplays = onRefreshAgentModeDisplays,
                 onBack = { currentPage = SettingsPage.Hub.name },
@@ -1918,6 +1954,10 @@ private fun ReliabilityPage(
     onKeepTasksRunningInBackgroundChanged: (Boolean) -> Unit,
     notifyOnTaskCompletion: Boolean,
     onNotifyOnTaskCompletionChanged: (Boolean) -> Unit,
+    autonomousContinuationEnabled: Boolean,
+    onAutonomousContinuationEnabledChanged: (Boolean) -> Unit,
+    maxAutonomousContinuationTurnsValue: TextFieldValue,
+    onMaxAutonomousContinuationTurnsChanged: (TextFieldValue) -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
@@ -1952,6 +1992,27 @@ private fun ReliabilityPage(
                     subtitle = tr(strings, "Shows a completion alert when a run ends while Aether is not on screen.", "当 Aether 不在前台且任务结束时显示完成提醒。"),
                     checked = notifyOnTaskCompletion,
                     onCheckedChange = onNotifyOnTaskCompletionChanged,
+                )
+                Spacer(Modifier.height(4.dp))
+                SettingsToggleRow(
+                    title = tr(strings, "Autonomous continuation", "自主续跑"),
+                    subtitle = tr(strings, "Lets Aether continue a task with hidden follow-up turns when the model asks to keep working.", "当模型请求继续工作时，允许 Aether 使用隐藏轮次自主续跑。"),
+                    checked = autonomousContinuationEnabled,
+                    onCheckedChange = onAutonomousContinuationEnabledChanged,
+                )
+                ChatGptTextField(
+                    label = tr(strings, "Max autonomous turns (0-16)", "最大自主续跑轮次（0-16）"),
+                    value = maxAutonomousContinuationTurnsValue,
+                    onValueChange = {
+                        val digitsOnly = it.text.filter(Char::isDigit).take(2)
+                        onMaxAutonomousContinuationTurnsChanged(
+                            it.copy(
+                                text = digitsOnly,
+                                selection = androidx.compose.ui.text.TextRange(digitsOnly.length),
+                            )
+                        )
+                    },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
             }
         }
@@ -2934,7 +2995,6 @@ private fun AgentModeSettingsPage(
     agentModeAuthorizationEnabled: Boolean,
     agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
     agentModeAuthorizationState: AgentModeAuthorizationState,
-    rootSetupState: RootSetupState,
     onAgentModeAuthorizationEnabledChanged: (Boolean) -> Unit,
     onAgentModeAuthorizationMethodChanged: (AgentModeAuthorizationMethod) -> Unit,
     agentModeDisplayState: AgentModeDisplayState,
@@ -2942,54 +3002,18 @@ private fun AgentModeSettingsPage(
     onRefreshAgentModeAuthorization: () -> Unit,
     onOpenShizuku: () -> Unit,
     onInstallShizuku: () -> Unit,
-    onRefreshRootSetup: () -> Unit,
-    onConfigureWithRoot: () -> Unit,
     onStopAgentModeDisplay: () -> Unit,
     onRefreshAgentModeDisplays: () -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
-    var showAlreadyConfiguredDialog by rememberSaveable { mutableStateOf(false) }
-    val agentModeConfigured = agentModeAuthorizationEnabled && agentModeAuthorizationState.isReady
-
-    fun requestRootSetup() {
-        if (agentModeConfigured && !rootSetupState.isRunning) {
-            showAlreadyConfiguredDialog = true
-        } else {
-            onConfigureWithRoot()
-        }
-    }
 
     fun refreshAgentModeStatus() {
         onRefreshAgentModeAuthorization()
         onRefreshAgentModeDisplays()
     }
-    if (showAlreadyConfiguredDialog) {
-        RootSetupAlreadyConfiguredDialog(
-            title = tr(strings, "Agent Mode is already configured", "Agent Mode 已配置完成"),
-            body = if (agentModeAuthorizationMethod == AgentModeAuthorizationMethod.Root) {
-                tr(
-                    strings,
-                    "Root Agent Mode authorization is already ready. You do not need to run Root automatic setup again.",
-                    "Root Agent Mode 授权已经正常，不需要再次执行 Root 自动配置。",
-                )
-            } else {
-                tr(
-                    strings,
-                    "Agent Mode authorization is already ready. Root automatic setup is not required; continuing will reconfigure Agent Mode to Root.",
-                    "Agent Mode 授权已经正常，不需要执行 Root 自动配置；继续后会将 Agent Mode 重新配置为 Root。",
-                )
-            },
-            onDismiss = { showAlreadyConfiguredDialog = false },
-            onContinue = {
-                showAlreadyConfiguredDialog = false
-                onConfigureWithRoot()
-            },
-        )
-    }
 
     LaunchedEffect(Unit) {
-        onRefreshRootSetup()
         refreshAgentModeStatus()
         while (true) {
             delay(SettingsAutoRefreshIntervalMillis)
@@ -3055,15 +3079,14 @@ private fun AgentModeSettingsPage(
                     onInstallShizuku = onInstallShizuku,
                 )
                 Spacer(Modifier.height(12.dp))
-                RootSetupSettingsSection(
-                    title = tr(strings, "Root automatic setup", "Root 自动配置"),
-                    rootSetupState = rootSetupState,
-                    body = tr(
+                Text(
+                    text = tr(
                         strings,
-                        "Use su to select Root mode and prepare local device control automatically.",
-                        "使用 su 自动选择 Root 模式，并准备本地设备控制。",
+                        "Root automatic setup is available in Termux settings.",
+                        "Root 自动配置入口在「Termux」设置页。",
                     ),
-                    onConfigureWithRoot = ::requestRootSetup,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
                 )
             }
         }

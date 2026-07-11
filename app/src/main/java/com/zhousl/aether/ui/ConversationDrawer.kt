@@ -209,6 +209,7 @@ fun ConversationDrawer(
     onDeleteSession: (String) -> Unit,
     onDeleteSessions: (Set<String>) -> Unit = { ids -> ids.forEach(onDeleteSession) },
     onSettingsSelected: () -> Unit,
+    onMarketMonitorSelected: () -> Unit = {},
 ) {
     val strings = rememberAetherStrings()
     var searchExpanded by rememberSaveable { mutableStateOf(false) }
@@ -468,6 +469,18 @@ fun ConversationDrawer(
                                     } else {
                                         searchExpanded = true
                                     }
+                                },
+                                size = 46.dp,
+                                containerColor = AetherSurface.copy(alpha = 0.90f),
+                            )
+                            HeaderCircleButton(
+                                icon = LucideIcons.TrendingUp,
+                                contentDescription = "行情监控",
+                                onClick = {
+                                    selectedSessionIds = emptySet()
+                                    searchExpanded = false
+                                    searchQuery = ""
+                                    onMarketMonitorSelected()
                                 },
                                 size = 46.dp,
                                 containerColor = AetherSurface.copy(alpha = 0.90f),

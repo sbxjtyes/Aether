@@ -2,6 +2,8 @@
 
 import com.zhousl.aether.data.AgentTaskState
 import com.zhousl.aether.data.AgentTaskStatus
+import com.zhousl.aether.data.AgentLoopState
+import com.zhousl.aether.data.AgentLoopStopReason
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.PendingSessionInput
 import com.zhousl.aether.data.SessionExecutionState
@@ -14,9 +16,370 @@ import org.junit.Test
 
 class ConversationUiTest {
     @Test
+    fun goalModeStatusLabelsAreLocalized() {
+        assertEquals(
+            "Goal in progress",
+            goalModeTaskStatusLabel(AgentTaskStatus.InProgress, AppLanguage.English),
+        )
+        assertEquals(
+            "目标已暂停",
+            goalModeTaskStatusLabel(AgentTaskStatus.WaitingForUser, AppLanguage.SimplifiedChinese),
+        )
+        assertEquals(
+            "目标受阻",
+            goalModeTaskStatusLabel(AgentTaskStatus.Blocked, AppLanguage.SimplifiedChinese),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptFillsEmptyDraft() {
+        assertEquals(
+            "hello Aether",
+            mergeVoiceTranscriptDraft(
+                currentDraft = "",
+                transcript = " hello Aether ",
+                language = AppLanguage.English,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptFillsBlankDraftWithoutKeepingWhitespace() {
+        assertEquals(
+            "hello Aether",
+            mergeVoiceTranscriptDraft(
+                currentDraft = " \n ",
+                transcript = " hello Aether ",
+                language = AppLanguage.English,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptAppendsEnglishDraftWithSpace() {
+        assertEquals(
+            "Plan the release today",
+            mergeVoiceTranscriptDraft(
+                currentDraft = "Plan the release",
+                transcript = "today",
+                language = AppLanguage.English,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptDoesNotDuplicateEnglishWhitespace() {
+        assertEquals(
+            "Plan the release today",
+            mergeVoiceTranscriptDraft(
+                currentDraft = "Plan the release ",
+                transcript = "today",
+                language = AppLanguage.English,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptPreservesEnglishDraftNewline() {
+        assertEquals(
+            "Plan:\ntoday",
+            mergeVoiceTranscriptDraft(
+                currentDraft = "Plan:\n",
+                transcript = "today",
+                language = AppLanguage.English,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptAppendsChineseDraftWithoutSpace() {
+        assertEquals(
+            "帮我写计划",
+            mergeVoiceTranscriptDraft(
+                currentDraft = "帮我写",
+                transcript = "计划",
+                language = AppLanguage.SimplifiedChinese,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptPreservesChineseDraftNewline() {
+        assertEquals(
+            "帮我写\n计划",
+            mergeVoiceTranscriptDraft(
+                currentDraft = "帮我写\n",
+                transcript = "计划",
+                language = AppLanguage.SimplifiedChinese,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptLeavesDraftUnchangedForEmptyTranscript() {
+        assertEquals(
+            "Keep this draft",
+            mergeVoiceTranscriptDraft(
+                currentDraft = "Keep this draft",
+                transcript = "   ",
+                language = AppLanguage.English,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptMergesIntoExistingEditingDraft() {
+        assertEquals(
+            "Edit prior message with voice",
+            mergeVoiceTranscriptDraft(
+                currentDraft = "Edit prior message",
+                transcript = "with voice",
+                language = AppLanguage.English,
+            ),
+        )
+    }
+
+    @Test
+    fun canceledVoiceInputProducesNoTranscriptOrEmptyMessage() {
+        val result = resolveVoiceInputResult(
+            isOk = false,
+            rawTranscript = null,
+        )
+
+        assertEquals("", result.transcript)
+        assertFalse(result.showEmptyMessage)
+    }
+
+    @Test
+    fun emptySuccessfulVoiceInputShowsEmptyMessage() {
+        val result = resolveVoiceInputResult(
+            isOk = true,
+            rawTranscript = "   ",
+        )
+
+        assertEquals("", result.transcript)
+        assertTrue(result.showEmptyMessage)
+    }
+
+    @Test
+    fun successfulVoiceInputReturnsTrimmedTranscript() {
+        val result = resolveVoiceInputResult(
+            isOk = true,
+            rawTranscript = "  send the update  ",
+        )
+
+        assertEquals("send the update", result.transcript)
+        assertFalse(result.showEmptyMessage)
+    }
+
+    @Test
+    fun conversationScreenActionsCarriesPressHoldVoiceInputCallbacks() {
+        var didPressVoiceInput = false
+        var didReleaseVoiceInput = false
+        var didCancelVoiceInput = false
+        val actions = conversationScreenActionsForTest(
+            onVoiceInputPressed = { didPressVoiceInput = true },
+            onVoiceInputReleased = { didReleaseVoiceInput = true },
+            onCancelVoiceInput = { didCancelVoiceInput = true },
+        )
+
+        actions.onVoiceInputPressed()
+        actions.onVoiceInputReleased()
+        actions.onCancelVoiceInput()
+
+        assertTrue(didPressVoiceInput)
+        assertTrue(didReleaseVoiceInput)
+        assertTrue(didCancelVoiceInput)
+    }
+
+    @Test
+    fun voiceRmsNormalizationClampsAndScalesLevels() {
+        assertEquals(0f, normalizeVoiceRms(-20f), 0.0001f)
+        assertEquals(0f, normalizeVoiceRms(Float.NaN), 0.0001f)
+        assertEquals(0f, normalizeVoiceRms(Float.POSITIVE_INFINITY), 0.0001f)
+
+        val low = normalizeVoiceRms(0f)
+        val middle = normalizeVoiceRms(4f)
+        val high = normalizeVoiceRms(14f)
+
+        assertTrue(middle > low)
+        assertEquals(1f, high, 0.0001f)
+    }
+
+    @Test
+    fun voiceLevelBarsChangeWithLevel() {
+        val quiet = voiceLevelBars(0f)
+        val loud = voiceLevelBars(0.86f)
+
+        assertEquals(7, quiet.size)
+        assertEquals(7, loud.size)
+        assertTrue(loud.zip(quiet).any { (loudLevel, quietLevel) -> loudLevel > quietLevel })
+    }
+
+    @Test
+    fun voiceInputReducerTracksPermissionListeningAndText() {
+        val requesting = reduceVoiceInputState(
+            VoiceInputUiState(),
+            VoiceInputEvent.RequestPermission,
+        )
+        assertEquals(VoiceInputStatus.RequestingPermission, requesting.status)
+
+        val listening = reduceVoiceInputState(requesting, VoiceInputEvent.StartListening)
+        assertEquals(VoiceInputStatus.Listening, listening.status)
+        assertTrue(listening.isHolding)
+
+        val withLevel = reduceVoiceInputState(listening, VoiceInputEvent.LevelChanged(7f))
+        assertEquals(VoiceInputStatus.Listening, withLevel.status)
+        assertTrue(withLevel.level > 0f)
+
+        val withPartial = reduceVoiceInputState(withLevel, VoiceInputEvent.PartialText("  drafting now  "))
+        assertEquals("drafting now", withPartial.partialText)
+        assertEquals(VoiceInputStatus.Listening, withPartial.status)
+
+        val withFinal = reduceVoiceInputState(withPartial, VoiceInputEvent.FinalText("  final text  "))
+        assertEquals(VoiceInputStatus.Processing, withFinal.status)
+        assertEquals("final text", withFinal.finalText)
+        assertEquals("", withFinal.partialText)
+        assertFalse(withFinal.isHolding)
+
+        val canceled = reduceVoiceInputState(withFinal, VoiceInputEvent.Cancel)
+        assertEquals(VoiceInputStatus.Idle, canceled.status)
+        assertEquals("", canceled.finalText)
+    }
+
+    @Test
+    fun voiceInputReducerAccumulatesLongVoiceSegments() {
+        val firstSegment = reduceVoiceInputState(
+            VoiceInputUiState(status = VoiceInputStatus.Listening, isHolding = true),
+            VoiceInputEvent.CommitSegment("first part", AppLanguage.English),
+        )
+        val secondSegment = reduceVoiceInputState(
+            firstSegment,
+            VoiceInputEvent.CommitSegment("second part", AppLanguage.English),
+        )
+        val withPartial = reduceVoiceInputState(
+            secondSegment,
+            VoiceInputEvent.PartialText("third part"),
+        )
+
+        assertEquals("first part second part", secondSegment.committedText)
+        assertEquals(
+            "first part second part third part",
+            recoverVoiceTranscript(withPartial, AppLanguage.English),
+        )
+        assertEquals(VoiceInputStatus.Listening, secondSegment.status)
+        assertTrue(secondSegment.isHolding)
+    }
+
+    @Test
+    fun voiceInputPendingSegmentAvoidsRecommittingAccumulatedText() {
+        val state = VoiceInputUiState(
+            status = VoiceInputStatus.Listening,
+            committedText = "first part",
+            partialText = "second part",
+            isHolding = true,
+        )
+        val committed = reduceVoiceInputState(
+            state,
+            VoiceInputEvent.CommitSegment(
+                pendingVoiceTranscriptSegment(state),
+                AppLanguage.English,
+            ),
+        )
+
+        assertEquals("second part", pendingVoiceTranscriptSegment(state))
+        assertEquals("first part second part", committed.committedText)
+        assertEquals(
+            "first part second part",
+            recoverVoiceTranscript(committed, AppLanguage.English),
+        )
+    }
+
+    @Test
+    fun voiceInputErrorResolutionPreservesRecoverableText() {
+        assertEquals(
+            VoiceInputErrorResolution.CommitRecoveredTranscript,
+            resolveVoiceInputError(
+                hasRecoverableTranscript = true,
+                isEmptyResultError = true,
+            ),
+        )
+        assertEquals(
+            VoiceInputErrorResolution.ShowEmptyMessage,
+            resolveVoiceInputError(
+                hasRecoverableTranscript = false,
+                isEmptyResultError = true,
+            ),
+        )
+        assertEquals(
+            VoiceInputErrorResolution.ShowInterruptedMessage,
+            resolveVoiceInputError(
+                hasRecoverableTranscript = false,
+                isEmptyResultError = false,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceInputContinuesAfterRecoverableHeldErrors() {
+        assertTrue(
+            shouldContinueVoiceInputAfterError(
+                isHolding = true,
+                isFatalError = false,
+                hasRecoverableTranscript = true,
+                emptyRestartCount = 3,
+            ),
+        )
+        assertTrue(
+            shouldContinueVoiceInputAfterError(
+                isHolding = true,
+                isFatalError = false,
+                hasRecoverableTranscript = false,
+                emptyRestartCount = 2,
+            ),
+        )
+        assertFalse(
+            shouldContinueVoiceInputAfterError(
+                isHolding = true,
+                isFatalError = false,
+                hasRecoverableTranscript = false,
+                emptyRestartCount = 3,
+            ),
+        )
+        assertFalse(
+            shouldContinueVoiceInputAfterError(
+                isHolding = true,
+                isFatalError = true,
+                hasRecoverableTranscript = true,
+                emptyRestartCount = 0,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceInputReducerTracksDeniedAndErrors() {
+        val denied = reduceVoiceInputState(
+            VoiceInputUiState(),
+            VoiceInputEvent.PermissionDenied,
+        )
+        assertEquals(VoiceInputStatus.Error, denied.status)
+        assertEquals("permission_denied", denied.errorMessage)
+
+        val failed = reduceVoiceInputState(
+            VoiceInputUiState(status = VoiceInputStatus.Listening, level = 0.7f),
+            VoiceInputEvent.Failed("Voice unavailable"),
+        )
+        assertEquals(VoiceInputStatus.Error, failed.status)
+        assertEquals("Voice unavailable", failed.errorMessage)
+        assertEquals(0f, failed.level, 0.0001f)
+    }
+
+    @Test
     fun composerToolsEntryLabelSwitchesForPlanMode() {
         assertEquals("Auto", composerToolsEntryLabel(planModeSelected = false))
         assertEquals("Plan", composerToolsEntryLabel(planModeSelected = true))
+        assertEquals("Goal", composerToolsEntryLabel(planModeSelected = false, goalModeSelected = true))
+        assertEquals("Plan", composerToolsEntryLabel(planModeSelected = true, goalModeSelected = true))
     }
 
     @Test
@@ -121,6 +484,28 @@ class ConversationUiTest {
 
         assertEquals(AgentTaskStatus.WaitingForUser, waitingSnapshot!!.effectiveStatus)
         assertEquals(AgentTaskStatus.Completed, completedSnapshot!!.effectiveStatus)
+    }
+
+    @Test
+    fun taskWorkbenchSnapshotIncludesLoopStopSignalsWithoutTaskState() {
+        val session = chatSession(id = "loop-limit", preview = "Loop preview")
+
+        val snapshot = session.toTaskWorkbenchSnapshot(
+            executionState = SessionExecutionState(
+                sessionId = session.id,
+                loopState = AgentLoopState(
+                    maxContinuationTurns = 8,
+                    reason = "Still active",
+                    stopReason = AgentLoopStopReason.LimitReached,
+                ),
+            ),
+            isUnviewedComplete = false,
+            language = AppLanguage.English,
+        )
+
+        assertEquals(AgentTaskStatus.WaitingForUser, snapshot!!.effectiveStatus)
+        assertEquals("Autonomous limit reached", snapshot.activityLabel)
+        assertEquals("Still active", snapshot.activityDetail)
     }
 
     @Test
@@ -544,4 +929,56 @@ class ConversationUiTest {
         isUnviewedComplete = false,
         language = AppLanguage.English,
     )!!
+
+    private fun conversationScreenActionsForTest(
+        onVoiceInputPressed: () -> Unit = {},
+        onVoiceInputReleased: () -> Unit = {},
+        onCancelVoiceInput: () -> Unit = {},
+    ): ConversationScreenActions = ConversationScreenActions(
+        onInputChanged = {},
+        onRenameThread = {},
+        onTogglePinned = {},
+        onArchiveThread = {},
+        onRestoreThread = {},
+        onExportThread = {},
+        onDeleteThread = {},
+        onModelSelected = {},
+        onRemoveDraftAttachment = {},
+        onSetSkillSelected = { _, _ -> },
+        onSetMcpServerSelected = { _, _ -> },
+        onSetAgentModeSelected = {},
+        onSetToolGroupEnabled = { _, _ -> },
+        onSetPlanModeEnabled = {},
+        onSetGoalModeEnabled = {},
+        onSlashCommand = { _, _ -> },
+        onCancelEdit = {},
+        onSend = {},
+        onVoiceInputPressed = onVoiceInputPressed,
+        onVoiceInputReleased = onVoiceInputReleased,
+        onCancelVoiceInput = onCancelVoiceInput,
+        onQueueFollowUp = {},
+        onSteerFollowUp = {},
+        onMenu = {},
+        onOpenInbox = {},
+        onNewChat = {},
+        onPickImages = {},
+        onPickFiles = {},
+        onSaveAttachment = {},
+        onOpenLink = {},
+        onEditMessage = {},
+        onDeleteMessage = {},
+        onRedoAgentMessage = {},
+        onRetryUserMessage = {},
+        onSwitchUserMessageBranch = { _, _ -> },
+        onCopyMessage = {},
+        onRequestTermuxPermission = {},
+        onOpenAppPermissions = {},
+        onOpenTermuxSettings = {},
+        onOpenTermux = {},
+        onInstallTermux = {},
+        onRefreshTermuxSetup = {},
+        onPauseGeneration = {},
+        onResumeOnboarding = {},
+        onDismissStarterPromptHint = {},
+    )
 }

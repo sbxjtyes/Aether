@@ -1,10 +1,16 @@
 package com.zhousl.aether.ui
 
+import android.Manifest
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Bundle
 import android.provider.Settings
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import androidx.core.net.toUri
 import android.util.Patterns
 import android.widget.Toast
@@ -105,11 +111,14 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import com.zhousl.aether.data.AetherPrivacyPolicyUrl
 import com.zhousl.aether.data.AetherWebsiteUrl
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
 import com.zhousl.aether.data.AgentTaskState
+import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AppSettings
+import com.zhousl.aether.data.AgentLoopState
 import com.zhousl.aether.data.SessionExecutionState
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.LlmProviderConfig
@@ -131,6 +140,7 @@ import com.zhousl.aether.ui.theme.AetherSurfaceHigh
 import com.zhousl.aether.ui.theme.AetherSurfaceHigher
 import com.zhousl.aether.ui.theme.AetherTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -154,6 +164,13 @@ private const val AssistantLocalFileOpenByteLimit = 32 * 1024 * 1024
 private const val AssistantLocalFileCacheDirectory = "assistant-local-open"
 private const val PrivacyPolicyAnnotationTag = "privacy_policy"
 
+data class MarketAlertLaunchRequest(
+    val id: Long = System.currentTimeMillis(),
+    val symbol: String,
+    val ruleId: String,
+    val autoAnalyze: Boolean,
+)
+
 private fun tr(strings: AetherStrings, english: String, chinese: String): String =
     if (strings.appLanguage == com.zhousl.aether.data.AppLanguage.SimplifiedChinese) chinese else english
 
@@ -161,6 +178,7 @@ private fun AppScreen.depth(): Int = when (this) {
     AppScreen.Onboarding -> 0
     AppScreen.Inbox -> 1
     AppScreen.Chat -> 2
+    AppScreen.MarketMonitor -> 2
     AppScreen.Settings -> 3
 }
 
@@ -168,11 +186,23 @@ private fun AppScreen.depth(): Int = when (this) {
 fun AetherApp(
     viewModel: AetherViewModel = viewModel(),
     onPrivacyPolicyAccepted: () -> Unit = {},
+    marketAlertRequest: MarketAlertLaunchRequest? = null,
+    onMarketAlertRequestConsumed: () -> Unit = {},
 ) {
     val uiState = viewModel.uiState.collectAsStateWithLifecycle().value
     // 流式执行状态单独订阅，逐 token 更新只影响依赖它的子树，不会重组整包 uiState。
     val executionStates = viewModel.executionStates.collectAsStateWithLifecycle().value
     val strings = remember(uiState.settings.language) { aetherStringsFor(uiState.settings.language) }
+
+    LaunchedEffect(marketAlertRequest?.id) {
+        val request = marketAlertRequest ?: return@LaunchedEffect
+        if (request.autoAnalyze) {
+            viewModel.analyzeMarketAlert(request.symbol, request.ruleId)
+        } else {
+            viewModel.openMarketMonitor()
+        }
+        onMarketAlertRequestConsumed()
+    }
 
     AetherLocalization(uiState.settings.language) {
         AetherTheme(themeMode = uiState.settings.themeMode) {
@@ -216,6 +246,7 @@ private fun AetherAppContent(
     val agentModeSelected = activeSession?.agentModeEnabled ?: uiState.draftAgentModeEnabled
     val enabledToolGroups = activeSession?.enabledToolGroups ?: uiState.draftEnabledToolGroups
     val planModeSelected = activeSession?.planModeEnabled ?: uiState.draftPlanModeEnabled
+    val goalModeSelected = activeSession?.goalModeEnabled ?: uiState.draftGoalModeEnabled
     val currentTaskSnapshot = remember(
         activeSession,
         currentSessionExecution,
@@ -298,6 +329,311 @@ private fun AetherAppContent(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = onPickedDocuments,
     )
+    var voiceInputState by remember { mutableStateOf(VoiceInputUiState()) }
+    var speechRecognizer by remember { mutableStateOf<SpeechRecognizer?>(null) }
+    var voiceInputCanceled by remember { mutableStateOf(false) }
+    var voiceInputHeld by remember { mutableStateOf(false) }
+    var voiceInputRecoveryRestartCount by remember { mutableStateOf(0) }
+
+    fun destroyVoiceRecognizer() {
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+    }
+
+    fun voiceTranscriptFromBundle(results: Bundle?): String =
+        results
+            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            ?.firstOrNull()
+            .orEmpty()
+
+    fun currentRecoveredVoiceTranscript(): String =
+        recoverVoiceTranscript(
+            state = voiceInputState,
+            language = uiState.settings.language,
+        )
+
+    fun finishVoiceInputWithTranscript(
+        transcript: String,
+        retainedAfterInterruption: Boolean,
+    ) {
+        val normalizedTranscript = transcript.trim()
+        if (normalizedTranscript.isBlank()) {
+            Toast.makeText(context, strings.voiceInputEmpty, Toast.LENGTH_SHORT).show()
+            voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Cancel)
+            return
+        }
+        voiceInputHeld = false
+        voiceInputState = reduceVoiceInputState(
+            voiceInputState,
+            VoiceInputEvent.FinalText(normalizedTranscript),
+        )
+        viewModel.appendVoiceTranscript(normalizedTranscript)
+        Toast.makeText(
+            context,
+            if (retainedAfterInterruption) strings.voiceInputInterruptedRetained else strings.voiceInputAdded,
+            Toast.LENGTH_SHORT,
+        ).show()
+        voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Cancel)
+    }
+
+    fun finishVoiceInputFromRecoveredText(retainedAfterInterruption: Boolean) {
+        finishVoiceInputWithTranscript(
+            transcript = currentRecoveredVoiceTranscript(),
+            retainedAfterInterruption = retainedAfterInterruption,
+        )
+    }
+
+    fun cancelVoiceInput() {
+        voiceInputHeld = false
+        voiceInputCanceled = true
+        voiceInputRecoveryRestartCount = 0
+        speechRecognizer?.cancel()
+        destroyVoiceRecognizer()
+        voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Cancel)
+    }
+
+    fun isEmptyVoiceResultError(error: Int): Boolean =
+        error == SpeechRecognizer.ERROR_NO_MATCH ||
+            error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+
+    fun isFatalVoiceInputError(error: Int): Boolean =
+        error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ||
+            error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
+            error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
+
+    fun startVoiceInputListening(continuing: Boolean = false) {
+        fun scheduleVoiceInputRestart(delayMillis: Long = 240L) {
+            scope.launch {
+                delay(delayMillis)
+                if (voiceInputHeld && !voiceInputCanceled) {
+                    startVoiceInputListening(continuing = true)
+                }
+            }
+        }
+
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+            voiceInputHeld = false
+            voiceInputState = reduceVoiceInputState(
+                voiceInputState,
+                VoiceInputEvent.Failed(strings.voiceInputUnavailable),
+            )
+            Toast.makeText(context, strings.voiceInputUnavailable, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val languageTag = if (uiState.settings.language == AppLanguage.SimplifiedChinese) "zh-CN" else "en-US"
+        voiceInputCanceled = false
+        destroyVoiceRecognizer()
+        voiceInputState = reduceVoiceInputState(
+            voiceInputState,
+            if (continuing) VoiceInputEvent.ContinueListening else VoiceInputEvent.StartListening,
+        )
+        val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
+        speechRecognizer = recognizer
+        recognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                if (!voiceInputCanceled) {
+                    voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.ContinueListening)
+                }
+            }
+
+            override fun onBeginningOfSpeech() = Unit
+
+            override fun onRmsChanged(rmsdB: Float) {
+                if (!voiceInputCanceled) {
+                    voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.LevelChanged(rmsdB))
+                }
+            }
+
+            override fun onBufferReceived(buffer: ByteArray?) = Unit
+
+            override fun onEndOfSpeech() {
+                if (!voiceInputCanceled) {
+                    voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Processing)
+                }
+            }
+
+            override fun onError(error: Int) {
+                destroyVoiceRecognizer()
+                if (voiceInputCanceled) {
+                    voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Cancel)
+                    return
+                }
+                val recoveredTranscript = currentRecoveredVoiceTranscript()
+                if (shouldContinueVoiceInputAfterError(
+                        isHolding = voiceInputHeld,
+                        isFatalError = isFatalVoiceInputError(error),
+                        hasRecoverableTranscript = recoveredTranscript.isNotBlank(),
+                        emptyRestartCount = voiceInputRecoveryRestartCount,
+                    )
+                ) {
+                    val pendingSegment = pendingVoiceTranscriptSegment(voiceInputState)
+                    if (pendingSegment.isNotBlank()) {
+                        voiceInputRecoveryRestartCount = 0
+                        voiceInputState = reduceVoiceInputState(
+                            voiceInputState,
+                            VoiceInputEvent.CommitSegment(
+                                text = pendingSegment,
+                                language = uiState.settings.language,
+                            ),
+                        )
+                        scheduleVoiceInputRestart()
+                    } else {
+                        voiceInputRecoveryRestartCount += 1
+                        voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.ContinueListening)
+                        scheduleVoiceInputRestart(delayMillis = 420L + voiceInputRecoveryRestartCount * 160L)
+                    }
+                    return
+                }
+                val resolution = resolveVoiceInputError(
+                    hasRecoverableTranscript = currentRecoveredVoiceTranscript().isNotBlank(),
+                    isEmptyResultError = isEmptyVoiceResultError(error),
+                )
+                voiceInputHeld = false
+                voiceInputRecoveryRestartCount = 0
+                when (resolution) {
+                    VoiceInputErrorResolution.CommitRecoveredTranscript -> {
+                        finishVoiceInputFromRecoveredText(retainedAfterInterruption = true)
+                    }
+                    VoiceInputErrorResolution.ShowEmptyMessage -> {
+                        Toast.makeText(context, strings.voiceInputEmpty, Toast.LENGTH_SHORT).show()
+                        voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Cancel)
+                    }
+                    VoiceInputErrorResolution.ShowInterruptedMessage -> {
+                        Toast.makeText(context, strings.voiceInputInterruptedRetry, Toast.LENGTH_SHORT).show()
+                        voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Cancel)
+                    }
+                }
+            }
+
+            override fun onResults(results: Bundle?) {
+                destroyVoiceRecognizer()
+                if (voiceInputCanceled) {
+                    voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Cancel)
+                    return
+                }
+                val voiceResult = resolveVoiceInputResult(
+                    isOk = true,
+                    rawTranscript = voiceTranscriptFromBundle(results),
+                )
+                if (voiceResult.showEmptyMessage) {
+                    if (voiceInputHeld) {
+                        if (voiceInputRecoveryRestartCount < 3) {
+                            voiceInputRecoveryRestartCount += 1
+                            scheduleVoiceInputRestart(delayMillis = 420L + voiceInputRecoveryRestartCount * 160L)
+                        } else {
+                            voiceInputHeld = false
+                            voiceInputRecoveryRestartCount = 0
+                            finishVoiceInputFromRecoveredText(retainedAfterInterruption = false)
+                        }
+                    } else {
+                        finishVoiceInputFromRecoveredText(retainedAfterInterruption = false)
+                    }
+                } else {
+                    if (voiceInputHeld) {
+                        voiceInputRecoveryRestartCount = 0
+                        voiceInputState = reduceVoiceInputState(
+                            voiceInputState,
+                            VoiceInputEvent.CommitSegment(
+                                text = voiceResult.transcript,
+                                language = uiState.settings.language,
+                            ),
+                        )
+                        scheduleVoiceInputRestart()
+                    } else {
+                        voiceInputRecoveryRestartCount = 0
+                        finishVoiceInputWithTranscript(
+                            transcript = mergeVoiceTranscriptSegment(
+                                committedTranscript = voiceInputState.committedText,
+                                segment = voiceResult.transcript,
+                                language = uiState.settings.language,
+                            ),
+                            retainedAfterInterruption = false,
+                        )
+                    }
+                }
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                if (!voiceInputCanceled) {
+                    voiceInputState = reduceVoiceInputState(
+                        voiceInputState,
+                        VoiceInputEvent.PartialText(voiceTranscriptFromBundle(partialResults)),
+                    )
+                }
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) = Unit
+        })
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageTag)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, strings.voice)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2_000L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1_200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 30_000L)
+        }
+        runCatching {
+            recognizer.startListening(intent)
+        }.onFailure {
+            destroyVoiceRecognizer()
+            voiceInputHeld = false
+            voiceInputRecoveryRestartCount = 0
+            voiceInputState = reduceVoiceInputState(
+                voiceInputState,
+                VoiceInputEvent.Failed(strings.voiceInputUnavailable),
+            )
+            Toast.makeText(context, strings.voiceInputUnavailable, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val voicePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            if (granted) {
+                voiceInputRecoveryRestartCount = 0
+                voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Cancel)
+                Toast.makeText(context, strings.voiceHoldToTalk, Toast.LENGTH_SHORT).show()
+            } else {
+                voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.PermissionDenied)
+                Toast.makeText(context, strings.voiceInputPermissionDenied, Toast.LENGTH_SHORT).show()
+            }
+        },
+    )
+
+    fun startVoiceInputHold() {
+        if (voiceInputState.isActive) return
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            voiceInputHeld = true
+            voiceInputRecoveryRestartCount = 0
+            startVoiceInputListening()
+        } else {
+            voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.RequestPermission)
+            voicePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    fun releaseVoiceInputHold() {
+        if (!voiceInputState.isActive || voiceInputState.status == VoiceInputStatus.RequestingPermission) return
+        voiceInputHeld = false
+        voiceInputRecoveryRestartCount = 0
+        if (speechRecognizer != null) {
+            voiceInputState = reduceVoiceInputState(voiceInputState, VoiceInputEvent.Processing)
+            speechRecognizer?.stopListening()
+        } else {
+            finishVoiceInputFromRecoveredText(retainedAfterInterruption = false)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            voiceInputHeld = false
+            voiceInputRecoveryRestartCount = 0
+            speechRecognizer?.cancel()
+            destroyVoiceRecognizer()
+        }
+    }
     val skillFolderPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree(),
         onResult = { treeUri ->
@@ -492,6 +828,12 @@ private fun AetherAppContent(
                         viewModel.openSettings()
                     }
                 },
+                onMarketMonitorSelected = {
+                    scope.launch {
+                        drawerState.close()
+                        viewModel.openMarketMonitor()
+                    }
+                },
             )
         },
     ) {
@@ -599,6 +941,7 @@ private fun AetherAppContent(
                             pendingStatusText = currentSessionExecution?.pendingStatusText.orEmpty(),
                             pendingStatusDetail = currentSessionExecution?.pendingStatusDetail.orEmpty(),
                             pendingInputs = pendingInputs,
+                            loopState = currentSessionExecution?.loopState ?: AgentLoopState(),
                             taskState = activeSession?.taskState ?: AgentTaskState(),
                             inputValue = uiState.draftInput,
                             draftAttachments = uiState.draftAttachments,
@@ -613,6 +956,7 @@ private fun AetherAppContent(
                             agentModeSelected = agentModeSelected,
                             enabledToolGroups = enabledToolGroups,
                             planModeSelected = planModeSelected,
+                            goalModeSelected = goalModeSelected,
                             agentModeDisplayState = uiState.agentModeDisplayState,
                             allowRootImageRead = uiState.rootSetupState.isReady ||
                                 (
@@ -631,6 +975,7 @@ private fun AetherAppContent(
                             showStarterPromptHint = uiState.showStarterPromptHint,
                             showTermuxSetupNotice = !uiState.awaitingFollowUpTour && !uiState.showFollowUpTourCard,
                             isSending = isCurrentSessionRunning,
+                            voiceInputState = voiceInputState,
                         ),
                         actions = ConversationScreenActions(
                             onInputChanged = viewModel::updateDraftInput,
@@ -662,9 +1007,13 @@ private fun AetherAppContent(
                             onSetAgentModeSelected = viewModel::setComposerAgentModeSelected,
                             onSetToolGroupEnabled = viewModel::setComposerToolGroupEnabled,
                             onSetPlanModeEnabled = viewModel::setComposerPlanModeEnabled,
+                            onSetGoalModeEnabled = viewModel::setComposerGoalModeEnabled,
                             onSlashCommand = viewModel::handleComposerSlashCommand,
                             onCancelEdit = viewModel::cancelMessageEdit,
                             onSend = viewModel::sendCurrentMessage,
+                            onVoiceInputPressed = ::startVoiceInputHold,
+                            onVoiceInputReleased = ::releaseVoiceInputHold,
+                            onCancelVoiceInput = ::cancelVoiceInput,
                             onQueueFollowUp = viewModel::queueCurrentMessage,
                             onSteerFollowUp = viewModel::steerCurrentMessage,
                             onMenu = { scope.launch { drawerState.open() } },
@@ -734,6 +1083,10 @@ private fun AetherAppContent(
                         ),
                     )
 
+                    AppScreen.MarketMonitor -> MarketMonitorScreen(
+                        onBack = viewModel::closeMarketMonitor,
+                    )
+
                     AppScreen.Settings -> SettingsScreen(
                     provider = uiState.settings.provider,
                     apiKey = uiState.settings.apiKey,
@@ -744,6 +1097,7 @@ private fun AetherAppContent(
                     llmInactivityReconnectTimeoutSeconds = uiState.settings.llmInactivityReconnectTimeoutSeconds,
                     keepTasksRunningInBackground = uiState.settings.keepTasksRunningInBackground,
                     notifyOnTaskCompletion = uiState.settings.notifyOnTaskCompletion,
+                    agentLoopPolicy = uiState.settings.agentLoopPolicy,
                     agentModeAuthorizationEnabled = uiState.settings.agentModeAuthorizationEnabled,
                     agentModeAuthorizationMethod = uiState.settings.agentModeAuthorizationMethod,
                     agentModeAuthorizationState = uiState.agentModeAuthorizationState,

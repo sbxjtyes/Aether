@@ -1,7 +1,6 @@
 package com.zhousl.aether.ui
 
 import android.graphics.BitmapFactory
-import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -18,7 +17,10 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
@@ -118,7 +120,6 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextRange
@@ -139,6 +140,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
 import com.zhousl.aether.data.InstalledSkill
 import com.zhousl.aether.data.AppLanguage
+import com.zhousl.aether.data.AgentLoopState
 import com.zhousl.aether.data.AgentModeDisplayState
 import com.zhousl.aether.data.AgentTaskState
 import com.zhousl.aether.data.AgentTaskStatus
@@ -223,6 +225,7 @@ internal data class ConversationScreenState(
     val pendingStatusText: String,
     val pendingStatusDetail: String,
     val pendingInputs: List<PendingSessionInput>,
+    val loopState: AgentLoopState = AgentLoopState(),
     val taskState: AgentTaskState,
     val inputValue: String,
     val draftAttachments: List<ChatAttachment>,
@@ -237,6 +240,7 @@ internal data class ConversationScreenState(
     val agentModeSelected: Boolean,
     val enabledToolGroups: List<String>,
     val planModeSelected: Boolean,
+    val goalModeSelected: Boolean,
     val agentModeDisplayState: AgentModeDisplayState,
     val allowRootImageRead: Boolean,
     val isEditing: Boolean,
@@ -245,6 +249,7 @@ internal data class ConversationScreenState(
     val showStarterPromptHint: Boolean,
     val showTermuxSetupNotice: Boolean,
     val isSending: Boolean,
+    val voiceInputState: VoiceInputUiState = VoiceInputUiState(),
 )
 
 internal data class ConversationScreenActions(
@@ -262,9 +267,13 @@ internal data class ConversationScreenActions(
     val onSetAgentModeSelected: (Boolean) -> Unit,
     val onSetToolGroupEnabled: (String, Boolean) -> Unit,
     val onSetPlanModeEnabled: (Boolean) -> Unit,
+    val onSetGoalModeEnabled: (Boolean) -> Unit,
     val onSlashCommand: (ComposerSlashCommandId, String) -> Unit,
     val onCancelEdit: () -> Unit,
     val onSend: () -> Unit,
+    val onVoiceInputPressed: () -> Unit,
+    val onVoiceInputReleased: () -> Unit,
+    val onCancelVoiceInput: () -> Unit,
     val onQueueFollowUp: () -> Unit,
     val onSteerFollowUp: () -> Unit,
     val onMenu: () -> Unit,
@@ -315,6 +324,7 @@ internal fun ConversationScreen(
         pendingStatusText = state.pendingStatusText,
         pendingStatusDetail = state.pendingStatusDetail,
         pendingInputs = state.pendingInputs,
+        loopState = state.loopState,
         taskState = state.taskState,
         inputValue = state.inputValue,
         draftAttachments = state.draftAttachments,
@@ -329,6 +339,7 @@ internal fun ConversationScreen(
         agentModeSelected = state.agentModeSelected,
         enabledToolGroups = state.enabledToolGroups,
         planModeSelected = state.planModeSelected,
+        goalModeSelected = state.goalModeSelected,
         agentModeDisplayState = state.agentModeDisplayState,
         allowRootImageRead = state.allowRootImageRead,
         isEditing = state.isEditing,
@@ -350,9 +361,12 @@ internal fun ConversationScreen(
         onSetAgentModeSelected = actions.onSetAgentModeSelected,
         onSetToolGroupEnabled = actions.onSetToolGroupEnabled,
         onSetPlanModeEnabled = actions.onSetPlanModeEnabled,
+        onSetGoalModeEnabled = actions.onSetGoalModeEnabled,
         onSlashCommand = actions.onSlashCommand,
         onCancelEdit = actions.onCancelEdit,
         onSend = actions.onSend,
+        onVoiceInputPressed = actions.onVoiceInputPressed,
+        onVoiceInputReleased = actions.onVoiceInputReleased,
         onQueueFollowUp = actions.onQueueFollowUp,
         onSteerFollowUp = actions.onSteerFollowUp,
         onMenu = actions.onMenu,
@@ -378,6 +392,8 @@ internal fun ConversationScreen(
         onResumeOnboarding = actions.onResumeOnboarding,
         onDismissStarterPromptHint = actions.onDismissStarterPromptHint,
         isSending = state.isSending,
+        voiceInputState = state.voiceInputState,
+        onCancelVoiceInput = actions.onCancelVoiceInput,
     )
 }
 
@@ -464,6 +480,7 @@ private fun ConversationScreen(
     pendingStatusText: String,
     pendingStatusDetail: String,
     pendingInputs: List<PendingSessionInput>,
+    loopState: AgentLoopState = AgentLoopState(),
     taskState: AgentTaskState,
     inputValue: String,
     draftAttachments: List<ChatAttachment>,
@@ -478,6 +495,7 @@ private fun ConversationScreen(
     agentModeSelected: Boolean,
     enabledToolGroups: List<String>,
     planModeSelected: Boolean,
+    goalModeSelected: Boolean,
     agentModeDisplayState: AgentModeDisplayState,
     allowRootImageRead: Boolean = false,
     isEditing: Boolean,
@@ -499,6 +517,7 @@ private fun ConversationScreen(
     onSetAgentModeSelected: (Boolean) -> Unit,
     onSetToolGroupEnabled: (String, Boolean) -> Unit,
     onSetPlanModeEnabled: (Boolean) -> Unit,
+    onSetGoalModeEnabled: (Boolean) -> Unit,
     onSlashCommand: (ComposerSlashCommandId, String) -> Unit,
     onCancelEdit: () -> Unit,
     onSend: () -> Unit,
@@ -509,6 +528,8 @@ private fun ConversationScreen(
     onNewChat: () -> Unit,
     onPickImages: () -> Unit,
     onPickFiles: () -> Unit,
+    onVoiceInputPressed: () -> Unit,
+    onVoiceInputReleased: () -> Unit,
     onSaveAttachment: (ChatAttachment) -> Unit,
     onOpenLink: (String) -> Unit,
     onEditMessage: (String) -> Unit,
@@ -527,9 +548,12 @@ private fun ConversationScreen(
     onResumeOnboarding: () -> Unit,
     onDismissStarterPromptHint: () -> Unit,
     isSending: Boolean,
+    voiceInputState: VoiceInputUiState,
+    onCancelVoiceInput: () -> Unit,
 ) {
     val listState = remember(conversationStateKey) { LazyListState() }
     val coroutineScope = rememberCoroutineScope()
+    val strings = rememberAetherStrings()
     var loadedFromMessageIndex by rememberSaveable(conversationStateKey) { mutableIntStateOf(-1) }
     var isLoadingOlderMessages by remember(conversationStateKey) { mutableStateOf(false) }
     LaunchedEffect(conversationStateKey, messages.size) {
@@ -724,6 +748,7 @@ private fun ConversationScreen(
             revision = revision * 31 + conversationItems.lastOrNull()?.key.hashCode()
             revision = revision * 31 + pendingAssistantText.length
             revision = revision * 31 + pendingInputs.size
+            revision = revision * 31 + loopState.hashCode()
             pendingResponseBlocks.forEach { block ->
                 revision = when (block) {
                     is AssistantResponseBlock.Text -> revision * 31 + block.text.length
@@ -923,6 +948,12 @@ private fun ConversationScreen(
 
                                         PendingGenerationIndicator.None -> Unit
                                     }
+                                    agentLoopStatusText(
+                                        loopState = loopState,
+                                        language = strings.appLanguage,
+                                    )?.let { statusText ->
+                                        AgentLoopStatusPill(statusText = statusText)
+                                    }
                                 }
                             }
                         }
@@ -972,12 +1003,13 @@ private fun ConversationScreen(
                     agentModeSelected = agentModeSelected,
                     enabledToolGroups = enabledToolGroups,
                     planModeSelected = planModeSelected,
+                    goalModeSelected = goalModeSelected,
                     modelOptions = modelOptions,
                     selectedModelKey = selectedModelKey,
                     isEditing = isEditing,
                     termuxSetupState = termuxSetupState,
-                    taskState = taskState,
                     isSending = isSending,
+                    voiceInputState = voiceInputState,
                     showStarterPromptHint = showStarterPromptHint,
                     showTermuxSetupNotice = showTermuxSetupNotice,
                     onValueChange = onInputChanged,
@@ -987,11 +1019,15 @@ private fun ConversationScreen(
                     onSetAgentModeSelected = onSetAgentModeSelected,
                     onSetToolGroupEnabled = onSetToolGroupEnabled,
                     onSetPlanModeEnabled = onSetPlanModeEnabled,
+                    onSetGoalModeEnabled = onSetGoalModeEnabled,
                     onSlashCommand = onSlashCommand,
                     onModelSelected = onModelSelected,
                     onCancelEdit = onCancelEdit,
                     onPickImages = onPickImages,
                     onPickFiles = onPickFiles,
+                    onVoiceInputPressed = onVoiceInputPressed,
+                    onVoiceInputReleased = onVoiceInputReleased,
+                    onCancelVoiceInput = onCancelVoiceInput,
                     onRequestTermuxPermission = onRequestTermuxPermission,
                     onOpenAppPermissions = onOpenAppPermissions,
                     onOpenTermuxSettings = onOpenTermuxSettings,
@@ -1239,19 +1275,6 @@ private fun ConversationTopBar(
             )
         }
 
-        ConversationThreadMetaBar(
-            session = currentSession,
-            taskSnapshot = currentTaskSnapshot,
-            title = currentSessionTitle,
-            isPinned = currentSessionPinned,
-            isArchived = currentSessionArchived,
-            onRenameThread = onRenameThread,
-            onTogglePinned = onTogglePinned,
-            onArchiveThread = onArchiveThread,
-            onRestoreThread = onRestoreThread,
-            onExportThread = onExportThread,
-            onDeleteThread = onDeleteThread,
-        )
     }
 }
 
@@ -1984,6 +2007,49 @@ private fun isLegacyAssistantGroupStart(
 }
 
 @Composable
+private fun AgentLoopStatusPill(
+    statusText: AgentLoopStatusText,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(AetherSurfaceHigh.copy(alpha = 0.82f))
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.AutoAwesome,
+            contentDescription = null,
+            tint = AetherOnSurfaceVariant,
+            modifier = Modifier.size(16.dp),
+        )
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = statusText.title,
+                style = MaterialTheme.typography.labelMedium,
+                color = AetherOnSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (statusText.detail.isNotBlank()) {
+                Text(
+                    text = statusText.detail,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun PendingSessionInputBubble(
     pendingInput: PendingSessionInput,
 ) {
@@ -2041,189 +2107,6 @@ private fun PendingSessionInputBubble(
 }
 
 @Composable
-private fun TaskStatePanel(
-    taskState: AgentTaskState,
-    modifier: Modifier = Modifier,
-) {
-    if (taskState.isEmpty) return
-
-    var expanded by rememberSaveable(taskState.updatedAtMillis, taskState.goal) { mutableStateOf(false) }
-    val accent = taskStatusAccent(taskState.status)
-    val doneCount = taskState.todos.count { it.done }
-    val totalCount = taskState.todos.size
-    val progressLabel = if (totalCount > 0) "$doneCount/$totalCount" else taskStatusLabel(taskState.status)
-    val bodyText = taskPanelBodyText(taskState)
-    val visibleTodos = taskState.todos.take(5)
-
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .shadow(12.dp, RoundedCornerShape(24.dp), ambientColor = AetherScrim, spotColor = AetherScrim)
-            .clip(RoundedCornerShape(24.dp))
-            .background(AetherSurface.copy(alpha = 0.96f))
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-            ) { expanded = !expanded }
-            .animateContentSize(animationSpec = tween(durationMillis = 220, easing = ChatGptMotionEasing))
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(30.dp)
-                    .clip(CircleShape)
-                    .background(accent.copy(alpha = 0.16f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = taskStatusIcon(taskState.status),
-                    contentDescription = null,
-                    tint = accent,
-                    modifier = Modifier.size(18.dp),
-                )
-            }
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = taskStatusLabel(taskState.status),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = AetherOnSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = taskState.goal.ifBlank { bodyText },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = AetherOnSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            Text(
-                text = progressLabel,
-                style = MaterialTheme.typography.labelMedium,
-                color = accent,
-                maxLines = 1,
-            )
-            Icon(
-                imageVector = Icons.Rounded.KeyboardArrowDown,
-                contentDescription = null,
-                tint = AetherOnSurfaceVariant,
-                modifier = Modifier
-                    .size(22.dp)
-                    .graphicsLayer { rotationZ = if (expanded) 180f else 0f },
-            )
-        }
-
-        if (expanded) {
-            if (bodyText.isNotBlank() && bodyText != taskState.goal) {
-                Text(
-                    text = bodyText,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = AetherOnSurfaceVariant,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-
-            visibleTodos.forEach { item ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.Top,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .padding(top = 2.dp)
-                            .size(18.dp)
-                            .clip(CircleShape)
-                            .background(if (item.done) accent.copy(alpha = 0.18f) else AetherSurfaceHigher),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        if (item.done) {
-                            Icon(
-                                imageVector = Icons.Rounded.Check,
-                                contentDescription = null,
-                                tint = accent,
-                                modifier = Modifier.size(13.dp),
-                            )
-                        }
-                    }
-                    Text(
-                        text = item.text,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (item.done) AetherOnSurfaceVariant else AetherOnSurface,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-
-            if (taskState.todos.size > visibleTodos.size) {
-                Text(
-                    text = "+${taskState.todos.size - visibleTodos.size} more",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = AetherOnSurfaceVariant,
-                )
-            }
-
-            if (taskState.completionCriteria.isNotEmpty()) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        text = "Completion",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = AetherOnSurfaceVariant,
-                    )
-                    taskState.completionCriteria.take(3).forEach { criterion ->
-                        Text(
-                            text = criterion,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = AetherOnSurface,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun taskPanelBodyText(taskState: AgentTaskState): String =
-    taskState.summary.ifBlank { taskState.completionCriteria.firstOrNull().orEmpty() }
-
-private fun taskStatusLabel(status: AgentTaskStatus): String = when (status) {
-    AgentTaskStatus.Idle -> "Task ready"
-    AgentTaskStatus.InProgress -> "Working"
-    AgentTaskStatus.WaitingForUser -> "Waiting for you"
-    AgentTaskStatus.Completed -> "Completed"
-    AgentTaskStatus.Blocked -> "Blocked"
-}
-
-@Composable
-private fun taskStatusAccent(status: AgentTaskStatus): Color = when (status) {
-    AgentTaskStatus.Completed -> AetherPrimary
-    AgentTaskStatus.Blocked -> MaterialTheme.colorScheme.error
-    AgentTaskStatus.WaitingForUser -> Color(0xFFB26A00)
-    AgentTaskStatus.InProgress -> AetherPrimary
-    AgentTaskStatus.Idle -> AetherOnSurfaceVariant
-}
-
-private fun taskStatusIcon(status: AgentTaskStatus): ImageVector = when (status) {
-    AgentTaskStatus.Completed -> Icons.Rounded.Check
-    AgentTaskStatus.Blocked -> Icons.Rounded.Close
-    AgentTaskStatus.WaitingForUser -> Icons.Rounded.Lightbulb
-    AgentTaskStatus.InProgress -> Icons.Rounded.AutoAwesome
-    AgentTaskStatus.Idle -> Icons.Rounded.AutoAwesome
-}
-
-@Composable
 private fun ConversationComposerOverlay(
     modifier: Modifier = Modifier,
     onBodyHeightChanged: (Int) -> Unit,
@@ -2241,12 +2124,13 @@ private fun ConversationComposerOverlay(
     agentModeSelected: Boolean,
     enabledToolGroups: List<String>,
     planModeSelected: Boolean,
+    goalModeSelected: Boolean,
     modelOptions: List<ProviderModelOption>,
     selectedModelKey: String,
     isEditing: Boolean,
     termuxSetupState: TermuxSetupState,
-    taskState: AgentTaskState,
     isSending: Boolean,
+    voiceInputState: VoiceInputUiState,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
     onValueChange: (String) -> Unit,
@@ -2256,11 +2140,15 @@ private fun ConversationComposerOverlay(
     onSetAgentModeSelected: (Boolean) -> Unit,
     onSetToolGroupEnabled: (String, Boolean) -> Unit,
     onSetPlanModeEnabled: (Boolean) -> Unit,
+    onSetGoalModeEnabled: (Boolean) -> Unit,
     onSlashCommand: (ComposerSlashCommandId, String) -> Unit,
     onModelSelected: (String) -> Unit,
     onCancelEdit: () -> Unit,
     onPickImages: () -> Unit,
     onPickFiles: () -> Unit,
+    onVoiceInputPressed: () -> Unit,
+    onVoiceInputReleased: () -> Unit,
+    onCancelVoiceInput: () -> Unit,
     onRequestTermuxPermission: () -> Unit,
     onOpenAppPermissions: () -> Unit,
     onOpenTermuxSettings: () -> Unit,
@@ -2308,12 +2196,13 @@ private fun ConversationComposerOverlay(
                 agentModeSelected = agentModeSelected,
                 enabledToolGroups = enabledToolGroups,
                 planModeSelected = planModeSelected,
+                goalModeSelected = goalModeSelected,
                 modelOptions = modelOptions,
                 selectedModelKey = selectedModelKey,
                 isEditing = isEditing,
                 termuxSetupState = termuxSetupState,
-                taskState = taskState,
                 isSending = isSending,
+                voiceInputState = voiceInputState,
                 showStarterPromptHint = showStarterPromptHint,
                 showTermuxSetupNotice = showTermuxSetupNotice,
                 onValueChange = onValueChange,
@@ -2323,11 +2212,15 @@ private fun ConversationComposerOverlay(
                 onSetAgentModeSelected = onSetAgentModeSelected,
                 onSetToolGroupEnabled = onSetToolGroupEnabled,
                 onSetPlanModeEnabled = onSetPlanModeEnabled,
+                onSetGoalModeEnabled = onSetGoalModeEnabled,
                 onSlashCommand = onSlashCommand,
                 onModelSelected = onModelSelected,
                 onCancelEdit = onCancelEdit,
                 onPickImages = onPickImages,
                 onPickFiles = onPickFiles,
+                onVoiceInputPressed = onVoiceInputPressed,
+                onVoiceInputReleased = onVoiceInputReleased,
+                onCancelVoiceInput = onCancelVoiceInput,
                 onRequestTermuxPermission = onRequestTermuxPermission,
                 onOpenAppPermissions = onOpenAppPermissions,
                 onOpenTermuxSettings = onOpenTermuxSettings,
@@ -2359,12 +2252,13 @@ private fun ChatGptPromptComposerBar(
     agentModeSelected: Boolean,
     enabledToolGroups: List<String>,
     planModeSelected: Boolean,
+    goalModeSelected: Boolean,
     modelOptions: List<ProviderModelOption>,
     selectedModelKey: String,
     isEditing: Boolean,
     termuxSetupState: TermuxSetupState,
-    taskState: AgentTaskState,
     isSending: Boolean,
+    voiceInputState: VoiceInputUiState,
     showStarterPromptHint: Boolean,
     showTermuxSetupNotice: Boolean,
     onValueChange: (String) -> Unit,
@@ -2374,11 +2268,15 @@ private fun ChatGptPromptComposerBar(
     onSetAgentModeSelected: (Boolean) -> Unit,
     onSetToolGroupEnabled: (String, Boolean) -> Unit,
     onSetPlanModeEnabled: (Boolean) -> Unit,
+    onSetGoalModeEnabled: (Boolean) -> Unit,
     onSlashCommand: (ComposerSlashCommandId, String) -> Unit,
     onModelSelected: (String) -> Unit,
     onCancelEdit: () -> Unit,
     onPickImages: () -> Unit,
     onPickFiles: () -> Unit,
+    onVoiceInputPressed: () -> Unit,
+    onVoiceInputReleased: () -> Unit,
+    onCancelVoiceInput: () -> Unit,
     onRequestTermuxPermission: () -> Unit,
     onOpenAppPermissions: () -> Unit,
     onOpenTermuxSettings: () -> Unit,
@@ -2393,7 +2291,6 @@ private fun ChatGptPromptComposerBar(
     onSteerFollowUp: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
-    val context = LocalContext.current
     val density = LocalDensity.current
     val focusRequester = remember { FocusRequester() }
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -2530,7 +2427,6 @@ private fun ChatGptPromptComposerBar(
             .padding(horizontal = 24.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        TaskStatePanel(taskState = taskState)
         if (showTermuxSetupNotice) {
             TermuxSetupNotice(
                 setupState = termuxSetupState,
@@ -2610,6 +2506,10 @@ private fun ChatGptPromptComposerBar(
                 )
             }
         }
+        VoiceInputPanel(
+            state = voiceInputState,
+            onCancel = onCancelVoiceInput,
+        )
 
         Box(modifier = Modifier.fillMaxWidth()) {
             Box(
@@ -2712,8 +2612,9 @@ private fun ChatGptPromptComposerBar(
 
                     Box {
                         ComposerToolsButton(
-                            selected = toolsMenuExpanded || planModeSelected,
+                            selected = toolsMenuExpanded || planModeSelected || goalModeSelected,
                             planModeSelected = planModeSelected,
+                            goalModeSelected = goalModeSelected,
                             onClick = {
                                 attachmentMenuExpanded = false
                                 toolsMenuExpanded = !toolsMenuExpanded
@@ -2724,6 +2625,7 @@ private fun ChatGptPromptComposerBar(
                             agentModeAvailable = agentModeAvailable,
                             agentModeSelected = agentModeSelected,
                             planModeSelected = planModeSelected,
+                            goalModeSelected = goalModeSelected,
                             enabledToolGroups = normalizedToolGroups,
                             allSkillsSelected = allSkillsSelected,
                             allMcpServersSelected = allMcpServersSelected,
@@ -2735,6 +2637,7 @@ private fun ChatGptPromptComposerBar(
                             onSetToolGroupEnabled = onSetToolGroupEnabled,
                             onSetAgentModeSelected = onSetAgentModeSelected,
                             onSetPlanModeEnabled = onSetPlanModeEnabled,
+                            onSetGoalModeEnabled = onSetGoalModeEnabled,
                             onSetSkillSelected = onSetSkillSelected,
                             onSetMcpServerSelected = onSetMcpServerSelected,
                         )
@@ -2746,17 +2649,10 @@ private fun ChatGptPromptComposerBar(
                         icon = Icons.Rounded.Mic,
                         contentDescription = strings.voice,
                         iconSize = 23.dp,
-                        onClick = {
-                            Toast.makeText(
-                                context,
-                                if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
-                                    "语音输入暂不可用"
-                                } else {
-                                    "Voice input is not available yet"
-                                },
-                                Toast.LENGTH_SHORT,
-                            ).show()
-                        },
+                        selected = voiceInputState.status == VoiceInputStatus.Listening ||
+                            voiceInputState.status == VoiceInputStatus.Processing,
+                        onPress = onVoiceInputPressed,
+                        onRelease = onVoiceInputReleased,
                     )
                     if (showPauseButton) {
                         ComposerPauseButton(onClick = onPauseGeneration)
@@ -2790,6 +2686,179 @@ private fun ChatGptPromptComposerBar(
                 }
             }
         }
+    }
+}
+
+internal fun goalModeTaskStatusLabel(
+    status: AgentTaskStatus,
+    language: AppLanguage,
+): String {
+    val isChinese = language == AppLanguage.SimplifiedChinese
+    return when (status) {
+        AgentTaskStatus.InProgress -> if (isChinese) "目标进行中" else "Goal in progress"
+        AgentTaskStatus.WaitingForUser -> if (isChinese) "目标已暂停" else "Goal paused"
+        AgentTaskStatus.Completed -> if (isChinese) "目标已完成" else "Goal complete"
+        AgentTaskStatus.Blocked -> if (isChinese) "目标受阻" else "Goal blocked"
+        AgentTaskStatus.Idle -> if (isChinese) "目标模式" else "Goal Mode"
+    }
+}
+
+@Composable
+private fun VoiceInputPanel(
+    state: VoiceInputUiState,
+    onCancel: () -> Unit,
+) {
+    if (!state.isActive) return
+    val strings = rememberAetherStrings()
+    val recognizedText = recoverVoiceTranscript(state, strings.appLanguage)
+    val title = when (state.status) {
+        VoiceInputStatus.RequestingPermission -> strings.grantAccess
+        VoiceInputStatus.Listening -> strings.voiceListening
+        VoiceInputStatus.Processing -> strings.voiceProcessing
+        VoiceInputStatus.Error -> strings.voiceInputUnavailable
+        VoiceInputStatus.Idle -> strings.voice
+    }
+    val bodyText = when {
+        state.errorMessage.isNotBlank() && state.errorMessage != "permission_denied" -> state.errorMessage
+        recognizedText.isNotBlank() -> recognizedText
+        state.finalText.isNotBlank() -> state.finalText
+        state.status == VoiceInputStatus.Error && state.errorMessage == "permission_denied" -> strings.voiceInputPermissionDenied
+        state.status == VoiceInputStatus.Listening -> strings.voiceReleaseToAddDraft
+        else -> strings.voiceHoldToTalk
+    }
+    val bars = remember(state.level) { voiceLevelBars(state.level, count = 7) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(26.dp))
+            .background(AetherSurfaceHigh.copy(alpha = 0.92f))
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(42.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (state.status == VoiceInputStatus.Listening) {
+                            AetherPrimary.copy(alpha = 0.18f + state.level * 0.18f)
+                        } else {
+                            AetherSurface.copy(alpha = 0.84f)
+                        }
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Mic,
+                    contentDescription = null,
+                    tint = if (state.status == VoiceInputStatus.Listening) AetherPrimary else AetherOnSurface,
+                    modifier = Modifier.size(21.dp),
+                )
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                    color = AetherOnSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = bodyText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AetherOnSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            VoiceLevelBars(
+                levels = bars,
+                active = state.status == VoiceInputStatus.Listening,
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            VoicePanelAction(
+                label = strings.cancel,
+                onClick = onCancel,
+                emphasized = false,
+            )
+        }
+    }
+}
+
+@Composable
+private fun VoiceLevelBars(
+    levels: List<Float>,
+    active: Boolean,
+) {
+    Row(
+        modifier = Modifier
+            .height(32.dp)
+            .width(54.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+    ) {
+        levels.forEachIndexed { index, level ->
+            val targetHeight by animateDpAsState(
+                targetValue = if (active) (7.dp + 23.dp * level) else 7.dp,
+                animationSpec = tween(durationMillis = 120, easing = ChatGptMotionEasing),
+                label = "voice_level_bar_$index",
+            )
+            Box(
+                modifier = Modifier
+                    .width(4.dp)
+                    .height(targetHeight)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(if (active) AetherPrimary.copy(alpha = 0.74f) else AetherOnSurfaceVariant.copy(alpha = 0.28f))
+            )
+        }
+    }
+}
+
+@Composable
+private fun VoicePanelAction(
+    label: String,
+    onClick: () -> Unit,
+    emphasized: Boolean,
+    enabled: Boolean = true,
+) {
+    val background = when {
+        !enabled -> AetherSurface.copy(alpha = 0.42f)
+        emphasized -> AetherOnSurface
+        else -> AetherSurface.copy(alpha = 0.82f)
+    }
+    val foreground = when {
+        !enabled -> AetherOnSurfaceVariant.copy(alpha = 0.46f)
+        emphasized -> AetherSurface
+        else -> AetherOnSurface
+    }
+    Box(
+        modifier = Modifier
+            .height(34.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(background)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 14.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium),
+            color = foreground,
+            maxLines = 1,
+        )
     }
 }
 
@@ -2949,19 +3018,35 @@ private fun ComposerIconButton(
     icon: ImageVector,
     contentDescription: String?,
     iconSize: Dp,
-    onClick: () -> Unit,
+    selected: Boolean = false,
+    onClick: (() -> Unit)? = null,
+    onPress: (() -> Unit)? = null,
+    onRelease: (() -> Unit)? = null,
 ) {
+    val inputModifier = if (onPress != null && onRelease != null) {
+        Modifier.pointerInput(onPress, onRelease) {
+            awaitEachGesture {
+                awaitFirstDown(requireUnconsumed = false)
+                onPress()
+                waitForUpOrCancellation()
+                onRelease()
+            }
+        }
+    } else {
+        Modifier.clickable { onClick?.invoke() }
+    }
     Box(
         modifier = Modifier
             .size(38.dp)
             .clip(CircleShape)
-            .clickable(onClick = onClick),
+            .background(if (selected) AetherPrimary.copy(alpha = 0.14f) else Color.Transparent)
+            .then(inputModifier),
         contentAlignment = Alignment.Center,
     ) {
         Icon(
             imageVector = icon,
             contentDescription = contentDescription,
-            tint = AetherOnSurface,
+            tint = if (selected) AetherPrimary else AetherOnSurface,
             modifier = Modifier.size(iconSize),
         )
     }
@@ -2971,6 +3056,7 @@ private fun ComposerIconButton(
 private fun ComposerToolsButton(
     selected: Boolean,
     planModeSelected: Boolean,
+    goalModeSelected: Boolean,
     onClick: () -> Unit,
 ) {
     Row(
@@ -2990,7 +3076,7 @@ private fun ComposerToolsButton(
             modifier = Modifier.size(20.dp),
         )
         Text(
-            text = composerToolsEntryLabel(planModeSelected),
+            text = composerToolsEntryLabel(planModeSelected, goalModeSelected),
             style = MaterialTheme.typography.bodyLarge.copy(fontSize = 16.sp, lineHeight = 20.sp),
             color = AetherOnSurface,
             maxLines = 1,
@@ -2998,8 +3084,14 @@ private fun ComposerToolsButton(
     }
 }
 
-internal fun composerToolsEntryLabel(planModeSelected: Boolean): String =
-    if (planModeSelected) "Plan" else "Auto"
+internal fun composerToolsEntryLabel(
+    planModeSelected: Boolean,
+    goalModeSelected: Boolean = false,
+): String = when {
+    planModeSelected -> "Plan"
+    goalModeSelected -> "Goal"
+    else -> "Auto"
+}
 
 @Composable
 private fun ComposerAttachmentPopup(
@@ -3060,6 +3152,7 @@ private fun ComposerToolsPopup(
     agentModeAvailable: Boolean,
     agentModeSelected: Boolean,
     planModeSelected: Boolean,
+    goalModeSelected: Boolean,
     enabledToolGroups: List<String>,
     allSkillsSelected: Boolean,
     allMcpServersSelected: Boolean,
@@ -3071,6 +3164,7 @@ private fun ComposerToolsPopup(
     onSetToolGroupEnabled: (String, Boolean) -> Unit,
     onSetAgentModeSelected: (Boolean) -> Unit,
     onSetPlanModeEnabled: (Boolean) -> Unit,
+    onSetGoalModeEnabled: (Boolean) -> Unit,
     onSetSkillSelected: (String, Boolean) -> Unit,
     onSetMcpServerSelected: (String, Boolean) -> Unit,
 ) {
@@ -3088,7 +3182,8 @@ private fun ComposerToolsPopup(
     val activeCapabilityCount = normalizedToolGroups.size +
         activeExtensionSelectionCount +
         (if (agentModeSelected) 1 else 0) +
-        (if (planModeSelected) 1 else 0)
+        (if (planModeSelected) 1 else 0) +
+        (if (goalModeSelected) 1 else 0)
     fun groupEnabled(groupId: String): Boolean = enabledGroupSet.contains(groupId)
     fun toggleGroup(groupId: String) {
         onSetToolGroupEnabled(groupId, !groupEnabled(groupId))
@@ -3130,11 +3225,15 @@ private fun ComposerToolsPopup(
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 ComposerToolsSummaryCard(
-                    title = if (planModeSelected) "Plan" else "Auto",
+                    title = composerToolsEntryLabel(planModeSelected, goalModeSelected),
                     subtitle = if (isChinese) {
                         if (planModeSelected) "只读探索并输出计划" else "按需使用已启用能力"
                     } else {
-                        if (planModeSelected) "Explore read-only and propose a plan" else "Use enabled capabilities as needed"
+                        when {
+                            planModeSelected -> "Explore read-only and propose a plan"
+                            goalModeSelected -> "Keep working toward the active goal"
+                            else -> "Use enabled capabilities as needed"
+                        }
                     },
                     trailing = if (isChinese) {
                         "$activeCapabilityCount 项"
@@ -3152,6 +3251,13 @@ private fun ComposerToolsPopup(
                     trailing = onOffLabel(planModeSelected),
                     selected = planModeSelected,
                     onClick = { onSetPlanModeEnabled(!planModeSelected) },
+                )
+                ChatGptToolMenuRow(
+                    title = if (isChinese) "目标模式" else "Goal Mode",
+                    icon = Icons.Rounded.AutoAwesome,
+                    trailing = onOffLabel(goalModeSelected),
+                    selected = goalModeSelected,
+                    onClick = { onSetGoalModeEnabled(!goalModeSelected) },
                 )
                 ChatGptToolMenuRow(
                     title = if (isChinese) "文件与图片" else "Files & Images",

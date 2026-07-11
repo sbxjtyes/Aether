@@ -31,6 +31,7 @@ class AetherForegroundService : Service() {
             runtime.notificationController.buildForegroundNotification(
                 sessions = emptyList(),
                 executionStates = emptyMap(),
+                isMarketMonitoring = runtime.marketMonitorRepository.isRunning,
             ),
         )
         serviceScope.launch {
@@ -38,15 +39,20 @@ class AetherForegroundService : Service() {
                 runtime.chatStateStore.state,
                 runtime.sessionExecutionManager.executionStates,
                 runtime.settingsRepository.settings,
-            ) { chatState, executionStates, settings ->
-                Triple(chatState.sessions, executionStates, settings)
-            }.conflate().collect { (sessions, executionStates, settings) ->
+                runtime.marketMonitorRepository.isRunningFlow,
+            ) { chatState, executionStates, settings, isMonitoring ->
+                ForegroundState(chatState.sessions, executionStates, settings, isMonitoring)
+            }.conflate().collect { state ->
+                val sessions = state.sessions
+                val executionStates = state.executionStates
+                val settings = state.settings
                 val activeCount = executionStates.values.count { it.isRunning }
-                if (activeCount == 0 || !settings.keepTasksRunningInBackground) {
+                val isMonitoring = state.isMarketMonitoring
+                if ((activeCount == 0 && !isMonitoring) || (!settings.keepTasksRunningInBackground && !isMonitoring)) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 } else {
-                    val signature = foregroundNotificationSignature(sessions, executionStates)
+                    val signature = foregroundNotificationSignature(sessions, executionStates, isMonitoring)
                     val now = System.currentTimeMillis()
                     if (
                         signature != lastForegroundSignature ||
@@ -56,6 +62,7 @@ class AetherForegroundService : Service() {
                             runtime.notificationController.buildForegroundNotification(
                                 sessions = sessions,
                                 executionStates = executionStates,
+                                isMarketMonitoring = isMonitoring,
                             ),
                         )
                         lastForegroundSignature = signature
@@ -80,6 +87,7 @@ class AetherForegroundService : Service() {
                 runtime.notificationController.buildForegroundNotification(
                     sessions = emptyList(),
                     executionStates = emptyMap(),
+                    isMarketMonitoring = runtime.marketMonitorRepository.isRunning,
                 ),
             )
         }
@@ -107,6 +115,7 @@ class AetherForegroundService : Service() {
     private fun foregroundNotificationSignature(
         sessions: List<com.zhousl.aether.ui.ChatSession>,
         executionStates: Map<String, com.zhousl.aether.data.SessionExecutionState>,
+        isMarketMonitoring: Boolean,
     ): String {
         val activeIds = executionStates
             .filterValues { it.isRunning }
@@ -115,7 +124,7 @@ class AetherForegroundService : Service() {
         val activeTitles = activeIds.joinToString(separator = "|") { sessionId ->
             sessions.firstOrNull { it.id == sessionId }?.title.orEmpty()
         }
-        return "${activeIds.size}:$activeTitles"
+        return "${activeIds.size}:$activeTitles:$isMarketMonitoring"
     }
 
     companion object {
@@ -137,3 +146,10 @@ class AetherForegroundService : Service() {
         }
     }
 }
+
+private data class ForegroundState(
+    val sessions: List<com.zhousl.aether.ui.ChatSession>,
+    val executionStates: Map<String, com.zhousl.aether.data.SessionExecutionState>,
+    val settings: com.zhousl.aether.data.AppSettings,
+    val isMarketMonitoring: Boolean,
+)

@@ -33,15 +33,17 @@ class ComposerSlashCommandsTest {
 
     @Test
     fun goalTextSetsInProgressGoal() {
-        val updated = applyGoalSlashCommand(
+        val result = applyGoalSlashCommand(
             current = AgentTaskState(),
             inlineText = "Ship slash commands",
             nowMillis = 42L,
         )
+        val updated = result.taskState
 
         assertEquals("Ship slash commands", updated.goal)
         assertEquals(AgentTaskStatus.InProgress, updated.status)
         assertEquals(42L, updated.updatedAtMillis)
+        assertEquals(true, result.goalModeEnabled)
     }
 
     @Test
@@ -53,14 +55,17 @@ class ComposerSlashCommandsTest {
         )
 
         val paused = applyGoalSlashCommand(current, "pause", 10L)
-        val resumed = applyGoalSlashCommand(paused, "resume", 11L)
-        val cleared = applyGoalSlashCommand(resumed, "clear", 12L)
+        val resumed = applyGoalSlashCommand(paused.taskState, "resume", 11L)
+        val cleared = applyGoalSlashCommand(resumed.taskState, "clear", 12L)
 
-        assertEquals(AgentTaskStatus.WaitingForUser, paused.status)
-        assertEquals(10L, paused.updatedAtMillis)
-        assertEquals(AgentTaskStatus.InProgress, resumed.status)
-        assertEquals(11L, resumed.updatedAtMillis)
-        assertTrue(cleared.isEmpty)
+        assertEquals(AgentTaskStatus.WaitingForUser, paused.taskState.status)
+        assertEquals(10L, paused.taskState.updatedAtMillis)
+        assertEquals(false, paused.goalModeEnabled)
+        assertEquals(AgentTaskStatus.InProgress, resumed.taskState.status)
+        assertEquals(11L, resumed.taskState.updatedAtMillis)
+        assertEquals(true, resumed.goalModeEnabled)
+        assertTrue(cleared.taskState.isEmpty)
+        assertEquals(false, cleared.goalModeEnabled)
     }
 
     @Test

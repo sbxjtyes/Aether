@@ -23,6 +23,7 @@ enum class AppScreen {
     Inbox,
     Chat,
     Settings,
+    MarketMonitor,
 }
 
 enum class OnboardingStep {

@@ -41,32 +41,52 @@ internal fun slashCommandQuery(input: String): String? {
     return trimmed.drop(1).takeWhile { !it.isWhitespace() }.lowercase()
 }
 
+internal data class GoalSlashCommandResult(
+    val taskState: AgentTaskState,
+    val goalModeEnabled: Boolean?,
+)
+
 internal fun applyGoalSlashCommand(
     current: AgentTaskState,
     inlineText: String,
     nowMillis: Long,
-): AgentTaskState {
+): GoalSlashCommandResult {
     val goalText = inlineText.trim()
     return when (goalText.lowercase()) {
-        "clear" -> AgentTaskState()
-        "pause" -> current.copy(
-            status = AgentTaskStatus.WaitingForUser,
-            summary = current.summary.ifBlank { "Goal paused." },
-            updatedAtMillis = nowMillis,
+        "clear" -> GoalSlashCommandResult(
+            taskState = AgentTaskState(),
+            goalModeEnabled = false,
         )
-        "resume" -> current.copy(
-            status = AgentTaskStatus.InProgress,
-            summary = current.summary.ifBlank { "Goal resumed." },
-            updatedAtMillis = nowMillis,
+        "pause" -> GoalSlashCommandResult(
+            taskState = current.copy(
+                status = AgentTaskStatus.WaitingForUser,
+                summary = current.summary.ifBlank { "Goal paused." },
+                updatedAtMillis = nowMillis,
+            ),
+            goalModeEnabled = false,
+        )
+        "resume" -> GoalSlashCommandResult(
+            taskState = current.copy(
+                status = AgentTaskStatus.InProgress,
+                summary = current.summary.ifBlank { "Goal resumed." },
+                updatedAtMillis = nowMillis,
+            ),
+            goalModeEnabled = true,
         )
         else -> if (goalText.isBlank()) {
-            current
+            GoalSlashCommandResult(
+                taskState = current,
+                goalModeEnabled = null,
+            )
         } else {
-            current.copy(
-                goal = goalText,
-                status = AgentTaskStatus.InProgress,
-                summary = "Goal set from /goal.",
-                updatedAtMillis = nowMillis,
+            GoalSlashCommandResult(
+                taskState = current.copy(
+                    goal = goalText,
+                    status = AgentTaskStatus.InProgress,
+                    summary = "Goal set from /goal.",
+                    updatedAtMillis = nowMillis,
+                ),
+                goalModeEnabled = true,
             )
         }
     }

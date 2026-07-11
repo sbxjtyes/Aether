@@ -419,6 +419,44 @@ object LucideIcons {
             return _trash2!!
         }
 
+    // 行情监控图标（折线图）
+    val TrendingUp: ImageVector
+        get() {
+            if (_trendingUp != null) return _trendingUp!!
+            _trendingUp = ImageVector.Builder(
+                name = "trending_up",
+                defaultWidth = 24.dp,
+                defaultHeight = 24.dp,
+                viewportWidth = 24f,
+                viewportHeight = 24f,
+            ).apply {
+                path(
+                    fill = SolidColor(Color.Transparent),
+                    stroke = SolidColor(Color(0xFF000000)),
+                    strokeLineWidth = 2f,
+                    strokeLineCap = StrokeCap.Round,
+                    strokeLineJoin = StrokeJoin.Round,
+                ) {
+                    moveTo(22f, 7f)
+                    lineToRelative(-10f, 10f)
+                    lineToRelative(-4f, -4f)
+                    lineToRelative(-6f, 6f)
+                }
+                path(
+                    fill = SolidColor(Color.Transparent),
+                    stroke = SolidColor(Color(0xFF000000)),
+                    strokeLineWidth = 2f,
+                    strokeLineCap = StrokeCap.Round,
+                    strokeLineJoin = StrokeJoin.Round,
+                ) {
+                    moveTo(16f, 7f)
+                    horizontalLineToRelative(6f)
+                    verticalLineToRelative(6f)
+                }
+            }.build()
+            return _trendingUp!!
+        }
+
     private var _search: ImageVector? = null
     private var _settings: ImageVector? = null
     private var _squarePen: ImageVector? = null
@@ -428,4 +466,5 @@ object LucideIcons {
     private var _mousePointer2: ImageVector? = null
     private var _rotateCcw: ImageVector? = null
     private var _trash2: ImageVector? = null
+    private var _trendingUp: ImageVector? = null
 }

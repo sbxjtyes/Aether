@@ -109,6 +109,7 @@ internal data class TaskSearchMatch(
 internal data class TaskWorkbenchSnapshot(
     val session: ChatSession,
     val isPinned: Boolean,
+    val goalModeEnabled: Boolean,
     val effectiveStatus: AgentTaskStatus,
     val headline: String,
     val body: String,
@@ -1728,14 +1729,17 @@ internal fun ChatSession.toTaskWorkbenchSnapshot(
 ): TaskWorkbenchSnapshot? {
     val hasPendingInputs = executionState?.pendingInputs?.isNotEmpty() == true
     val isRunning = executionState?.isRunning == true
+    val hasLoopSignal = executionState?.loopState
+        ?.let { agentLoopStatusText(it, language) } != null
     val hasTaskState = !taskState.isEmpty
-    val hasTaskSignal = hasTaskState || isRunning || hasPendingInputs || isUnviewedComplete
+    val hasTaskSignal = hasTaskState || isRunning || hasPendingInputs || hasLoopSignal || isUnviewedComplete
     if (!hasTaskSignal) return null
 
     val effectiveStatus = when {
         isRunning -> AgentTaskStatus.InProgress
         taskState.status != AgentTaskStatus.Idle -> taskState.status
         hasPendingInputs -> AgentTaskStatus.WaitingForUser
+        hasLoopSignal -> AgentTaskStatus.WaitingForUser
         isUnviewedComplete -> AgentTaskStatus.Completed
         else -> AgentTaskStatus.Idle
     }
@@ -1766,6 +1770,7 @@ internal fun ChatSession.toTaskWorkbenchSnapshot(
     return TaskWorkbenchSnapshot(
         session = this,
         isPinned = isPinned,
+        goalModeEnabled = goalModeEnabled,
         effectiveStatus = effectiveStatus,
         headline = headline,
         body = body,
@@ -1795,6 +1800,12 @@ private fun taskWorkbenchRecentActivitySummary(
     executionState: SessionExecutionState?,
     language: AppLanguage,
 ): Pair<String, String> {
+    executionState?.loopState
+        ?.let { loopState -> agentLoopStatusText(loopState, language) }
+        ?.let { statusText ->
+            return statusText.title to statusText.detail
+        }
+
     executionState?.pendingStatusText
         ?.trim()
         ?.takeIf { it.isNotBlank() }
@@ -1813,6 +1824,13 @@ private fun taskWorkbenchRecentActivitySummary(
         )
         val detail = parseTaskWorkbenchSubject(runningTool.argumentsJson)
         return title to detail
+    }
+
+    if (session.goalModeEnabled && session.taskState.goal.isNotBlank()) {
+        return goalModeTaskStatusLabel(
+            status = session.taskState.status,
+            language = language,
+        ) to session.taskState.summary
     }
 
     executionState?.pendingAssistantText

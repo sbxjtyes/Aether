@@ -14,6 +14,7 @@ import com.zhousl.aether.data.AppUpdateManager
 import com.zhousl.aether.data.AssistantMarkdownImageExternalizer
 import com.zhousl.aether.data.AutomaticModelPurpose
 import com.zhousl.aether.data.AgentModeAuthorizationMethod
+import com.zhousl.aether.data.AgentLoopPolicy
 import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.AppSettings
 import com.zhousl.aether.data.AppThemeMode
@@ -33,6 +34,8 @@ import com.zhousl.aether.data.McpValidationSummary
 import com.zhousl.aether.data.generateQuickActionLabel
 import com.zhousl.aether.data.markdownMayContainDataImage
 import com.zhousl.aether.data.normalizeChatToolGroups
+import com.zhousl.aether.data.normalizeAgentLoopPolicy
+import com.zhousl.aether.data.normalizeAutonomousContinuationTurns
 import com.zhousl.aether.data.normalizeSelectableModelKey
 import com.zhousl.aether.data.normalizeLlmInactivityReconnectTimeoutSeconds
 import com.zhousl.aether.data.OnboardingStarterPrompt
@@ -76,6 +79,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -90,6 +94,209 @@ private const val LogcatReadTimeoutSeconds = 4L
 private const val AetherViewModelLogTag = "AetherViewModel"
 private const val SessionTitleSystemPrompt =
     "Generate a concise chat title for this conversation. Return only the title, in the user's language when possible, with no quotes, no emoji, and at most 6 words."
+
+internal fun mergeVoiceTranscriptDraft(
+    currentDraft: String,
+    transcript: String,
+    language: AppLanguage,
+): String {
+    val trimmedTranscript = transcript.trim()
+    if (trimmedTranscript.isBlank()) return currentDraft
+
+    if (currentDraft.isBlank()) return trimmedTranscript
+
+    val shouldInsertSpace = language != AppLanguage.SimplifiedChinese &&
+        currentDraft.lastOrNull()?.isWhitespace() != true
+    val separator = if (shouldInsertSpace) " " else ""
+    return currentDraft + separator + trimmedTranscript
+}
+
+internal data class VoiceInputResult(
+    val transcript: String = "",
+    val showEmptyMessage: Boolean = false,
+)
+
+internal fun resolveVoiceInputResult(
+    isOk: Boolean,
+    rawTranscript: String?,
+): VoiceInputResult {
+    if (!isOk) return VoiceInputResult()
+    val transcript = rawTranscript.orEmpty().trim()
+    return if (transcript.isBlank()) {
+        VoiceInputResult(showEmptyMessage = true)
+    } else {
+        VoiceInputResult(transcript = transcript)
+    }
+}
+
+internal enum class VoiceInputErrorResolution {
+    CommitRecoveredTranscript,
+    ShowEmptyMessage,
+    ShowInterruptedMessage,
+}
+
+internal fun resolveVoiceInputError(
+    hasRecoverableTranscript: Boolean,
+    isEmptyResultError: Boolean,
+): VoiceInputErrorResolution = when {
+    hasRecoverableTranscript -> VoiceInputErrorResolution.CommitRecoveredTranscript
+    isEmptyResultError -> VoiceInputErrorResolution.ShowEmptyMessage
+    else -> VoiceInputErrorResolution.ShowInterruptedMessage
+}
+
+internal fun mergeVoiceTranscriptSegment(
+    committedTranscript: String,
+    segment: String,
+    language: AppLanguage,
+): String = mergeVoiceTranscriptDraft(
+    currentDraft = committedTranscript,
+    transcript = segment,
+    language = language,
+)
+
+internal fun pendingVoiceTranscriptSegment(state: VoiceInputUiState): String =
+    state.partialText.ifBlank { state.finalText }.trim()
+
+internal fun recoverVoiceTranscript(
+    state: VoiceInputUiState,
+    language: AppLanguage,
+): String = mergeVoiceTranscriptSegment(
+    committedTranscript = state.committedText,
+    segment = pendingVoiceTranscriptSegment(state),
+    language = language,
+)
+
+internal fun shouldContinueVoiceInputAfterError(
+    isHolding: Boolean,
+    isFatalError: Boolean,
+    hasRecoverableTranscript: Boolean,
+    emptyRestartCount: Int,
+    maxEmptyRestarts: Int = 3,
+): Boolean = isHolding &&
+    !isFatalError &&
+    (hasRecoverableTranscript || emptyRestartCount < maxEmptyRestarts)
+
+internal enum class VoiceInputStatus {
+    Idle,
+    RequestingPermission,
+    Listening,
+    Processing,
+    Error,
+}
+
+internal data class VoiceInputUiState(
+    val status: VoiceInputStatus = VoiceInputStatus.Idle,
+    val partialText: String = "",
+    val finalText: String = "",
+    val committedText: String = "",
+    val level: Float = 0f,
+    val errorMessage: String = "",
+    val isHolding: Boolean = false,
+) {
+    val isActive: Boolean
+        get() = status != VoiceInputStatus.Idle
+}
+
+internal sealed interface VoiceInputEvent {
+    data object RequestPermission : VoiceInputEvent
+    data object PermissionDenied : VoiceInputEvent
+    data object StartListening : VoiceInputEvent
+    data object ContinueListening : VoiceInputEvent
+    data class LevelChanged(val rmsDb: Float) : VoiceInputEvent
+    data class PartialText(val text: String) : VoiceInputEvent
+    data class CommitSegment(val text: String, val language: AppLanguage) : VoiceInputEvent
+    data class FinalText(val text: String) : VoiceInputEvent
+    data class Failed(val message: String) : VoiceInputEvent
+    data object Processing : VoiceInputEvent
+    data object Cancel : VoiceInputEvent
+}
+
+internal fun reduceVoiceInputState(
+    current: VoiceInputUiState,
+    event: VoiceInputEvent,
+): VoiceInputUiState = when (event) {
+    VoiceInputEvent.RequestPermission -> VoiceInputUiState(status = VoiceInputStatus.RequestingPermission)
+    VoiceInputEvent.PermissionDenied -> VoiceInputUiState(
+        status = VoiceInputStatus.Error,
+        errorMessage = "permission_denied",
+    )
+    VoiceInputEvent.StartListening -> VoiceInputUiState(status = VoiceInputStatus.Listening, isHolding = true)
+    VoiceInputEvent.ContinueListening -> current.copy(
+        status = VoiceInputStatus.Listening,
+        partialText = "",
+        finalText = "",
+        level = 0f,
+        errorMessage = "",
+        isHolding = true,
+    )
+    is VoiceInputEvent.LevelChanged -> current.copy(
+        status = VoiceInputStatus.Listening,
+        level = smoothVoiceLevel(current.level, normalizeVoiceRms(event.rmsDb)),
+    )
+    is VoiceInputEvent.PartialText -> current.copy(
+        status = VoiceInputStatus.Listening,
+        partialText = event.text.trim(),
+        errorMessage = "",
+    )
+    is VoiceInputEvent.CommitSegment -> current.copy(
+        status = VoiceInputStatus.Listening,
+        committedText = mergeVoiceTranscriptSegment(
+            committedTranscript = current.committedText,
+            segment = event.text,
+            language = event.language,
+        ),
+        partialText = "",
+        finalText = "",
+        level = 0f,
+        errorMessage = "",
+        isHolding = true,
+    )
+    is VoiceInputEvent.FinalText -> current.copy(
+        status = VoiceInputStatus.Processing,
+        finalText = event.text.trim(),
+        partialText = "",
+        committedText = "",
+        level = 0f,
+        errorMessage = "",
+        isHolding = false,
+    )
+    is VoiceInputEvent.Failed -> current.copy(
+        status = VoiceInputStatus.Error,
+        errorMessage = event.message,
+        level = 0f,
+        isHolding = false,
+    )
+    VoiceInputEvent.Processing -> current.copy(status = VoiceInputStatus.Processing, level = 0f, isHolding = false)
+    VoiceInputEvent.Cancel -> VoiceInputUiState()
+}
+
+internal fun normalizeVoiceRms(rmsDb: Float): Float {
+    if (!rmsDb.isFinite()) return 0f
+    return ((rmsDb + 2f) / 12f).coerceIn(0f, 1f)
+}
+
+internal fun smoothVoiceLevel(
+    previous: Float,
+    next: Float,
+): Float {
+    val safePrevious = previous.coerceIn(0f, 1f)
+    val safeNext = next.coerceIn(0f, 1f)
+    return (safePrevious * 0.58f + safeNext * 0.42f).coerceIn(0f, 1f)
+}
+
+internal fun voiceLevelBars(
+    level: Float,
+    count: Int = 7,
+): List<Float> {
+    val safeCount = count.coerceAtLeast(1)
+    val safeLevel = level.coerceIn(0f, 1f)
+    val center = (safeCount - 1) / 2f
+    return List(safeCount) { index ->
+        val distance = kotlin.math.abs(index - center) / center.coerceAtLeast(1f)
+        val emphasis = 1f - distance * 0.42f
+        (0.18f + safeLevel * emphasis).coerceIn(0.12f, 1f)
+    }
+}
 
 class AetherViewModel(
     application: Application,
@@ -603,6 +810,22 @@ class AetherViewModel(
         }
     }
 
+    fun appendVoiceTranscript(transcript: String) {
+        if (transcript.isBlank()) return
+        val language = _uiState.value.settings.language
+        _uiState.update { current ->
+            current.copy(
+                draftInput = mergeVoiceTranscriptDraft(
+                    currentDraft = current.draftInput,
+                    transcript = transcript,
+                    language = language,
+                ),
+                showStarterPromptHint = false,
+            )
+        }
+        emitTransientMessage(aetherStringsFor(language).voiceInputAdded)
+    }
+
     fun skipOnboarding() {
         viewModelScope.launch {
             settingsRepository.updateOnboardingSeenVersion(CurrentOnboardingVersion)
@@ -705,6 +928,7 @@ class AetherViewModel(
                     draftAgentModeEnabled = false,
                     draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
                     draftPlanModeEnabled = false,
+                    draftGoalModeEnabled = false,
                     draftWorkspaceId = null,
                     editingSessionId = null,
                     editingMessageId = null,
@@ -896,6 +1120,14 @@ class AetherViewModel(
         }
     }
 
+    fun openMarketMonitor() {
+        _uiState.update { it.copy(currentScreen = AppScreen.MarketMonitor) }
+    }
+
+    fun closeMarketMonitor() {
+        _uiState.update { it.copy(currentScreen = AppScreen.Chat) }
+    }
+
     fun startNewChat() {
         _uiState.update {
             it.copy(
@@ -909,6 +1141,7 @@ class AetherViewModel(
                 draftAgentModeEnabled = false,
                 draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
                 draftPlanModeEnabled = false,
+                draftGoalModeEnabled = false,
                 draftWorkspaceId = null,
                 editingSessionId = null,
                 editingMessageId = null,
@@ -942,6 +1175,7 @@ class AetherViewModel(
                 draftAgentModeEnabled = false,
                 draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
                 draftPlanModeEnabled = false,
+                draftGoalModeEnabled = false,
                 draftWorkspaceId = null,
                 editingSessionId = null,
                 editingMessageId = null,
@@ -1115,6 +1349,7 @@ class AetherViewModel(
                 draftSelectedMcpServerIds = if (archivedCurrentSession) emptyList() else current.draftSelectedMcpServerIds,
                 draftAgentModeEnabled = if (archivedCurrentSession) false else current.draftAgentModeEnabled,
                 draftPlanModeEnabled = if (archivedCurrentSession) false else current.draftPlanModeEnabled,
+                draftGoalModeEnabled = if (archivedCurrentSession) false else current.draftGoalModeEnabled,
                 draftWorkspaceId = if (archivedCurrentSession) null else current.draftWorkspaceId,
                 editingSessionId = if (current.editingSessionId in archivedIds) null else current.editingSessionId,
                 editingMessageId = if (current.editingSessionId in archivedIds) null else current.editingMessageId,
@@ -1305,6 +1540,7 @@ class AetherViewModel(
                             draftAgentModeEnabled = false,
                             draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
                             draftPlanModeEnabled = false,
+                            draftGoalModeEnabled = false,
                             draftWorkspaceId = null,
                             editingSessionId = null,
                             editingMessageId = null,
@@ -1369,6 +1605,7 @@ class AetherViewModel(
                 draftAgentModeEnabled = false,
                 draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
                 draftPlanModeEnabled = false,
+                draftGoalModeEnabled = false,
                 draftWorkspaceId = null,
                 editingSessionId = null,
                 editingMessageId = null,
@@ -1443,6 +1680,13 @@ class AetherViewModel(
                     } else {
                         current.draftPlanModeEnabled
                     },
+                    draftGoalModeEnabled = if (
+                        trimmedMessages.isEmpty() && current.currentSessionId == sessionId
+                    ) {
+                        false
+                    } else {
+                        current.draftGoalModeEnabled
+                    },
                     draftInput = if (current.editingSessionId == sessionId) "" else current.draftInput,
                     draftAttachments = if (current.editingSessionId == sessionId) {
                         emptyList()
@@ -1511,6 +1755,7 @@ class AetherViewModel(
                 agentModeEnabled = session.agentModeEnabled,
                 enabledToolGroups = session.enabledToolGroups,
                 planModeEnabled = session.planModeEnabled,
+                goalModeEnabled = session.goalModeEnabled,
                 taskState = AgentTaskState(),
             )
             val updatedSessions = current.sessions.toMutableList().apply {
@@ -1594,6 +1839,7 @@ class AetherViewModel(
                 agentModeEnabled = updatedSession.agentModeEnabled,
                 enabledToolGroups = updatedSession.enabledToolGroups,
                 planModeEnabled = updatedSession.planModeEnabled,
+                goalModeEnabled = updatedSession.goalModeEnabled,
                 taskState = AgentTaskState(),
             )
 
@@ -1662,6 +1908,7 @@ class AetherViewModel(
         llmInactivityReconnectTimeoutSeconds: Int,
         keepTasksRunningInBackground: Boolean,
         notifyOnTaskCompletion: Boolean,
+        agentLoopPolicy: AgentLoopPolicy,
         agentModeAuthorizationEnabled: Boolean,
         agentModeAuthorizationMethod: AgentModeAuthorizationMethod,
         language: AppLanguage,
@@ -1705,6 +1952,7 @@ class AetherViewModel(
                         ),
                     keepTasksRunningInBackground = keepTasksRunningInBackground,
                     notifyOnTaskCompletion = notifyOnTaskCompletion,
+                    agentLoopPolicy = normalizeAgentLoopPolicy(agentLoopPolicy),
                     agentModeAuthorizationEnabled = agentModeAuthorizationEnabled,
                     agentModeAuthorizationMethod = agentModeAuthorizationMethod,
                     language = language,
@@ -2367,23 +2615,29 @@ class AetherViewModel(
         var sessionIdForPersistence: String? = null
         _uiState.update { current ->
             if (current.currentSessionId == DraftSessionId) {
-                if (current.draftPlanModeEnabled == enabled) {
+                if (current.draftPlanModeEnabled == enabled && (!enabled || !current.draftGoalModeEnabled)) {
                     current
                 } else {
                     didUpdate = true
-                    current.copy(draftPlanModeEnabled = enabled)
+                    current.copy(
+                        draftPlanModeEnabled = enabled,
+                        draftGoalModeEnabled = if (enabled) false else current.draftGoalModeEnabled,
+                    )
                 }
             } else {
                 val sessionIndex = current.sessions.indexOfFirst { it.id == current.currentSessionId }
                 if (sessionIndex < 0) return@update current
                 val updatedSessions = current.sessions.toMutableList()
                 val session = updatedSessions.removeAt(sessionIndex)
-                if (session.planModeEnabled == enabled) {
+                if (session.planModeEnabled == enabled && (!enabled || !session.goalModeEnabled)) {
                     updatedSessions.add(sessionIndex, session)
                     current
                 } else {
                     didUpdate = true
-                    val updatedSession = session.copy(planModeEnabled = enabled)
+                    val updatedSession = session.copy(
+                        planModeEnabled = enabled,
+                        goalModeEnabled = if (enabled) false else session.goalModeEnabled,
+                    )
                     sessionIdForPersistence = current.currentSessionId
                     updatedSessions.add(
                         sessionIndex.coerceAtMost(updatedSessions.size),
@@ -2396,16 +2650,77 @@ class AetherViewModel(
         val persistedSessionId = sessionIdForPersistence
         if (didUpdate && persistedSessionId != null) {
             persistSessionMutation(persistedSessionId) { session ->
-                if (session.planModeEnabled == enabled) {
+                if (session.planModeEnabled == enabled && (!enabled || !session.goalModeEnabled)) {
                     null
                 } else {
-                    session.copy(planModeEnabled = enabled)
+                    session.copy(
+                        planModeEnabled = enabled,
+                        goalModeEnabled = if (enabled) false else session.goalModeEnabled,
+                    )
                 }
             }
         }
         if (didUpdate) {
             captureAnalyticsEvent(
                 event = "plan mode toggled",
+                properties = mapOf("enabled" to enabled),
+            )
+        }
+    }
+
+    fun setComposerGoalModeEnabled(enabled: Boolean) {
+        var didUpdate = false
+        var sessionIdForPersistence: String? = null
+        _uiState.update { current ->
+            if (current.currentSessionId == DraftSessionId) {
+                if (current.draftGoalModeEnabled == enabled && (!enabled || !current.draftPlanModeEnabled)) {
+                    current
+                } else {
+                    didUpdate = true
+                    current.copy(
+                        draftGoalModeEnabled = enabled,
+                        draftPlanModeEnabled = if (enabled) false else current.draftPlanModeEnabled,
+                    )
+                }
+            } else {
+                val sessionIndex = current.sessions.indexOfFirst { it.id == current.currentSessionId }
+                if (sessionIndex < 0) return@update current
+                val updatedSessions = current.sessions.toMutableList()
+                val session = updatedSessions.removeAt(sessionIndex)
+                if (session.goalModeEnabled == enabled && (!enabled || !session.planModeEnabled)) {
+                    updatedSessions.add(sessionIndex, session)
+                    current
+                } else {
+                    didUpdate = true
+                    val updatedSession = session.copy(
+                        goalModeEnabled = enabled,
+                        planModeEnabled = if (enabled) false else session.planModeEnabled,
+                    )
+                    sessionIdForPersistence = current.currentSessionId
+                    updatedSessions.add(
+                        sessionIndex.coerceAtMost(updatedSessions.size),
+                        updatedSession,
+                    )
+                    current.copy(sessions = updatedSessions)
+                }
+            }
+        }
+        val persistedSessionId = sessionIdForPersistence
+        if (didUpdate && persistedSessionId != null) {
+            persistSessionMutation(persistedSessionId) { session ->
+                if (session.goalModeEnabled == enabled && (!enabled || !session.planModeEnabled)) {
+                    null
+                } else {
+                    session.copy(
+                        goalModeEnabled = enabled,
+                        planModeEnabled = if (enabled) false else session.planModeEnabled,
+                    )
+                }
+            }
+        }
+        if (didUpdate) {
+            captureAnalyticsEvent(
+                event = "goal mode toggled",
                 properties = mapOf("enabled" to enabled),
             )
         }
@@ -2487,6 +2802,57 @@ class AetherViewModel(
         submitCurrentMessage(SessionFollowUpMode.Steer)
     }
 
+    fun analyzeMarketAlert(
+        symbol: String,
+        ruleId: String,
+    ) {
+        val normalizedSymbol = symbol.trim().uppercase(Locale.US)
+        if (normalizedSymbol.isBlank()) return
+        viewModelScope.launch {
+            val snapshot = runtime.marketMonitorRepository.refreshOnce()
+            val entries = runtime.watchlistRepository.entries.first()
+            val entry = entries.firstOrNull { it.symbol.equals(normalizedSymbol, ignoreCase = true) }
+            val rule = entry?.alertRules?.firstOrNull { it.id == ruleId }
+            val quote = snapshot.watchlistQuotes.firstOrNull { it.symbol.equals(normalizedSymbol, ignoreCase = true) }
+            val prompt = buildMarketAlertAnalysisPrompt(
+                symbol = normalizedSymbol,
+                entryName = entry?.name.orEmpty(),
+                ruleDescription = rule?.let { alertRule ->
+                    when (alertRule.type) {
+                        com.zhousl.aether.data.AlertType.PriceAbove -> "价格高于 ${alertRule.threshold}"
+                        com.zhousl.aether.data.AlertType.PriceBelow -> "价格低于 ${alertRule.threshold}"
+                        com.zhousl.aether.data.AlertType.ChangePercentUp -> "涨幅超过 ${alertRule.threshold}%"
+                        com.zhousl.aether.data.AlertType.ChangePercentDown -> "跌幅超过 ${alertRule.threshold}%"
+                    }
+                }.orEmpty(),
+                quoteSummary = quote?.let {
+                    "${it.name.ifBlank { it.symbol }} 现价 ${String.format(Locale.US, "%.2f", it.price)}，涨跌幅 ${String.format(Locale.US, "%.2f", it.changePercent)}%，成交额 ${String.format(Locale.US, "%.0f", it.amount)}"
+                }.orEmpty(),
+                marketSummary = "上涨 ${snapshot.breadth.risingCount}，下跌 ${snapshot.breadth.fallingCount}，涨停 ${snapshot.breadth.limitUpCount}，跌停 ${snapshot.breadth.limitDownCount}",
+            )
+            _uiState.update { current ->
+                current.copy(
+                    currentScreen = AppScreen.Chat,
+                    currentSessionId = DraftSessionId,
+                    draftInput = prompt,
+                    draftAttachments = emptyList(),
+                    draftSelectedModelKey = resolveDefaultChatModelKey(current.settings, current.providerConfigs),
+                    draftSelectedSkillIds = emptyList(),
+                    draftSelectedMcpServerIds = emptyList(),
+                    draftAgentModeEnabled = false,
+                    draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
+                    draftPlanModeEnabled = false,
+                    draftGoalModeEnabled = false,
+                    draftWorkspaceId = null,
+                    editingSessionId = null,
+                    editingMessageId = null,
+                    showStarterPromptHint = false,
+                )
+            }
+            submitCurrentMessage(SessionFollowUpMode.Queue)
+        }
+    }
+
     internal fun handleComposerSlashCommand(
         commandId: ComposerSlashCommandId,
         inlineText: String,
@@ -2536,6 +2902,27 @@ class AetherViewModel(
         submitCurrentMessage(SessionFollowUpMode.Queue)
     }
 
+    private fun buildMarketAlertAnalysisPrompt(
+        symbol: String,
+        entryName: String,
+        ruleDescription: String,
+        quoteSummary: String,
+        marketSummary: String,
+    ): String = buildString {
+        appendLine("请分析这条自选股预警，并给出结构化解读。")
+        appendLine("标的：${entryName.ifBlank { symbol }}（$symbol）")
+        if (ruleDescription.isNotBlank()) appendLine("触发规则：$ruleDescription")
+        if (quoteSummary.isNotBlank()) appendLine("当前行情：$quoteSummary")
+        appendLine("市场宽度：$marketSummary")
+        appendLine()
+        appendLine("请重点说明：")
+        appendLine("1. 触发信号可能代表什么")
+        appendLine("2. 需要关注的风险和确认指标")
+        appendLine("3. 接下来适合观察的问题")
+        appendLine()
+        appendLine("东方财富公开数据可能延迟，数据仅供参考，不构成投资建议。")
+    }.trim()
+
     private fun handleGoalSlashCommand(inlineText: String) {
         val now = System.currentTimeMillis()
         val snapshot = _uiState.value
@@ -2546,8 +2933,12 @@ class AetherViewModel(
             return
         }
 
-        val updatedTaskState = applyGoalSlashCommand(currentTaskState, inlineText, now)
-        applyTaskStateToCurrentSession(updatedTaskState, now)
+        val result = applyGoalSlashCommand(currentTaskState, inlineText, now)
+        applyTaskStateToCurrentSession(
+            taskState = result.taskState,
+            nowMillis = now,
+            goalModeEnabled = result.goalModeEnabled,
+        )
         _uiState.update { current -> current.copy(draftInput = "") }
         emitTransientMessage(
             when (inlineText.trim().lowercase()) {
@@ -2628,6 +3019,7 @@ class AetherViewModel(
         var requestAgentModeEnabled = false
         var requestEnabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled
         var requestPlanModeEnabled = false
+        var requestGoalModeEnabled = false
         var requestModelKey = ""
         var requestTaskState = AgentTaskState()
         var shouldGenerateSessionTitle = false
@@ -2664,6 +3056,7 @@ class AetherViewModel(
                         requestAgentModeEnabled = updated.agentModeEnabled
                         requestEnabledToolGroups = updated.enabledToolGroups
                         requestPlanModeEnabled = updated.planModeEnabled
+                        requestGoalModeEnabled = updated.goalModeEnabled
                         requestModelKey = updated.selectedModelKey
                         requestTaskState = AgentTaskState()
                     } else {
@@ -2688,6 +3081,7 @@ class AetherViewModel(
                     requestAgentModeEnabled = updated.agentModeEnabled
                     requestEnabledToolGroups = updated.enabledToolGroups
                     requestPlanModeEnabled = updated.planModeEnabled
+                    requestGoalModeEnabled = updated.goalModeEnabled
                     requestModelKey = updated.selectedModelKey
                     requestTaskState = updated.taskState
                 } else {
@@ -2704,6 +3098,7 @@ class AetherViewModel(
                         agentModeEnabled = current.draftAgentModeEnabled,
                         enabledToolGroups = current.draftEnabledToolGroups,
                         planModeEnabled = current.draftPlanModeEnabled,
+                        goalModeEnabled = current.draftGoalModeEnabled,
                     )
                     shouldGenerateSessionTitle = true
                     sessionForPersistence = newSession
@@ -2715,6 +3110,7 @@ class AetherViewModel(
                     requestAgentModeEnabled = newSession.agentModeEnabled
                     requestEnabledToolGroups = newSession.enabledToolGroups
                     requestPlanModeEnabled = newSession.planModeEnabled
+                    requestGoalModeEnabled = newSession.goalModeEnabled
                     requestModelKey = newSession.selectedModelKey
                     requestTaskState = newSession.taskState
                 }
@@ -2735,6 +3131,7 @@ class AetherViewModel(
                 agentModeEnabled = requestAgentModeEnabled,
                 enabledToolGroups = requestEnabledToolGroups,
                 planModeEnabled = requestPlanModeEnabled,
+                goalModeEnabled = requestGoalModeEnabled,
                 taskState = requestTaskState,
             )
 
@@ -2749,6 +3146,7 @@ class AetherViewModel(
                 draftAgentModeEnabled = false,
                 draftEnabledToolGroups = ChatToolGroups.DefaultEnabled,
                 draftPlanModeEnabled = false,
+                draftGoalModeEnabled = false,
                 draftWorkspaceId = null,
                 editingSessionId = null,
                 editingMessageId = null,
@@ -3283,6 +3681,7 @@ class AetherViewModel(
             agentModeEnabled = session.agentModeEnabled,
             enabledToolGroups = session.enabledToolGroups,
             planModeEnabled = session.planModeEnabled,
+            goalModeEnabled = session.goalModeEnabled,
             taskState = session.taskState,
         )
     }
@@ -3510,6 +3909,7 @@ class AetherViewModel(
     private fun applyTaskStateToCurrentSession(
         taskState: AgentTaskState,
         nowMillis: Long,
+        goalModeEnabled: Boolean? = null,
     ) {
         var sessionForPersistence: ChatSession? = null
         var currentSessionIdForPersistence: String? = null
@@ -3518,7 +3918,11 @@ class AetherViewModel(
             val sessionIndex = updatedSessions.indexOfFirst { it.id == current.currentSessionId }
             val updatedSession = if (sessionIndex >= 0) {
                 val existing = updatedSessions.removeAt(sessionIndex)
-                existing.copy(taskState = taskState)
+                existing.copy(
+                    taskState = taskState,
+                    goalModeEnabled = goalModeEnabled ?: existing.goalModeEnabled,
+                    planModeEnabled = if (goalModeEnabled == true) false else existing.planModeEnabled,
+                )
             } else {
                 createSession(
                     id = current.draftWorkspaceId?.takeIf { it.isNotBlank() } ?: "session-$nowMillis",
@@ -3532,7 +3936,8 @@ class AetherViewModel(
                     activeMcpServerIds = current.draftSelectedMcpServerIds,
                     agentModeEnabled = current.draftAgentModeEnabled,
                     enabledToolGroups = current.draftEnabledToolGroups,
-                    planModeEnabled = current.draftPlanModeEnabled,
+                    planModeEnabled = if (goalModeEnabled == true) false else current.draftPlanModeEnabled,
+                    goalModeEnabled = goalModeEnabled ?: current.draftGoalModeEnabled,
                     taskState = taskState,
                 )
             }
@@ -3543,6 +3948,8 @@ class AetherViewModel(
                 sessions = updatedSessions,
                 currentSessionId = updatedSession.id,
                 currentScreen = AppScreen.Chat,
+                draftGoalModeEnabled = if (goalModeEnabled != null) goalModeEnabled else current.draftGoalModeEnabled,
+                draftPlanModeEnabled = if (goalModeEnabled == true) false else current.draftPlanModeEnabled,
                 showStarterPromptHint = false,
             )
         }
@@ -3588,11 +3995,18 @@ class AetherViewModel(
             appendLine("Aether status")
             appendLine("Model: ${selectedModel?.chatLabel ?: selectedModelKey.ifBlank { "default" }}")
             appendLine("Plan Mode: ${if (session?.planModeEnabled ?: snapshot.draftPlanModeEnabled) "on" else "off"}")
+            appendLine("Goal Mode: ${if (session?.goalModeEnabled ?: snapshot.draftGoalModeEnabled) "on" else "off"}")
             appendLine("Agent Mode: ${if (session?.agentModeEnabled ?: snapshot.draftAgentModeEnabled) "on" else "off"}")
             appendLine("Tool groups: ${normalizeChatToolGroups(enabledGroups).joinToString().ifBlank { "none" }}")
             appendLine("Skills: ${selectedSkillNames.joinToString().ifBlank { "none" }}")
             appendLine("MCP: ${selectedMcpNames.joinToString().ifBlank { "none" }}")
             appendLine("Task: ${taskState.status.storageValue}${taskState.goal.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}")
+            if (taskState.todos.isNotEmpty()) {
+                appendLine("Todos: ${taskState.todos.count { it.done }}/${taskState.todos.size}")
+            }
+            executionState?.loopState?.stopReason?.let { stopReason ->
+                appendLine("Loop stop: ${stopReason.name.lowercase()}")
+            }
             appendLine("Execution: ${if (executionState?.isRunning == true) "running" else "idle"}")
         }.trim()
     }
@@ -3609,6 +4023,7 @@ class AetherViewModel(
         agentModeEnabled: Boolean = false,
         enabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
         planModeEnabled: Boolean = false,
+        goalModeEnabled: Boolean = false,
         taskState: AgentTaskState = AgentTaskState(),
     ): ChatSession {
         val metadata = deriveSessionMetadata(messages)
@@ -3626,6 +4041,7 @@ class AetherViewModel(
             agentModeEnabled = agentModeEnabled,
             enabledToolGroups = normalizeChatToolGroups(enabledToolGroups),
             planModeEnabled = planModeEnabled,
+            goalModeEnabled = goalModeEnabled,
             taskState = taskState,
             lastOpenedAtMillis = lastActivityAtMillis,
             lastActivityAtMillis = lastActivityAtMillis,
@@ -4326,6 +4742,8 @@ class AetherViewModel(
         put("llmInactivityReconnectTimeoutSeconds", llmInactivityReconnectTimeoutSeconds)
         put("keepTasksRunningInBackground", keepTasksRunningInBackground)
         put("notifyOnTaskCompletion", notifyOnTaskCompletion)
+        put("autonomousContinuationEnabled", agentLoopPolicy.autonomousContinuationEnabled)
+        put("maxAutonomousContinuationTurns", agentLoopPolicy.maxAutonomousContinuationTurns)
         put("agentModeAuthorizationEnabled", agentModeAuthorizationEnabled)
         put("agentModeAuthorizationMethod", agentModeAuthorizationMethod.storageValue)
         put("language", language.storageValue)
@@ -4367,6 +4785,21 @@ class AetherViewModel(
             notifyOnTaskCompletion = json.optBoolean(
                 "notifyOnTaskCompletion",
                 defaults.notifyOnTaskCompletion,
+            ),
+            agentLoopPolicy = normalizeAgentLoopPolicy(
+                AgentLoopPolicy(
+                    autonomousContinuationEnabled = json.optBoolean(
+                        "autonomousContinuationEnabled",
+                        defaults.agentLoopPolicy.autonomousContinuationEnabled,
+                    ),
+                    maxAutonomousContinuationTurns = normalizeAutonomousContinuationTurns(
+                        if (json.has("maxAutonomousContinuationTurns")) {
+                            json.optInt("maxAutonomousContinuationTurns")
+                        } else {
+                            defaults.agentLoopPolicy.maxAutonomousContinuationTurns
+                        }
+                    ),
+                )
             ),
             agentModeAuthorizationEnabled = json.optBoolean(
                 "agentModeAuthorizationEnabled",

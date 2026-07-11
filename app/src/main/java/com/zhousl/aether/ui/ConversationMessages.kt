@@ -2935,8 +2935,11 @@ private fun formatToolInvocationTitleLabel(toolInvocation: ChatToolInvocation): 
             fallback = "web page",
         )
         "stock_market_data" -> {
-            val action = arguments?.optString("action").orEmpty().lowercase()
+            val action = arguments?.optString("action").orEmpty().lowercase().let {
+                if (it == "batch" || it == "batch_quote") "quotes" else it
+            }
             val symbol = arguments?.optString("symbol").orEmpty().trim()
+            val symbols = summarizeStockSymbols(arguments)
             val query = arguments?.optString("query").orEmpty().trim()
             when (action) {
                 "search" -> formatArgumentDrivenTitle(
@@ -2952,6 +2955,13 @@ private fun formatToolInvocationTitleLabel(toolInvocation: ChatToolInvocation): 
                     completedVerb = "Fetched chart",
                     subject = symbol,
                     fallback = "stock chart",
+                )
+                "quotes" -> formatArgumentDrivenTitle(
+                    isRunning = toolInvocation.isRunning,
+                    progressiveVerb = "Fetching quotes",
+                    completedVerb = "Fetched quotes",
+                    subject = symbols.ifBlank { symbol.ifBlank { query } },
+                    fallback = "stock quotes",
                 )
                 else -> formatArgumentDrivenTitle(
                     isRunning = toolInvocation.isRunning,
@@ -3024,12 +3034,14 @@ private fun summarizeToolInvocationCommandLabel(
         "stock_market_data" -> {
             val action = arguments.optString("action").lowercase().ifBlank { "quote" }
             val symbol = arguments.optString("symbol").trim()
+            val symbols = summarizeStockSymbols(arguments)
             val query = arguments.optString("query").trim()
             val range = arguments.optString("range").trim()
             val interval = arguments.optString("interval").trim()
             buildString {
                 append("stock_market_data")
-                if (symbol.isNotBlank()) { append(" "); append(symbol) }
+                if (symbols.isNotBlank()) { append(" "); append(symbols) }
+                else if (symbol.isNotBlank()) { append(" "); append(symbol) }
                 else if (query.isNotBlank()) { append(" "); append(query) }
                 if (action.isNotBlank() && action != "quote") { append(" action=$action") }
                 if (range.isNotBlank()) { append(" range=$range") }
@@ -3249,6 +3261,18 @@ private fun formatArgumentDrivenTitle(
     }
 
     return "$action ${normalizedSubject.take(72)}${if (normalizedSubject.length > 72) "..." else ""}"
+}
+
+private fun summarizeStockSymbols(arguments: JSONObject?): String {
+    val symbols = arguments?.optJSONArray("symbols") ?: return ""
+    return buildList {
+        for (index in 0 until minOf(symbols.length(), 5)) {
+            val value = symbols.optString(index).trim()
+            if (value.isNotBlank()) add(value)
+        }
+    }.joinToString(", ").let { subject ->
+        if (symbols.length() > 5 && subject.isNotBlank()) "$subject, +${symbols.length() - 5}" else subject
+    }
 }
 
 private fun formatAgentDisplayTitle(

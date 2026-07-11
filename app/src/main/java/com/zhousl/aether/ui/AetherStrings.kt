@@ -23,6 +23,17 @@ data class AetherStrings(
     val replyToAether: String,
     val askAether: String,
     val voice: String,
+    val voiceInputUnavailable: String,
+    val voiceInputEmpty: String,
+    val voiceInputAdded: String,
+    val voiceInputPermissionDenied: String,
+    val voiceListening: String,
+    val voiceListeningHint: String,
+    val voiceProcessing: String,
+    val voiceHoldToTalk: String,
+    val voiceReleaseToAddDraft: String,
+    val voiceInputInterruptedRetained: String,
+    val voiceInputInterruptedRetry: String,
     val images: String,
     val apps: String,
     val gpts: String,
@@ -141,6 +152,17 @@ fun rememberAetherStrings(): AetherStrings = LocalAetherStrings.current
 fun aetherStringsFor(language: AppLanguage): AetherStrings = when (language) {
     AppLanguage.English -> AetherStrings(
         appLanguage = AppLanguage.English,
+        voiceInputUnavailable = "Voice input is not available on this device.",
+        voiceInputEmpty = "No speech was recognized.",
+        voiceInputAdded = "Voice input added to draft.",
+        voiceInputPermissionDenied = "Microphone access is needed for voice input.",
+        voiceListening = "Listening",
+        voiceListeningHint = "Speak naturally. Aether will add the text to your draft.",
+        voiceProcessing = "Processing voice input",
+        voiceHoldToTalk = "Hold the mic to speak.",
+        voiceReleaseToAddDraft = "Release to add to draft.",
+        voiceInputInterruptedRetained = "Voice input was interrupted. Recognized text was added to draft.",
+        voiceInputInterruptedRetry = "Voice input was interrupted. Please try again.",
         menu = "Menu",
         newChat = "New chat",
         more = "More",
@@ -253,6 +275,17 @@ fun aetherStringsFor(language: AppLanguage): AetherStrings = when (language) {
 
     AppLanguage.SimplifiedChinese -> AetherStrings(
         appLanguage = AppLanguage.SimplifiedChinese,
+        voiceInputUnavailable = "此设备上的语音输入不可用。",
+        voiceInputEmpty = "未识别到语音内容。",
+        voiceInputAdded = "语音输入已加入草稿。",
+        voiceInputPermissionDenied = "需要麦克风权限才能使用语音输入。",
+        voiceListening = "正在聆听",
+        voiceListeningHint = "自然说话即可，Aether 会把文字加入草稿。",
+        voiceProcessing = "正在处理语音输入",
+        voiceHoldToTalk = "按住麦克风说话。",
+        voiceReleaseToAddDraft = "松开后加入草稿。",
+        voiceInputInterruptedRetained = "语音识别中断，已将识别到的文字加入草稿。",
+        voiceInputInterruptedRetry = "语音识别中断，请重试。",
         menu = "菜单",
         newChat = "新建对话",
         more = "更多",
@@ -471,8 +504,11 @@ fun AetherStrings.toolInvocationTitleLabel(
         fallback = if (isChinese) "网页" else "web page",
     )
     "stock_market_data" -> {
-        val action = arguments?.optString("action").orEmpty().lowercase()
+        val action = arguments?.optString("action").orEmpty().lowercase().let {
+            if (it == "batch" || it == "batch_quote") "quotes" else it
+        }
         val symbol = arguments?.optString("symbol").orEmpty().trim()
+        val symbols = stockSymbolsSubject(arguments)
         val query = arguments?.optString("query").orEmpty().trim()
         when (action) {
             "search" -> formatArgumentDrivenTitle(
@@ -488,6 +524,13 @@ fun AetherStrings.toolInvocationTitleLabel(
                 completedVerb = if (isChinese) "已获取行情图" else "Fetched chart",
                 subject = symbol,
                 fallback = if (isChinese) "股票图表" else "stock chart",
+            )
+            "quotes" -> formatArgumentDrivenTitle(
+                isRunning = isRunning,
+                progressiveVerb = if (isChinese) "正在获取多只股票行情" else "Fetching quotes",
+                completedVerb = if (isChinese) "已获取多只股票行情" else "Fetched quotes",
+                subject = symbols.ifBlank { symbol.ifBlank { query } },
+                fallback = if (isChinese) "股票行情" else "stock quotes",
             )
             else -> formatArgumentDrivenTitle(
                 isRunning = isRunning,
@@ -536,12 +579,14 @@ fun AetherStrings.toolInvocationCommandLabel(toolName: String, arguments: JSONOb
         "stock_market_data" -> {
             val action = arguments.optString("action").lowercase().ifBlank { "quote" }
             val symbol = arguments.optString("symbol").trim()
+            val symbols = stockSymbolsSubject(arguments)
             val query = arguments.optString("query").trim()
             val range = arguments.optString("range").trim()
             val interval = arguments.optString("interval").trim()
             buildString {
                 append("stock_market_data")
-                if (symbol.isNotBlank()) { append(" "); append(symbol) }
+                if (symbols.isNotBlank()) { append(" "); append(symbols) }
+                else if (symbol.isNotBlank()) { append(" "); append(symbol) }
                 else if (query.isNotBlank()) { append(" "); append(query) }
                 if (action.isNotBlank() && action != "quote") { append(" action=$action") }
                 if (range.isNotBlank()) { append(" range=$range") }
@@ -565,6 +610,18 @@ fun AetherStrings.formatArgumentDrivenTitle(
     if (normalizedSubject.isBlank()) return "$action $fallback"
     val clipped = normalizedSubject.take(72)
     return if (normalizedSubject.length > 72) "$action $clipped..." else "$action $clipped"
+}
+
+private fun stockSymbolsSubject(arguments: JSONObject?): String {
+    val symbols = arguments?.optJSONArray("symbols") ?: return ""
+    return buildList {
+        for (index in 0 until minOf(symbols.length(), 5)) {
+            val value = symbols.optString(index).trim()
+            if (value.isNotBlank()) add(value)
+        }
+    }.joinToString(", ").let { subject ->
+        if (symbols.length() > 5 && subject.isNotBlank()) "$subject, +${symbols.length() - 5}" else subject
+    }
 }
 
 fun AetherStrings.formatAgentDisplayTitle(
