@@ -1,5 +1,7 @@
 # Gradle and Android build output
 .gradle/
+.gradle-direct/
+.kotlin/
 build/
 **/build/
 
@@ -11,6 +13,7 @@ captures/
 
 # Release artifacts and signing material
 dist/
+keystore/
 *.apk
 *.aab
 *.ap_
@@ -34,6 +37,7 @@ cursor_chat_*.json
 .claude/
 .vscode/
 .trash/
+tmp/
 reports/
 *-report.md
 *.bak
