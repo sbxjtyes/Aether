@@ -248,6 +248,11 @@ private fun makeSchemaNullable(schema: JSONObject): JSONObject =
     JSONObject(schema.toString()).apply {
         when (val typeValue = opt("type")) {
             is String -> {
+                if (typeValue == "object") {
+                    if (!has("additionalProperties")) {
+                        put("additionalProperties", false)
+                    }
+                }
                 if (typeValue != "null") {
                     put("type", JSONArray().put(typeValue).put("null"))
                 }
@@ -267,6 +272,36 @@ private fun makeSchemaNullable(schema: JSONObject): JSONObject =
                 put("type", typeValue)
             }
         }
+    }
+
+internal fun parseToolArgumentsObject(value: Any?): Result<JSONObject> =
+    when (value) {
+        null,
+        JSONObject.NULL -> Result.success(JSONObject())
+
+        is JSONObject -> Result.success(value)
+        is String -> {
+            val trimmed = value.trim()
+            if (trimmed.isBlank()) {
+                Result.success(JSONObject())
+            } else {
+                runCatching { JSONObject(trimmed) }.fold(
+                    onSuccess = { Result.success(it) },
+                    onFailure = {
+                        Result.failure(
+                            IllegalArgumentException(
+                                "Arguments must be a valid JSON object string.",
+                                it,
+                            ),
+                        )
+                    },
+                )
+            }
+        }
+
+        else -> Result.failure(
+            IllegalArgumentException("Arguments must be a JSON object or a JSON object string."),
+        )
     }
 
 internal fun resolveReconnectDelayMillis(

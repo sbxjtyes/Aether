@@ -38,9 +38,11 @@ private const val ForegroundServiceEnsureMinIntervalMillis = 1_000L
 private const val ReasoningSummaryMaxInputChars = 8_000
 private const val ReasoningSummaryTitleMaxChars = 120
 private const val ReasoningSummaryDetailMaxChars = 520
-private const val MaxAutonomousContinuationTurns = 8
 private const val ReasoningSummarySystemPrompt =
     "You write concise user-visible progress summaries for assistant reasoning. Use a consistent first-person planning style, and never quote long private reasoning verbatim."
+
+internal fun shouldIncludeMessageInLlmRequest(message: ChatMessage): Boolean =
+    message.text.isNotBlank() || message.attachments.isNotEmpty()
 
 enum class SessionFollowUpMode {
     Queue,
@@ -61,6 +63,26 @@ data class PendingSessionInput(
     val attachmentCount: Int,
 )
 
+enum class AgentLoopStopReason {
+    QueuedInput,
+    PlanMode,
+    Disabled,
+    WaitingForUser,
+    Blocked,
+    Completed,
+    MissingNextPrompt,
+    LimitReached,
+}
+
+data class AgentLoopState(
+    val isAutonomousContinuation: Boolean = false,
+    val continuationIndex: Int = 0,
+    val maxContinuationTurns: Int = DefaultMaxAutonomousContinuationTurns,
+    val reason: String = "",
+    val nextStep: String = "",
+    val stopReason: AgentLoopStopReason? = null,
+)
+
 data class SessionExecutionState(
     val sessionId: String,
     val isRunning: Boolean = false,
@@ -70,6 +92,7 @@ data class SessionExecutionState(
     val pendingStatusText: String = "",
     val pendingStatusDetail: String = "",
     val pendingInputs: List<PendingSessionInput> = emptyList(),
+    val loopState: AgentLoopState = AgentLoopState(),
     val activeTurnStartedAtMillis: Long? = null,
 )
 
@@ -83,6 +106,7 @@ data class SessionTurnRequest(
     val agentModeEnabled: Boolean,
     val enabledToolGroups: List<String>,
     val planModeEnabled: Boolean = false,
+    val goalModeEnabled: Boolean = false,
     val taskState: AgentTaskState = AgentTaskState(),
     val autonomousContinuationPrompt: String = "",
 )
@@ -95,6 +119,77 @@ data class SessionTurnEvent(
     val toolNames: List<String> = emptyList(),
     val durationMillis: Long? = null,
 )
+
+internal sealed class AgentLoopNextStep {
+    data object Stop : AgentLoopNextStep()
+    data object RunQueuedInput : AgentLoopNextStep()
+    data class ContinueAutonomously(
+        val continuationIndex: Int,
+        val maxContinuationTurns: Int,
+        val reason: String,
+        val nextPrompt: String,
+    ) : AgentLoopNextStep()
+}
+
+internal fun decideAgentLoopNextStep(
+    planModeEnabled: Boolean,
+    goalModeEnabled: Boolean = false,
+    queuedInputAvailable: Boolean,
+    conversationDecision: AgentConversationDecision,
+    taskState: AgentTaskState? = null,
+    autonomousContinuationCount: Int,
+    policy: AgentLoopPolicy,
+): Pair<AgentLoopNextStep, AgentLoopState> {
+    val normalizedPolicy = normalizeAgentLoopPolicy(policy)
+    val effectiveDecision = deriveAgentConversationDecision(
+        explicitDecision = conversationDecision,
+        taskState = taskState,
+        goalModeEnabled = goalModeEnabled,
+    )
+    val baseState = AgentLoopState(
+        maxContinuationTurns = normalizedPolicy.maxAutonomousContinuationTurns,
+        reason = effectiveDecision.reason.trim(),
+        nextStep = effectiveDecision.nextPrompt.trim(),
+    )
+    if (queuedInputAvailable) {
+        return AgentLoopNextStep.RunQueuedInput to baseState.copy(
+            stopReason = AgentLoopStopReason.QueuedInput,
+        )
+    }
+    if (effectiveDecision.status != AgentConversationStatus.Continue) {
+        val stopReason = when (effectiveDecision.status) {
+            AgentConversationStatus.WaitingForUser -> AgentLoopStopReason.WaitingForUser
+            AgentConversationStatus.Blocked -> AgentLoopStopReason.Blocked
+            AgentConversationStatus.Completed -> AgentLoopStopReason.Completed
+            AgentConversationStatus.Continue -> AgentLoopStopReason.Completed
+        }
+        return AgentLoopNextStep.Stop to baseState.copy(stopReason = stopReason)
+    }
+    if (planModeEnabled) {
+        return AgentLoopNextStep.Stop to baseState.copy(stopReason = AgentLoopStopReason.PlanMode)
+    }
+    if (!normalizedPolicy.autonomousContinuationEnabled) {
+        return AgentLoopNextStep.Stop to baseState.copy(stopReason = AgentLoopStopReason.Disabled)
+    }
+    if (effectiveDecision.nextPrompt.isBlank()) {
+        return AgentLoopNextStep.Stop to baseState.copy(stopReason = AgentLoopStopReason.MissingNextPrompt)
+    }
+    if (autonomousContinuationCount >= normalizedPolicy.maxAutonomousContinuationTurns) {
+        return AgentLoopNextStep.Stop to baseState.copy(stopReason = AgentLoopStopReason.LimitReached)
+    }
+    val nextIndex = autonomousContinuationCount + 1
+    val nextStep = AgentLoopNextStep.ContinueAutonomously(
+        continuationIndex = nextIndex,
+        maxContinuationTurns = normalizedPolicy.maxAutonomousContinuationTurns,
+        reason = effectiveDecision.reason.trim(),
+        nextPrompt = effectiveDecision.nextPrompt.trim(),
+    )
+    return nextStep to baseState.copy(
+        isAutonomousContinuation = true,
+        continuationIndex = nextIndex,
+        stopReason = null,
+    )
+}
 
 private enum class ReasoningCompletionTrigger {
     BodyStarted,
@@ -117,6 +212,7 @@ class SessionExecutionManager(
     private val agentModeController: AgentModeController,
     private val skillManager: AgentSkillManager,
     private val webToolsClient: WebToolsClient,
+    private val marketMonitorRepository: MarketMonitorRepository,
     private val notificationController: AetherNotificationController,
     private val appForegroundTracker: AppForegroundTracker,
 ) {
@@ -187,6 +283,11 @@ class SessionExecutionManager(
                 pendingAssistantText = "",
                 pendingStatusText = "",
                 pendingStatusDetail = "",
+                loopState = AgentLoopState(
+                    maxContinuationTurns = normalizeAgentLoopPolicy(
+                        request.settings.agentLoopPolicy
+                    ).maxAutonomousContinuationTurns,
+                ),
                 activeTurnStartedAtMillis = System.currentTimeMillis(),
             )
         }
@@ -272,7 +373,7 @@ class SessionExecutionManager(
         var autonomousContinuationCount = 0
 
         try {
-            while (!handle.pauseRequested) {
+            loop@ while (!handle.pauseRequested) {
                 val activeRequest = nextRequest ?: break
                 lastCompletion = executeTurn(
                     handle = handle,
@@ -282,30 +383,57 @@ class SessionExecutionManager(
                 promoteRemainingSteersToQueue(handle)
                 if (handle.pauseRequested) break
 
-                val nextQueued = pollNextQueuedInput(handle)
-                if (nextQueued != null) {
-                    autonomousContinuationCount = 0
-                    nextRequest = buildQueuedTurnRequest(
-                        sessionId = handle.sessionId,
-                        queuedInput = nextQueued.message,
-                    )
-                    continue
-                }
-
                 val decision = lastCompletion.conversationDecision
-                if (
-                    !activeRequest.planModeEnabled &&
-                    decision.shouldContinueAutonomously &&
-                    decision.nextPrompt.isNotBlank() &&
-                    autonomousContinuationCount < MaxAutonomousContinuationTurns
-                ) {
-                    autonomousContinuationCount += 1
-                    nextRequest = buildAutonomousContinuationRequest(
-                        previousRequest = activeRequest,
-                        decision = decision,
-                        continuationIndex = autonomousContinuationCount,
-                    )
-                    continue
+                val (loopNextStep, loopState) = decideAgentLoopNextStep(
+                    planModeEnabled = activeRequest.planModeEnabled,
+                    goalModeEnabled = activeRequest.goalModeEnabled,
+                    queuedInputAvailable = hasQueuedInput(handle),
+                    conversationDecision = decision,
+                    taskState = handle.latestTaskState ?: activeRequest.taskState,
+                    autonomousContinuationCount = autonomousContinuationCount,
+                    policy = activeRequest.settings.agentLoopPolicy,
+                )
+                updateExecutionState(handle.sessionId) { current ->
+                    current.copy(loopState = loopState)
+                }
+                when (loopNextStep) {
+                    AgentLoopNextStep.RunQueuedInput -> {
+                        val nextQueued = pollNextQueuedInput(handle)
+                        if (nextQueued != null) {
+                            autonomousContinuationCount = 0
+                            nextRequest = buildQueuedTurnRequest(
+                                sessionId = handle.sessionId,
+                                queuedInput = nextQueued.message,
+                            )
+                            continue@loop
+                        }
+                    }
+
+                    is AgentLoopNextStep.ContinueAutonomously -> {
+                        autonomousContinuationCount = loopNextStep.continuationIndex
+                        nextRequest = buildAutonomousContinuationRequest(
+                            previousRequest = activeRequest,
+                            decision = decision.copy(
+                                status = AgentConversationStatus.Continue,
+                                reason = loopNextStep.reason,
+                                nextPrompt = loopNextStep.nextPrompt,
+                            ),
+                            continuationIndex = loopNextStep.continuationIndex,
+                            maxContinuationTurns = loopNextStep.maxContinuationTurns,
+                        )
+                        continue@loop
+                    }
+
+                    AgentLoopNextStep.Stop -> {
+                        if (loopState.stopReason == AgentLoopStopReason.LimitReached) {
+                            appendAutonomousContinuationLimitMessage(
+                                sessionId = handle.sessionId,
+                                loopState = loopState,
+                                taskState = handle.latestTaskState,
+                            )
+                            chatStateStore.flush()
+                        }
+                    }
                 }
 
                 nextRequest = null
@@ -358,6 +486,7 @@ class SessionExecutionManager(
             skillManager = skillManager,
             mcpClientManager = mcpClientManager,
             webToolsClient = webToolsClient,
+            marketMonitorRepository = marketMonitorRepository,
             onParallelToolCallsUnsupported = settingsRepository::markParallelToolCallsUnsupported,
         )
 
@@ -410,6 +539,7 @@ class SessionExecutionManager(
                 agentModeEnabled = request.agentModeEnabled,
                 enabledToolGroups = request.enabledToolGroups,
                 planModeEnabled = request.planModeEnabled,
+                goalModeEnabled = request.goalModeEnabled,
                 taskState = request.taskState,
                 onToolEvent = { event ->
                     if (handle.pauseRequested) return@runTurn
@@ -665,6 +795,7 @@ class SessionExecutionManager(
         previousRequest: SessionTurnRequest,
         decision: AgentConversationDecision,
         continuationIndex: Int,
+        maxContinuationTurns: Int,
     ): SessionTurnRequest? {
         val session = chatStateStore.state.value.sessions.firstOrNull { it.id == previousRequest.sessionId }
             ?: return null
@@ -676,11 +807,55 @@ class SessionExecutionManager(
             agentModeEnabled = session.agentModeEnabled,
             enabledToolGroups = session.enabledToolGroups,
             planModeEnabled = session.planModeEnabled,
+            goalModeEnabled = session.goalModeEnabled,
             taskState = session.taskState,
             autonomousContinuationPrompt = buildAutonomousContinuationPrompt(
                 decision = decision,
                 continuationIndex = continuationIndex,
+                maxContinuationTurns = maxContinuationTurns,
             ),
+        )
+    }
+
+    private fun appendAutonomousContinuationLimitMessage(
+        sessionId: String,
+        loopState: AgentLoopState,
+        taskState: AgentTaskState?,
+    ) {
+        val maxTurns = loopState.maxContinuationTurns.coerceAtLeast(0)
+        val summary = taskState?.summary?.trim().orEmpty()
+        val text = if (currentSettings.value.language == AppLanguage.SimplifiedChinese) {
+            buildString {
+                append("已达到自主继续上限")
+                if (maxTurns > 0) append("（$maxTurns/$maxTurns）")
+                append("。我先停在这里；你可以发送消息让我继续。")
+                if (summary.isNotBlank()) {
+                    append("\n\n当前进展：")
+                    append(summary)
+                }
+            }
+        } else {
+            buildString {
+                append("Reached the autonomous continuation limit")
+                if (maxTurns > 0) append(" ($maxTurns/$maxTurns)")
+                append(". I stopped here; send another message when you want me to continue.")
+                if (summary.isNotBlank()) {
+                    append("\n\nCurrent progress: ")
+                    append(summary)
+                }
+            }
+        }
+        appendAgentMessage(
+            sessionId = sessionId,
+            blocks = listOf(
+                AssistantResponseBlock.Text(
+                    id = "agent-loop-limit-${System.currentTimeMillis()}",
+                    text = text,
+                )
+            ),
+            thoughtDurationMillis = null,
+            outcome = SessionTurnOutcome.Neutral,
+            taskState = taskState,
         )
     }
 
@@ -1099,6 +1274,12 @@ class SessionExecutionManager(
         return next
     }
 
+    private fun hasQueuedInput(
+        handle: SessionExecutionHandle,
+    ): Boolean = synchronized(handle.lock) {
+        handle.queuedInputs.isNotEmpty()
+    }
+
     private fun clearPendingInputs(
         handle: SessionExecutionHandle,
     ) {
@@ -1157,7 +1338,9 @@ class SessionExecutionManager(
         chatStateStore.state.value.sessions.firstOrNull { it.id == sessionId }?.title.orEmpty()
 
     private fun buildRequestMessages(messages: List<ChatMessage>): List<LlmMessage> =
-        applyHistoryContextBudget(messages).map(::buildRequestMessage)
+        applyHistoryContextBudget(messages)
+            .filter(::shouldIncludeMessageInLlmRequest)
+            .map(::buildRequestMessage)
 
     private fun buildRequestMessage(message: ChatMessage): LlmMessage {
         val parts = mutableListOf<LlmContentPart>()
@@ -1217,6 +1400,7 @@ class SessionExecutionManager(
     private fun buildAutonomousContinuationPrompt(
         decision: AgentConversationDecision,
         continuationIndex: Int,
+        maxContinuationTurns: Int,
     ): String = buildString {
         append(decision.nextPrompt.trim())
         val reason = decision.reason.trim()
@@ -1227,7 +1411,7 @@ class SessionExecutionManager(
         append("\n\nAutonomous continuation ")
         append(continuationIndex)
         append(" of ")
-        append(MaxAutonomousContinuationTurns)
+        append(maxContinuationTurns)
         append(".")
     }
 

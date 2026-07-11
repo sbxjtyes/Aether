@@ -3,6 +3,7 @@ package com.zhousl.aether.data
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
 import com.zhousl.aether.util.AetherLog
+import java.security.MessageDigest
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -48,6 +49,9 @@ data class McpToolBinding(
     val inputSchema: JSONObject,
 ) {
     val namespacedToolName: String
+        get() = buildSafeMcpToolCallName(serverId, toolName)
+
+    val rawNamespacedToolName: String
         get() = "mcp__${serverId}__${toolName}"
 
     val legacyToolName: String
@@ -56,6 +60,7 @@ data class McpToolBinding(
     fun matchesToolCallName(callName: String): Boolean {
         val normalizedCallName = callName.trim()
         return namespacedToolName.equals(normalizedCallName, ignoreCase = true) ||
+            rawNamespacedToolName.equals(normalizedCallName, ignoreCase = true) ||
             legacyToolName.equals(normalizedCallName, ignoreCase = true) ||
             "${serverName}:${toolName}".equals(normalizedCallName, ignoreCase = true)
     }
@@ -274,7 +279,7 @@ class McpClientManager(
         runCatching {
             val binding = resolveToolBinding(toolCallName)
                 ?: error("Unknown MCP tool '$toolCallName'.")
-            val arguments = runCatching { JSONObject(argumentsJson) }.getOrDefault(JSONObject())
+            val arguments = parseToolArgumentsObject(argumentsJson).getOrThrow()
             val result = sessions[binding.serverId]
                 ?.callTool(binding.toolName, arguments)
                 ?: error("MCP server '${binding.serverId}' is not connected.")
@@ -427,6 +432,7 @@ private class McpServerSession(
 ) {
     private var requestCounter = 1L
     private var initialized = false
+    private var serverCapabilities: JSONObject? = null
     var snapshot: McpServerSnapshot = McpServerSnapshot(config = config)
         private set
 
@@ -458,6 +464,7 @@ private class McpServerSession(
             val protocolVersion = initializeResult.optString("protocolVersion")
                 .ifBlank { DefaultMcpProtocolVersion }
             transport.updateProtocolVersion(protocolVersion)
+            serverCapabilities = initializeResult.optJSONObject("capabilities")
             initialized = true
             sendNotification("notifications/initialized")
             val serverInfo = initializeResult.optJSONObject("serverInfo")
@@ -481,9 +488,21 @@ private class McpServerSession(
     suspend fun refreshCatalog() {
         if (!initialized) return
         runCatching {
-            val toolsResult = call("tools/list")
-            val resourcesResult = call("resources/list")
-            val promptsResult = call("prompts/list")
+            val toolsResult = if (supportsMcpServerCapability(serverCapabilities, "tools")) {
+                callCatalogList("tools/list", required = true)
+            } else {
+                JSONObject()
+            }
+            val resourcesResult = if (supportsMcpServerCapability(serverCapabilities, "resources")) {
+                callCatalogList("resources/list")
+            } else {
+                JSONObject()
+            }
+            val promptsResult = if (supportsMcpServerCapability(serverCapabilities, "prompts")) {
+                callCatalogList("prompts/list")
+            } else {
+                JSONObject()
+            }
             snapshot = snapshot.copy(
                 status = McpConnectionStatus.Ready,
                 tools = parseTools(config.id, config.displayName, toolsResult),
@@ -495,6 +514,19 @@ private class McpServerSession(
                 status = McpConnectionStatus.Error,
                 errorMessage = throwable.message ?: "Couldn't refresh MCP server catalog.",
             )
+        }
+    }
+
+    private suspend fun callCatalogList(
+        method: String,
+        required: Boolean = false,
+    ): JSONObject {
+        return runCatching { call(method) }.getOrElse { throwable ->
+            if (!required && isMcpMethodNotFoundError(throwable)) {
+                JSONObject()
+            } else {
+                throw throwable
+            }
         }
     }
 
@@ -1164,6 +1196,45 @@ private fun describeMcpMessage(message: JSONObject): String = buildString {
         message.has("error") -> append(" error")
     }
 }
+
+internal fun supportsMcpServerCapability(
+    capabilities: JSONObject?,
+    capability: String,
+): Boolean {
+    if (capabilities == null) {
+        return capability == "tools"
+    }
+    return capabilities.has(capability) && capabilities.opt(capability) != JSONObject.NULL
+}
+
+internal fun isMcpMethodNotFoundError(throwable: Throwable): Boolean =
+    throwable.message?.contains("Method not found", ignoreCase = true) == true
+
+internal fun buildSafeMcpToolCallName(
+    serverId: String,
+    toolName: String,
+): String {
+    val hash = sha256Hex("$serverId\u0000$toolName").take(8)
+    val suffix = "__$hash"
+    val combinedBudget = MaxMcpToolCallNameLength - McpToolCallNamePrefix.length - suffix.length
+    val combined = sanitizeMcpToolCallNamePart(serverId) + "__" + sanitizeMcpToolCallNamePart(toolName)
+    return McpToolCallNamePrefix + combined.take(combinedBudget) + suffix
+}
+
+private fun sanitizeMcpToolCallNamePart(value: String): String =
+    value
+        .trim()
+        .replace(Regex("[^A-Za-z0-9_]+"), "_")
+        .trim('_')
+        .ifBlank { "x" }
+
+private fun sha256Hex(value: String): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(Charsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte) }
+
+private const val McpToolCallNamePrefix = "mcp__"
+private const val MaxMcpToolCallNameLength = 64
 
 private fun validateMcpServerConfig(server: McpServerConfig) {
     if (server.displayName.trim().isBlank()) {

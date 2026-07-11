@@ -27,16 +27,154 @@ private const val SkillMetadataContextBudgetChars = 8_000
 private const val MaxSleepDurationMillis = 10 * 60 * 1000L
 private const val AetherAgentLogTag = "AetherAgent"
 private const val MaxStockCandleOutputCount = 200
-private const val QuoteStockCandleOutputCount = 5
+// quote + include_chart 时返回足够覆盖约一个月交易日的 K 线，避免模型只看到 5 根就误判走势。
+private const val QuoteStockCandleOutputCount = 22
 private const val MaxConversationDecisionTextChars = 2_000
 private const val MaxTaskStateTextChars = 2_000
 private const val MaxTaskStateItemTextChars = 240
 private const val MaxTaskStateItemCount = 24
+private const val MaxForcedMarketSynthesisContinuations = 1
+
+private val MarketDataToolNames = setOf(
+    "stock_market_data",
+    "market_overview",
+    "sector_heat",
+)
+
+/**
+ * 判断模型是否只输出了“马上给结论”一类过渡语，却没有真正完成行情分析。
+ *
+ * 必须与本回合实际调用行情工具联合使用，避免把普通短回复误判为未完成。
+ */
+internal fun shouldForceMarketSynthesisContinuation(
+    assistantText: String,
+    marketDataToolCalled: Boolean,
+    conversationDecision: AgentConversationDecision,
+    planModeEnabled: Boolean,
+): Boolean {
+    if (!marketDataToolCalled || planModeEnabled) return false
+    if (conversationDecision.status == AgentConversationStatus.WaitingForUser) return false
+
+    val text = assistantText.trim()
+    if (text.isBlank()) return true
+    if (text.length >= 180) return false
+
+    val hasExplicitConclusion = listOf(
+        Regex("""(?:结论|判断|建议)[：:]\s*.{0,16}(?:合理|不合理|正确|不正确|偏对|偏错|卖出|持有|观望|止损|减仓|加仓)"""),
+        Regex("""(?:我认为|我的判断是|综合来看).{0,20}(?:合理|不合理|正确|偏对|偏错|建议|卖出|持有|观望)"""),
+        Regex("""(?:卖出|持有|观望|止损|减仓|加仓).{0,12}(?:合理|不合理|正确|偏对|偏错|更稳妥|更合适)"""),
+    ).any { it.containsMatchIn(text) }
+    if (hasExplicitConclusion) return false
+
+    val hasTransitionPromise = listOf(
+        "数据拿到了",
+        "已拿到数据",
+        "已经拿到数据",
+        "已获取行情",
+        "已经获取行情",
+        "接下来分析",
+        "接着分析",
+        "接下来判断",
+        "接着判断",
+        "下面给你结论",
+        "现在给你结论",
+        "给你做判断",
+        "给你结论",
+    ).any(text::contains)
+
+    return hasTransitionPromise
+}
+
+private fun buildForcedMarketSynthesisMessage(): LlmMessage = LlmMessage(
+    role = "user",
+    contentParts = listOf(
+        LlmTextPart(
+            "这是隐藏的执行完整性检查，不是新的用户请求。你刚才已经取得行情工具结果，" +
+                "但可见回复只有准备分析或准备给结论的过渡语。请立即使用已有工具结果写出完整、" +
+                "直接的用户可见结论和关键依据；不要重复查询，不要再用过渡语收尾。写完结论后才能标记完成。",
+        ),
+    ),
+)
 
 // 单个 turn 内工具调用轮次的硬上限，防止模型陷入无限工具调用循环耗尽资源。
 private const val MaxToolRoundsPerTurn = 64
 // 工具执行遇到疑似瞬时错误（网络/超时等）时的额外重试次数。
 private const val MaxTransientToolRetries = 1
+
+internal fun parseAgentConversationDecisionOutput(output: String): AgentConversationDecision {
+    val parsed = runCatching { JSONObject(output) }.getOrNull()
+        ?: return AgentConversationDecision.completed()
+    if (!parsed.optBoolean("ok", true)) {
+        return AgentConversationDecision(
+            status = AgentConversationStatus.Blocked,
+            reason = parsed.optString("errmsg").trim(),
+        )
+    }
+    return AgentConversationDecision(
+        status = AgentConversationStatus.fromStorageValue(parsed.optString("status")),
+        reason = parsed.cleanAgentDecisionString("reason").take(MaxConversationDecisionTextChars),
+        nextPrompt = parsed.cleanAgentDecisionString("next_prompt")
+            .ifBlank { parsed.cleanAgentDecisionString("nextPrompt") }
+            .take(MaxConversationDecisionTextChars),
+    )
+}
+
+internal fun deriveAgentConversationDecision(
+    explicitDecision: AgentConversationDecision,
+    taskState: AgentTaskState?,
+    goalModeEnabled: Boolean = true,
+): AgentConversationDecision {
+    if (explicitDecision.status == AgentConversationStatus.Continue) {
+        return if (explicitDecision.nextPrompt.isNotBlank()) {
+            explicitDecision
+        } else {
+            explicitDecision.copy(
+                nextPrompt = buildAgentTaskContinuationPrompt(taskState)
+                    .ifBlank { "Continue the current task and decide the next status after making progress." },
+            )
+        }
+    }
+    if (explicitDecision != AgentConversationDecision.completed()) {
+        return explicitDecision
+    }
+    if (!goalModeEnabled || taskState?.status != AgentTaskStatus.InProgress) {
+        return explicitDecision
+    }
+    return AgentConversationDecision(
+        status = AgentConversationStatus.Continue,
+        reason = taskState.summary.ifBlank { "Task state is still in progress." },
+        nextPrompt = buildAgentTaskContinuationPrompt(taskState),
+    )
+}
+
+internal fun buildAgentTaskContinuationPrompt(taskState: AgentTaskState?): String {
+    if (taskState == null) return ""
+    val nextTodo = taskState.todos.firstOrNull { !it.done }?.text.orEmpty()
+    return buildString {
+        append("Continue the current task.")
+        if (taskState.goal.isNotBlank()) {
+            append("\nGoal: ")
+            append(taskState.goal)
+        }
+        if (nextTodo.isNotBlank()) {
+            append("\nNext todo: ")
+            append(nextTodo)
+        }
+        if (taskState.summary.isNotBlank()) {
+            append("\nProgress summary: ")
+            append(taskState.summary)
+        }
+        append("\nUse the necessary tools now. Update task state after making progress, then set conversation status again.")
+    }.take(MaxConversationDecisionTextChars)
+}
+
+private fun JSONObject.cleanAgentDecisionString(key: String): String {
+    if (!has(key) || isNull(key)) return ""
+    val value = optString(key).trim()
+    return value.takeUnless {
+        it.equals("null", ignoreCase = true) || it.equals("undefined", ignoreCase = true)
+    }.orEmpty()
+}
 
 internal fun buildPlanModeInstructions(): String = """
     PLAN MODE is enabled for this chat turn. You are a read-only planning agent.
@@ -53,7 +191,7 @@ internal fun buildPlanModeInstructions(): String = """
 
     When asking the user to choose between branches, present 2-3 short mutually exclusive text options, put the recommended option first, and mark it as "(recommended)".
     Ask only questions that materially change the plan, confirm an important assumption, or choose between meaningful tradeoffs.
-    If user input is required before a reliable plan can be produced, call update_task_state with status=waiting_for_user and call set_conversation_status with status=waiting_for_user before ending the response.
+    If user input is required before a reliable plan can be produced, ask the focused question directly. The execution framework decides whether the turn is complete.
     If a low-risk preference is unanswered, choose the recommended default and record it in the final plan's Assumptions.
 
     When ready, output exactly one proposed implementation, analysis, or execution plan inside a single <proposed_plan>...</proposed_plan> block.
@@ -62,12 +200,17 @@ internal fun buildPlanModeInstructions(): String = """
     Do not ask "should I proceed" in the final plan. Do not claim that implementation has been completed while Plan Mode is enabled.
 """.trimIndent()
 
+internal fun buildGoalModeInstructions(): String = """
+    GOAL MODE is enabled for this chat. Treat the current task_state goal as the objective to pursue across turns.
+    Use available tools to make concrete progress, observe tool results, repair failures when possible, and provide the complete result in the current turn.
+    Ask the user directly when essential input, confirmation, files, permissions, or choices are missing.
+    Do not attempt to set conversation or task completion status. The execution framework exclusively decides when work stops or continues.
+""".trimIndent()
+
 private fun looksLikeMcpToolCallName(toolName: String): Boolean =
     toolName.startsWith("mcp__") || toolName.contains(':')
 
 private fun isPlanModeToolNameAllowed(toolName: String): Boolean = when (toolName) {
-    "set_conversation_status",
-    "update_task_state",
     "run_tool_batch",
     "read",
     "grep",
@@ -77,6 +220,8 @@ private fun isPlanModeToolNameAllowed(toolName: String): Boolean = when (toolNam
     "fetch_web_url",
     "tavily_search",
     "stock_market_data",
+    "market_overview",
+    "sector_heat",
     "activate_skill",
     "read_skill_resource",
     "mcp_list_tools",
@@ -85,6 +230,7 @@ private fun isPlanModeToolNameAllowed(toolName: String): Boolean = when (toolNam
     "mcp_list_prompts",
     "mcp_get_prompt" -> true
 
+    // 命名空间 MCP 工具（mcp__serverId__toolName）在 plan 模式下不允许执行
     else -> false
 }
 
@@ -116,6 +262,8 @@ internal fun buildAetherBaseToolDefinitions(
             add(buildFetchWebUrlToolDefinition())
             add(buildTavilySearchToolDefinition())
             add(buildStockMarketDataToolDefinition())
+            add(buildMarketOverviewToolDefinition())
+            add(buildSectorHeatToolDefinition())
         }
         if (!planModeEnabled && agentModeEnabled) {
             add(buildAgentModeToolDefinition())
@@ -135,7 +283,8 @@ internal fun isAetherToolAvailableForGroups(
     val normalizedGroups = normalizeChatToolGroups(enabledToolGroups)
     return when (toolName) {
         "set_conversation_status",
-        "update_task_state",
+        "update_task_state" -> false
+
         "run_tool_batch" -> true
 
         "read",
@@ -153,7 +302,9 @@ internal fun isAetherToolAvailableForGroups(
 
         "fetch_web_url",
         "tavily_search",
-        "stock_market_data" -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Web)
+        "stock_market_data",
+        "market_overview",
+        "sector_heat" -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Web)
 
         "activate_skill",
         "read_skill_resource",
@@ -171,6 +322,120 @@ internal fun isAetherToolAvailableForGroups(
     }
 }
 
+internal fun shouldForceToolUseForLatestUserText(latestUserText: String): Boolean {
+    val normalized = latestUserText.lowercase()
+    if (normalized.isBlank()) return false
+
+    if (listOf(
+        "bash",
+        "shell",
+        "termux",
+        "terminal",
+        "run pwd",
+        "run ls",
+        "run cat",
+        "execute ",
+        "command ",
+        "read ",
+        "open file",
+        "edit file",
+        "modify file",
+        "write file",
+        "create file",
+        "overwrite file",
+        "grep ",
+        "search files",
+        "find file",
+        "list directory",
+        "analyze image",
+        "inspect image",
+        "search the web",
+        "search web",
+        "browse the web",
+        "browse web",
+        "look up online",
+        "fetch url",
+        "web url",
+        "tavily",
+        "https://",
+        "http://",
+    ).any(normalized::contains)) {
+        return true
+    }
+
+    val asksForDataRefresh =
+        ("refresh" in normalized && "data" in normalized) ||
+            ("update" in normalized && "data" in normalized) ||
+            ("latest" in normalized && "data" in normalized) ||
+            ("current" in normalized && "price" in normalized) ||
+            ("latest" in normalized && "quote" in normalized) ||
+            ("latest" in normalized && "market" in normalized) ||
+            ("刷新" in normalized && "数据" in normalized) ||
+            ("更新" in normalized && "数据" in normalized) ||
+            ("最新" in normalized && "行情" in normalized) ||
+            ("最新" in normalized && "股" in normalized) ||
+            ("当前" in normalized && "股价" in normalized) ||
+            ("现价" in normalized)
+    if (asksForDataRefresh) {
+        return true
+    }
+
+    val marketTerms = listOf(
+        "stock",
+        "stocks",
+        "market",
+        "quote",
+        "ticker",
+        "symbol",
+        "etf",
+        "index",
+        "crypto",
+        "share",
+        "shares",
+        "行情",
+        "股票",
+        "股价",
+        "个股",
+        "证券",
+        "基金",
+        "指数",
+        "板块",
+        "大盘",
+        "港股",
+        "美股",
+        "a股",
+        "加密货币",
+        "币价",
+        "当前价",
+        "涨跌",
+        "换手",
+        "量比",
+        "成交量",
+        "分时",
+        "k线",
+    )
+    val freshDataTerms = listOf(
+        "refresh",
+        "update",
+        "latest",
+        "current",
+        "real-time",
+        "realtime",
+        "today",
+        "now",
+        "刷新",
+        "更新",
+        "最新",
+        "当前",
+        "实时",
+        "现在",
+        "今日",
+        "今天",
+        "盘中",
+    )
+    return marketTerms.any(normalized::contains) && freshDataTerms.any(normalized::contains)
+}
+
 class AetherAgent(
     private val client: OpenAiCompatibleClient,
     private val bashTool: TermuxBashTool,
@@ -179,6 +444,7 @@ class AetherAgent(
     private val skillManager: AgentSkillManager,
     private val mcpClientManager: McpClientManager,
     private val webToolsClient: WebToolsClient,
+    private val marketMonitorRepository: MarketMonitorRepository? = null,
     private val onParallelToolCallsUnsupported: suspend (String) -> Unit = {},
 ) {
     private val filesystemTool = TermuxFilesystemTool(bashTool)
@@ -193,6 +459,7 @@ class AetherAgent(
         agentModeEnabled: Boolean = false,
         enabledToolGroups: List<String> = ChatToolGroups.DefaultEnabled,
         planModeEnabled: Boolean = false,
+        goalModeEnabled: Boolean = false,
         taskState: AgentTaskState = AgentTaskState(),
         onToolEvent: suspend (AgentToolEvent) -> Unit = {},
         onAssistantTextDelta: suspend (String) -> Unit = {},
@@ -237,16 +504,15 @@ class AetherAgent(
         val exposeNamespacedMcpTools =
             !planModeEnabled &&
             !useBasicToolCompatibility &&
-            settings.provider in setOf(
-                LlmProvider.OpenAiResponses,
-                LlmProvider.OpenAiCompatible,
-            ) && effectiveMcpToolBindings.isNotEmpty()
+            effectiveMcpToolBindings.isNotEmpty()
         var lastAssistantText = ""
         var conversationDecision = AgentConversationDecision.completed()
         var latestTaskState = taskState
         var updatedTaskState: AgentTaskState? = null
         var lastAgentModeScreenshotMessageIndex: Int? = null
         var internalOnlyContinuationCount = 0
+        var marketDataToolCalled = false
+        var forcedMarketSynthesisCount = 0
         val latestUserText = messages.lastOrNull { it.role == "user" }
             ?.contentParts
             ?.filterIsInstance<LlmTextPart>()
@@ -284,14 +550,13 @@ class AetherAgent(
                 agentModeEnabled = agentModeEnabled,
                 enabledToolGroups = normalizedToolGroups,
                 planModeEnabled = planModeEnabled,
+                goalModeEnabled = goalModeEnabled,
                 taskState = latestTaskState,
                 parallelToolCallsEnabled = parallelToolCallsEnabled,
                 basicToolCompatibilityMode = useBasicToolCompatibility,
             )
             val tools = buildList {
                 addAll(baseTools)
-                add(buildConversationStatusToolDefinition())
-                add(buildTaskStateToolDefinition())
                 if (!parallelToolCallsEnabled && !useBasicToolCompatibility) {
                     add(buildRunToolBatchToolDefinition())
                 }
@@ -303,10 +568,16 @@ class AetherAgent(
                 }
             }
             val effectiveTools = if (hasMcpCatalog) {
+                // 命名空间工具直接注入时，跳过多余的 mcp_list_tools / mcp_call_tool 包装器
+                val skipWhenNamespaced = if (exposeNamespacedMcpTools) {
+                    setOf("mcp_list_tools", "mcp_call_tool")
+                } else {
+                    emptySet()
+                }
                 tools +
                     buildMcpGenericToolDefinitions().filter { definition ->
                         val name = definition.getJSONObject("function").getString("name")
-                        isAetherToolAvailableForGroups(
+                        name !in skipWhenNamespaced && isAetherToolAvailableForGroups(
                             toolName = name,
                             enabledToolGroups = normalizedToolGroups,
                             agentModeEnabled = agentModeEnabled,
@@ -367,6 +638,26 @@ class AetherAgent(
                     round += 1
                     continue
                 }
+                if (
+                    forcedMarketSynthesisCount < MaxForcedMarketSynthesisContinuations &&
+                    shouldForceMarketSynthesisContinuation(
+                        assistantText = lastAssistantText,
+                        marketDataToolCalled = marketDataToolCalled,
+                        conversationDecision = conversationDecision,
+                        planModeEnabled = planModeEnabled,
+                    )
+                ) {
+                    forcedMarketSynthesisCount += 1
+                    lastAssistantText = ""
+                    conversationDecision = AgentConversationDecision.completed()
+                    onAssistantTextReset()
+                    conversation += client.buildConversation(
+                        settings = settings,
+                        messages = listOf(buildForcedMarketSynthesisMessage()),
+                    )
+                    round += 1
+                    continue
+                }
                 break
             }
 
@@ -386,9 +677,12 @@ class AetherAgent(
                 onToolEvent = onToolEvent,
                 onSkillActivated = onSkillActivated,
             )
+            if (toolResults.any { it.name in MarketDataToolNames }) {
+                marketDataToolCalled = true
+            }
             toolResults.forEach { result ->
                 if (result.name == "set_conversation_status") {
-                    conversationDecision = parseConversationDecision(result.rawOutput)
+                    conversationDecision = parseAgentConversationDecisionOutput(result.rawOutput)
                 }
                 if (result.name == "update_task_state") {
                     parseTaskStateToolOutput(result.rawOutput)?.let { parsedTaskState ->
@@ -402,7 +696,39 @@ class AetherAgent(
                 }
             }
             if (toolResults.all { isInternalToolCall(it.name) }) {
-                if (lastAssistantText.isNotBlank()) break
+                if (lastAssistantText.isNotBlank()) {
+                    if (
+                        forcedMarketSynthesisCount < MaxForcedMarketSynthesisContinuations &&
+                        shouldForceMarketSynthesisContinuation(
+                            assistantText = lastAssistantText,
+                            marketDataToolCalled = marketDataToolCalled,
+                            conversationDecision = conversationDecision,
+                            planModeEnabled = planModeEnabled,
+                        )
+                    ) {
+                        forcedMarketSynthesisCount += 1
+                        conversation += client.buildToolResultMessages(
+                            settings = settings,
+                            results = toolResults.map { result ->
+                                ChatCompletionToolResult(
+                                    callId = result.id,
+                                    name = result.name,
+                                    output = result.visibleOutput,
+                                )
+                            },
+                        )
+                        lastAssistantText = ""
+                        conversationDecision = AgentConversationDecision.completed()
+                        onAssistantTextReset()
+                        conversation += client.buildConversation(
+                            settings = settings,
+                            messages = listOf(buildForcedMarketSynthesisMessage()),
+                        )
+                        round += 1
+                        continue
+                    }
+                    break
+                }
                 if (internalOnlyContinuationCount >= 2) break
                 internalOnlyContinuationCount += 1
                 conversation += client.buildToolResultMessages(
@@ -445,9 +771,10 @@ class AetherAgent(
             round += 1
         }
         val finalTaskState = updatedTaskState ?: latestTaskState
-        val finalConversationDecision = deriveConversationDecision(
+        val finalConversationDecision = deriveAgentConversationDecision(
             explicitDecision = conversationDecision,
             taskState = finalTaskState,
+            goalModeEnabled = goalModeEnabled,
         )
         Result.success(
             AgentTurnResult(
@@ -707,6 +1034,8 @@ class AetherAgent(
                 argumentsJson = toolCall.arguments,
             )
             "stock_market_data" -> executeStockMarketData(toolCall.arguments)
+            "market_overview" -> executeMarketOverview(toolCall.arguments)
+            "sector_heat" -> executeSectorHeat(toolCall.arguments)
             "run_tool_batch" -> executeRunToolBatch(
                 argumentsJson = toolCall.arguments,
                 settings = settings,
@@ -766,24 +1095,6 @@ class AetherAgent(
         }.toString()
     }
 
-    private fun parseConversationDecision(output: String): AgentConversationDecision {
-        val parsed = runCatching { JSONObject(output) }.getOrNull()
-            ?: return AgentConversationDecision.completed()
-        if (!parsed.optBoolean("ok", true)) {
-            return AgentConversationDecision(
-                status = AgentConversationStatus.Blocked,
-                reason = parsed.optString("errmsg").trim(),
-            )
-        }
-        return AgentConversationDecision(
-            status = AgentConversationStatus.fromStorageValue(parsed.optString("status")),
-            reason = parsed.cleanOptionalString("reason").take(MaxConversationDecisionTextChars),
-            nextPrompt = parsed.cleanOptionalString("next_prompt")
-                .ifBlank { parsed.cleanOptionalString("nextPrompt") }
-                .take(MaxConversationDecisionTextChars),
-        )
-    }
-
     private fun fallbackAssistantText(
         conversationDecision: AgentConversationDecision,
         taskState: AgentTaskState?,
@@ -800,54 +1111,6 @@ class AetherAgent(
         AgentConversationStatus.Completed -> taskState?.summary
             ?.takeIf { it.isNotBlank() }
             ?: "Done."
-    }
-
-    private fun deriveConversationDecision(
-        explicitDecision: AgentConversationDecision,
-        taskState: AgentTaskState?,
-    ): AgentConversationDecision {
-        if (explicitDecision.status == AgentConversationStatus.Continue) {
-            return if (explicitDecision.nextPrompt.isNotBlank()) {
-                explicitDecision
-            } else {
-                explicitDecision.copy(
-                    nextPrompt = buildTaskContinuationPrompt(taskState)
-                        .ifBlank { "Continue the current task and decide the next status after making progress." },
-                )
-            }
-        }
-        if (explicitDecision != AgentConversationDecision.completed()) {
-            return explicitDecision
-        }
-        if (taskState?.status != AgentTaskStatus.InProgress) {
-            return explicitDecision
-        }
-        return AgentConversationDecision(
-            status = AgentConversationStatus.Continue,
-            reason = taskState.summary.ifBlank { "Task state is still in progress." },
-            nextPrompt = buildTaskContinuationPrompt(taskState),
-        )
-    }
-
-    private fun buildTaskContinuationPrompt(taskState: AgentTaskState?): String {
-        if (taskState == null) return ""
-        val nextTodo = taskState.todos.firstOrNull { !it.done }?.text.orEmpty()
-        return buildString {
-            append("Continue the current task.")
-            if (taskState.goal.isNotBlank()) {
-                append("\nGoal: ")
-                append(taskState.goal)
-            }
-            if (nextTodo.isNotBlank()) {
-                append("\nNext todo: ")
-                append(nextTodo)
-            }
-            if (taskState.summary.isNotBlank()) {
-                append("\nProgress summary: ")
-                append(taskState.summary)
-            }
-            append("\nUse the necessary tools now. Update task state after making progress, then set conversation status again.")
-        }.take(MaxConversationDecisionTextChars)
     }
 
     private fun executeUpdateTaskState(argumentsJson: String): String {
@@ -1451,7 +1714,12 @@ class AetherAgent(
         val toolName = arguments.optString("tool_name").trim().ifBlank {
             arguments.optString("toolName").trim()
         }
-        val toolArguments = arguments.optJSONObject("arguments") ?: JSONObject()
+        val toolArguments = parseToolArgumentsObject(arguments.opt("arguments")).getOrElse { throwable ->
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", throwable.message ?: "'arguments' must be a JSON object string.")
+            }.toString()
+        }
         if (serverId.isBlank() || toolName.isBlank()) {
             return JSONObject().apply {
                 put("ok", false)
@@ -1502,7 +1770,12 @@ class AetherAgent(
             }.toString()
         val serverId = extractMcpServerId(arguments)
         val promptName = arguments.optString("name").trim()
-        val promptArguments = arguments.optJSONObject("arguments") ?: JSONObject()
+        val promptArguments = parseToolArgumentsObject(arguments.opt("arguments")).getOrElse { throwable ->
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", throwable.message ?: "'arguments' must be a JSON object string.")
+            }.toString()
+        }
         if (serverId.isBlank() || promptName.isBlank()) {
             return JSONObject().apply {
                 put("ok", false)
@@ -1968,6 +2241,151 @@ class AetherAgent(
         return response.toString()
     }
 
+    private suspend fun executeMarketOverview(argumentsJson: String): String {
+        val args = runCatching { JSONObject(argumentsJson) }.getOrNull() ?: JSONObject()
+        val includeSectors = args.optBoolean("include_sectors", false)
+            || args.optBoolean("includeSectors", false)
+        val sectorLimit = args.optInt("sector_limit", 20).coerceIn(5, 50)
+
+        val cached = marketMonitorRepository?.cachedSnapshot()
+        val snapshot = cached?.takeIf { it.indices.isNotEmpty() && (!includeSectors || it.industrySectors.isNotEmpty()) }
+            ?: marketMonitorRepository?.refreshOnce()
+        val indices = snapshot?.indices?.takeIf { it.isNotEmpty() }
+            ?: webToolsClient.fetchMarketIndices().getOrElse { t ->
+                return toolFailureOutput(t, "市场指数获取失败。") {}
+            }
+        val breadth = snapshot?.breadth ?: webToolsClient.fetchMarketBreadth().getOrDefault(MarketBreadth())
+
+        val summaryLines = mutableListOf<String>()
+        summaryLines.add("【大盘指数】is_market_open=${MarketTradingCalendar.isTrading()}")
+        // 统一用数值类型输出，避免模型对字符串与数值字段解析不一致。
+        val indicesArray = JSONArray().apply {
+            indices.forEach { idx ->
+                val sign = if (idx.changePercent >= 0) "+" else ""
+                summaryLines.add("${idx.name}: ${String.format("%.2f", idx.price)}  $sign${String.format("%.2f", idx.changePercent)}%")
+                put(JSONObject().apply {
+                    put("code", idx.code)
+                    put("name", idx.name)
+                    put("price", idx.price)               // Double
+                    put("change", idx.change)             // Double
+                    put("change_percent", idx.changePercent) // Double
+                })
+            }
+        }
+
+        val output = JSONObject().apply {
+            put("ok", true)
+            put("source", "Eastmoney")
+            put("is_market_open", MarketTradingCalendar.isTrading())
+            put("updated_at", System.currentTimeMillis())
+            put("indices", indicesArray)
+            put("breadth", buildBreadthObject(breadth))
+        }
+        summaryLines.add("【市场宽度】上涨${breadth.risingCount} 下跌${breadth.fallingCount} 平盘${breadth.flatCount} 涨停${breadth.limitUpCount} 跌停${breadth.limitDownCount}${if (breadth.isEstimatedLimitStats) "（涨跌停为估算）" else ""}")
+
+        if (includeSectors) {
+            val industry = snapshot?.industrySectors?.take(sectorLimit)?.takeIf { it.isNotEmpty() }
+                ?: webToolsClient.fetchSectorRank(SectorType.Industry, sectorLimit).getOrDefault(emptyList())
+            val concept = snapshot?.conceptSectors?.take(sectorLimit)?.takeIf { it.isNotEmpty() }
+                ?: webToolsClient.fetchSectorRank(SectorType.Concept, sectorLimit).getOrDefault(emptyList())
+            output.put("industry_sectors", buildSectorArray(industry))
+            output.put("concept_sectors", buildSectorArray(concept))
+            // 板块摘要追加到 stdout，方便模型在文本层快速读取。
+            if (industry.isNotEmpty()) {
+                summaryLines.add("【行业板块 Top5】")
+                industry.take(5).forEach { s ->
+                    val sign = if (s.changePercent >= 0) "+" else ""
+                    summaryLines.add("${s.name} $sign${String.format("%.2f", s.changePercent)}%")
+                }
+            }
+            if (concept.isNotEmpty()) {
+                summaryLines.add("【概念板块 Top5】")
+                concept.take(5).forEach { s ->
+                    val sign = if (s.changePercent >= 0) "+" else ""
+                    summaryLines.add("${s.name} $sign${String.format("%.2f", s.changePercent)}%")
+                }
+            }
+        }
+
+        summaryLines.add("东方财富公开数据可能延迟，数据仅供参考，不构成投资建议。")
+        output.put("stdout", summaryLines.joinToString("\n"))
+        return output.toString()
+    }
+
+    private suspend fun executeSectorHeat(argumentsJson: String): String {
+        val args = runCatching { JSONObject(argumentsJson) }.getOrNull() ?: JSONObject()
+        val typeStr = args.optString("type", "industry").lowercase(Locale.US)
+        val type = if (typeStr == "concept") SectorType.Concept else SectorType.Industry
+        val limit = args.optInt("limit", 50).coerceIn(5, 100)
+        val sortArg = args.optString("sort", "change_desc").lowercase(Locale.US)
+        val (sort, ascending, sortLabel) = parseSectorHeatSort(sortArg)
+
+        val cached = marketMonitorRepository?.cachedSnapshot()?.takeIf {
+            sort == SectorSort.ChangePercent && !ascending
+        }
+        val cachedSectors = when (type) {
+            SectorType.Industry -> cached?.industrySectors
+            SectorType.Concept -> cached?.conceptSectors
+        }?.take(limit)?.takeIf { it.isNotEmpty() }
+        val sectors = cachedSectors ?: webToolsClient.fetchSectorRank(type, limit, sort, ascending).getOrElse { t ->
+            return toolFailureOutput(t, "板块数据获取失败。") {}
+        }
+
+        val summaryLines = mutableListOf<String>()
+        summaryLines.add("【${if (type == SectorType.Industry) "行业板块" else "概念板块"}排行（${sortLabel}优先，共${sectors.size}条）】")
+        sectors.take(10).forEachIndexed { idx, s ->
+            val sign = if (s.changePercent >= 0) "+" else ""
+            val leading = if (s.leadingStock.isNotBlank()) "  领涨:${s.leadingStock}" else ""
+            summaryLines.add("${idx + 1}. ${s.name} $sign${String.format("%.2f", s.changePercent)}%$leading")
+        }
+
+        return JSONObject().apply {
+            put("ok", true)
+            put("source", "Eastmoney")
+            put("type", typeStr)
+            put("sort", sortArg)
+            put("updated_at", System.currentTimeMillis())
+            put("sectors", buildSectorArray(sectors))
+            summaryLines.add("东方财富公开数据可能延迟，数据仅供参考，不构成投资建议。")
+            put("stdout", summaryLines.joinToString("\n"))
+        }.toString()
+    }
+
+    private fun parseSectorHeatSort(sortArg: String): Triple<SectorSort, Boolean, String> =
+        when (sortArg) {
+            "asc",
+            "change_asc" -> Triple(SectorSort.ChangePercent, true, "跌幅")
+            "turnover",
+            "turnover_desc" -> Triple(SectorSort.TurnoverRate, false, "换手率")
+            else -> Triple(SectorSort.ChangePercent, false, "涨幅")
+        }
+
+    private fun buildBreadthObject(breadth: MarketBreadth): JSONObject = JSONObject().apply {
+        put("rising_count", breadth.risingCount)
+        put("falling_count", breadth.fallingCount)
+        put("flat_count", breadth.flatCount)
+        put("limit_up_count", breadth.limitUpCount)
+        put("limit_down_count", breadth.limitDownCount)
+        put("is_estimated_limit_stats", breadth.isEstimatedLimitStats)
+        put("updated_at", breadth.updatedAtMillis)
+    }
+
+    private fun buildSectorArray(sectors: List<SectorItem>): JSONArray = JSONArray().apply {
+        sectors.forEach { s ->
+            put(JSONObject().apply {
+                put("code", s.code)
+                put("name", s.name)
+                put("change_percent", s.changePercent)  // Double，与 index 字段类型一致
+                put("turnover_rate", s.turnoverRate)
+                put("amount", s.amount)
+                if (s.leadingStock.isNotBlank()) {
+                    put("leading_stock", s.leadingStock)
+                    put("leading_stock_change", s.leadingStockChange) // Double
+                }
+            })
+        }
+    }
+
     private suspend fun executeStockMarketData(argumentsJson: String): String {
         val arguments = runCatching { JSONObject(argumentsJson) }.getOrNull()
             ?: return JSONObject().apply {
@@ -1983,13 +2401,20 @@ class AetherAgent(
             }
         }
 
-        return when (action) {
+        val normalizedAction = when (action) {
+            "batch",
+            "batch_quote" -> "quotes"
+            else -> action
+        }
+
+        return when (normalizedAction) {
             "search" -> executeStockSearch(arguments)
-            "quote",
+            "quotes" -> executeStockQuotes(arguments)
+            "quote" -> executeStockQuote(arguments)
             "chart" -> executeStockChart(arguments, action)
             else -> JSONObject().apply {
                 put("ok", false)
-                put("errmsg", "Unsupported stock action '$action'. Use search, quote, or chart.")
+                put("errmsg", "Unsupported stock action '$action'. Use search, quote, quotes, or chart.")
             }.toString()
         }
     }
@@ -2018,6 +2443,58 @@ class AetherAgent(
         return buildStockSearchOutput(
             query = query,
             maxResults = maxResults,
+            response = response,
+        ).toString()
+    }
+
+    private suspend fun executeStockQuote(arguments: JSONObject): String {
+        val symbol = arguments.stringValue("symbol").uppercase(Locale.US)
+        if (symbol.isBlank()) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Missing required 'symbol' argument for stock quote.")
+            }.toString()
+        }
+
+        val includeChart = arguments.booleanValue("include_chart", "includeChart") ?: false
+        if (includeChart) {
+            return executeStockChart(arguments, "quote")
+        }
+
+        val response = webToolsClient.fetchStockQuote(
+            StockQuoteRequest(symbol = symbol),
+        ).getOrElse { throwable ->
+            return toolFailureOutput(throwable, "Stock quote request failed.") {
+                put("symbol", symbol)
+            }
+        }
+
+        return buildStockQuoteOutput(
+            requestedSymbols = listOf(symbol),
+            response = response,
+        ).toString()
+    }
+
+    private suspend fun executeStockQuotes(arguments: JSONObject): String {
+        val symbols = arguments.stockSymbolsValue()
+        if (symbols.isEmpty()) {
+            return JSONObject().apply {
+                put("ok", false)
+                put("errmsg", "Missing required 'symbols' argument for stock quotes.")
+            }.toString()
+        }
+
+        val response = webToolsClient.fetchStockQuotes(
+            StockQuotesRequest(symbols = symbols),
+        ).getOrElse { throwable ->
+            return toolFailureOutput(throwable, "Stock quotes request failed.") {
+                put("symbols", JSONArray(symbols))
+            }
+        }
+
+        return buildStockQuotesOutput(
+            action = "quotes",
+            requestedSymbols = symbols,
             response = response,
         ).toString()
     }
@@ -2124,28 +2601,17 @@ class AetherAgent(
             quoteData.optString("f107")
         }
 
-        val metaOutput = JSONObject().apply {
-            put("currency", eastmoneyCurrency(market))
-            put("symbol", quoteData.optString("f57").ifBlank { response.optString("resolved_symbol") })
-            put("name", quoteData.optString("f58"))
-            put("market", market)
-            put("secid", response.optString("secid"))
-            quoteData.optNumberAsDouble("f86")?.let { put("regularMarketTime", it.toLong()) }
-            quoteData.optEastmoneyPrice("f43", market)?.let { put("regularMarketPrice", it) }
-            quoteData.optEastmoneyPrice("f60", market)?.let { put("previousClose", it) }
-            quoteData.optEastmoneyPrice("f44", market)?.let { put("regularMarketDayHigh", it) }
-            quoteData.optEastmoneyPrice("f45", market)?.let { put("regularMarketDayLow", it) }
-            quoteData.optEastmoneyPrice("f46", market)?.let { put("regularMarketOpen", it) }
-            quoteData.optNumberAsDouble("f47")?.let { put("regularMarketVolume", it) }
-            quoteData.optNumberAsDouble("f48")?.let { put("regularMarketAmount", it) }
-            quoteData.optNumberAsDouble("f116")?.let { put("marketCap", it) }
-            val price = optNumberAsDouble("regularMarketPrice")
-            val previousClose = optNumberAsDouble("previousClose")
-            if (price != null && previousClose != null && previousClose != 0.0) {
-                val change = price - previousClose
-                put("regularMarketChange", change)
-                put("regularMarketChangePercent", change / previousClose * 100.0)
+        val metaOutput = normalizeEastmoneyQuote(quoteData, market, response.optString("secid")).apply {
+            if (optString("symbol").isBlank()) {
+                put("symbol", response.optString("resolved_symbol"))
             }
+            optNumberAsDouble("high")?.let { put("regularMarketDayHigh", it) }
+            optNumberAsDouble("low")?.let { put("regularMarketDayLow", it) }
+            optNumberAsDouble("open")?.let { put("regularMarketOpen", it) }
+            optNumberAsDouble("volume")?.let { put("regularMarketVolume", it) }
+            optNumberAsDouble("amount")?.let { put("regularMarketAmount", it) }
+            optNumberAsDouble("change")?.let { put("regularMarketChange", it) }
+            optNumberAsDouble("changePercent")?.let { put("regularMarketChangePercent", it) }
         }
 
         val candles = JSONArray()
@@ -2172,6 +2638,10 @@ class AetherAgent(
             put("action", action)
             put("symbol", symbol)
             put("secid", response.optString("secid"))
+            if (response.optBoolean("resolved_from_query", false)) {
+                put("resolved_from_query", true)
+                put("resolved_symbol", response.optString("resolved_symbol"))
+            }
             put("range", range)
             put("interval", interval)
             put("include_pre_post", includePrePost)
@@ -2183,6 +2653,113 @@ class AetherAgent(
             put("truncated", rawKlines.length() > candleOutputLimit)
             response.optString("kline_error").takeIf(String::isNotBlank)?.let { put("kline_error", it) }
             put("stdout", buildStockChartSummary(symbol, metaOutput, candles.length(), range, interval))
+        }
+    }
+
+    private fun buildStockQuotesOutput(
+        action: String,
+        requestedSymbols: List<String>,
+        response: JSONObject,
+    ): JSONObject {
+        val resolvedBySecid = mutableMapOf<String, JSONObject>()
+        val resolvedSymbols = response.optJSONArray("resolved_symbols") ?: JSONArray()
+        for (index in 0 until resolvedSymbols.length()) {
+            val resolved = resolvedSymbols.optJSONObject(index) ?: continue
+            resolvedBySecid[resolved.optString("secid")] = resolved
+        }
+
+        val normalizedQuotes = JSONArray()
+        val rawQuotes = response
+            .optJSONObject("quotes")
+            ?.optJSONObject("data")
+            ?.optJSONArray("diff")
+            ?: JSONArray()
+        for (index in 0 until rawQuotes.length()) {
+            val rawQuote = rawQuotes.optJSONObject(index) ?: continue
+            val normalizedQuote = normalizeEastmoneyQuote(rawQuote)
+            val resolved = resolvedBySecid[normalizedQuote.optString("secid")]
+            normalizedQuotes.put(
+                normalizedQuote.apply {
+                    resolved?.optString("input")?.takeIf(String::isNotBlank)?.let { put("input", it) }
+                },
+            )
+        }
+
+        val errors = JSONArray()
+        response.optJSONArray("errors")?.let { sourceErrors ->
+            for (index in 0 until sourceErrors.length()) {
+                sourceErrors.optJSONObject(index)?.let(errors::put)
+            }
+        }
+        val returnedSecids = buildSet {
+            for (index in 0 until normalizedQuotes.length()) {
+                val secid = normalizedQuotes.optJSONObject(index)?.optString("secid").orEmpty()
+                if (secid.isNotBlank()) add(secid)
+            }
+        }
+        for (index in 0 until resolvedSymbols.length()) {
+            val resolved = resolvedSymbols.optJSONObject(index) ?: continue
+            val secid = resolved.optString("secid")
+            if (secid.isNotBlank() && secid !in returnedSecids) {
+                errors.put(
+                    JSONObject().apply {
+                        put("symbol", resolved.optString("input").ifBlank { resolved.optString("symbol") })
+                        put("secid", secid)
+                        put("errmsg", "Stock quotes response did not include this symbol.")
+                    },
+                )
+            }
+        }
+        val ok = normalizedQuotes.length() > 0
+        return JSONObject().apply {
+            put("ok", ok)
+            put("source", "Eastmoney")
+            put("action", action)
+            put("requested_symbols", JSONArray(requestedSymbols))
+            put("quotes", normalizedQuotes)
+            if (action == "quote" && normalizedQuotes.length() > 0) {
+                put("quote", normalizedQuotes.getJSONObject(0))
+            }
+            if (errors.length() > 0) {
+                put("errors", errors)
+            }
+            if (!ok) {
+                put("errmsg", "No stock quotes were returned.")
+            }
+            put("stdout", buildStockQuotesSummary(normalizedQuotes, errors.length()))
+        }
+    }
+
+    private fun buildStockQuoteOutput(
+        requestedSymbols: List<String>,
+        response: JSONObject,
+    ): JSONObject {
+        val quoteData = response
+            .getJSONObject("quote")
+            .getJSONObject("data")
+        val market = response.optString("market").ifBlank {
+            quoteData.optString("f107")
+        }
+        val normalizedQuote = normalizeEastmoneyQuote(quoteData, market, response.optString("secid")).apply {
+            if (optString("symbol").isBlank()) {
+                put("symbol", response.optString("resolved_symbol"))
+            }
+        }
+        val quotes = JSONArray().put(normalizedQuote)
+
+        return JSONObject().apply {
+            put("ok", true)
+            put("source", "Eastmoney")
+            put("action", "quote")
+            put("requested_symbols", JSONArray(requestedSymbols))
+            put("secid", response.optString("secid"))
+            if (response.optBoolean("resolved_from_query", false)) {
+                put("resolved_from_query", true)
+                put("resolved_symbol", response.optString("resolved_symbol"))
+            }
+            put("quotes", quotes)
+            put("quote", normalizedQuote)
+            put("stdout", buildStockQuotesSummary(quotes, errorCount = 0))
         }
     }
 
@@ -2220,6 +2797,84 @@ class AetherAgent(
             parts.getOrNull(8)?.toDoubleOrNull()?.let { put("change_percent", it) }
             parts.getOrNull(9)?.toDoubleOrNull()?.let { put("change", it) }
             parts.getOrNull(10)?.toDoubleOrNull()?.let { put("turnover_percent", it) }
+        }
+    }
+
+    private fun normalizeEastmoneyQuote(
+        quoteData: JSONObject,
+        marketOverride: String = "",
+        secidOverride: String = "",
+    ): JSONObject {
+        val isBatchQuote = quoteData.hasUsableValue("f12") || quoteData.hasUsableValue("f2")
+        val market = marketOverride.ifBlank {
+            if (isBatchQuote) quoteData.optString("f13") else quoteData.optString("f107")
+        }
+        val symbol = if (isBatchQuote) {
+            quoteData.optString("f12")
+        } else {
+            quoteData.optString("f57")
+        }
+        val secid = secidOverride.ifBlank {
+            if (market.isNotBlank() && symbol.isNotBlank()) "$market.$symbol" else ""
+        }
+
+        return JSONObject().apply {
+            put("symbol", symbol)
+            put("name", if (isBatchQuote) quoteData.optString("f14") else quoteData.optString("f58"))
+            put("market", market)
+            put("secid", secid)
+            put("currency", eastmoneyCurrency(market))
+            quoteData.optNumberAsDouble("f152")?.let { put("pricePrecision", it.toInt()) }
+
+            if (isBatchQuote) {
+                quoteData.optEastmoneyPrice("f2", market)?.let { put("regularMarketPrice", it) }
+                quoteData.optEastmoneyPrice("f18", market)?.let { put("previousClose", it) }
+                quoteData.optEastmoneyPrice("f17", market)?.let { put("open", it) }
+                quoteData.optEastmoneyPrice("f15", market)?.let { put("high", it) }
+                quoteData.optEastmoneyPrice("f16", market)?.let { put("low", it) }
+                quoteData.optEastmoneyPriceDelta("f4", market)?.let { put("change", it) }
+                quoteData.optEastmoneyPercent("f3")?.let { put("changePercent", it) }
+                quoteData.optEastmoneyPercent("f7")?.let { put("amplitudePercent", it) }
+                quoteData.optNumberAsDouble("f5")?.let { put("volume", it) }
+                quoteData.optNumberAsDouble("f6")?.let { put("amount", it) }
+                quoteData.optEastmoneyPercent("f8")?.let { put("turnoverPercent", it) }
+                quoteData.optEastmoneyRatio("f10")?.let { put("volumeRatio", it) }
+                quoteData.optEastmoneyRatio("f9")?.let { put("peDynamic", it) }
+                quoteData.optEastmoneyRatio("f115")?.let { put("peTtm", it) }
+                quoteData.optEastmoneyRatio("f23")?.let { put("pbRatio", it) }
+                quoteData.optNumberAsDouble("f20")?.let { put("marketCap", it) }
+                quoteData.optNumberAsDouble("f21")?.let { put("floatMarketCap", it) }
+                quoteData.optEastmoneyPercent("f24")?.let { put("changePercent60d", it) }
+                quoteData.optEastmoneyPercent("f25")?.let { put("changePercentYtd", it) }
+            } else {
+                quoteData.optNumberAsDouble("f86")?.let { put("regularMarketTime", it.toLong()) }
+                quoteData.optEastmoneyPrice("f43", market)?.let { put("regularMarketPrice", it) }
+                quoteData.optEastmoneyPrice("f60", market)?.let { put("previousClose", it) }
+                quoteData.optEastmoneyPrice("f46", market)?.let { put("open", it) }
+                quoteData.optEastmoneyPrice("f44", market)?.let { put("high", it) }
+                quoteData.optEastmoneyPrice("f45", market)?.let { put("low", it) }
+                quoteData.optEastmoneyPrice("f71", market)?.let { put("averagePrice", it) }
+                quoteData.optNumberAsDouble("f47")?.let { put("volume", it) }
+                quoteData.optNumberAsDouble("f48")?.let { put("amount", it) }
+                quoteData.optEastmoneyPriceDelta("f169", market)?.let { put("change", it) }
+                quoteData.optEastmoneyPercent("f170")?.let { put("changePercent", it) }
+                quoteData.optEastmoneyPercent("f171")?.let { put("amplitudePercent", it) }
+                quoteData.optEastmoneyPercent("f168")?.let { put("turnoverPercent", it) }
+                quoteData.optEastmoneyRatio("f50")?.let { put("volumeRatio", it) }
+                quoteData.optEastmoneyRatio("f162")?.let { put("peDynamic", it) }
+                quoteData.optEastmoneyRatio("f164")?.let { put("peTtm", it) }
+                quoteData.optEastmoneyRatio("f167")?.let { put("pbRatio", it) }
+                quoteData.optNumberAsDouble("f116")?.let { put("marketCap", it) }
+                quoteData.optNumberAsDouble("f117")?.let { put("floatMarketCap", it) }
+                val price = optNumberAsDouble("regularMarketPrice")
+                val previousClose = optNumberAsDouble("previousClose")
+                if (!has("change") && price != null && previousClose != null) {
+                    put("change", price - previousClose)
+                }
+                if (!has("changePercent") && price != null && previousClose != null && previousClose != 0.0) {
+                    put("changePercent", (price - previousClose) / previousClose * 100.0)
+                }
+            }
         }
     }
 
@@ -2269,6 +2924,53 @@ class AetherAgent(
             append(interval)
             append(". Data may be delayed.")
         }
+    }
+
+    private fun buildStockQuotesSummary(
+        quotes: JSONArray,
+        errorCount: Int,
+    ): String = buildString {
+        if (quotes.length() == 0) {
+            append("No stock quotes returned")
+        } else {
+            append("Quotes: ")
+            for (index in 0 until minOf(quotes.length(), 5)) {
+                if (index > 0) append("; ")
+                val quote = quotes.optJSONObject(index) ?: continue
+                append(quote.optString("symbol"))
+                val price = quote.optNumberAsDouble("regularMarketPrice")
+                if (price != null) {
+                    append(" ")
+                    append(formatStockNumber(price))
+                    val currency = quote.optString("currency")
+                    if (currency.isNotBlank()) {
+                        append(" ")
+                        append(currency)
+                    }
+                }
+                val change = quote.optNumberAsDouble("change")
+                val changePercent = quote.optNumberAsDouble("changePercent")
+                if (change != null && changePercent != null) {
+                    append(" (")
+                    append(if (change >= 0) "+" else "")
+                    append(formatStockNumber(change))
+                    append(", ")
+                    append(if (changePercent >= 0) "+" else "")
+                    append(formatStockNumber(changePercent))
+                    append("%)")
+                }
+            }
+            if (quotes.length() > 5) {
+                append("; +")
+                append(quotes.length() - 5)
+                append(" more")
+            }
+        }
+        if (errorCount > 0) {
+            append("; errors=")
+            append(errorCount)
+        }
+        append(". Data may be delayed.")
     }
 
     private suspend fun executeSleep(argumentsJson: String): String {
@@ -2397,6 +3099,7 @@ class AetherAgent(
         agentModeEnabled: Boolean,
         enabledToolGroups: List<String>,
         planModeEnabled: Boolean,
+        goalModeEnabled: Boolean,
         taskState: AgentTaskState,
         parallelToolCallsEnabled: Boolean,
         basicToolCompatibilityMode: Boolean,
@@ -2429,7 +3132,15 @@ class AetherAgent(
                 "For Mermaid, use fenced blocks like ```mermaid {height=360 scroll=true show-all=false}\\ngraph TD\\nA-->B\\n``` and the same width/height/min-height/max-height/scroll/show-all attributes apply. Users can tap rendered images to enlarge them. " +
                 "Use fetch_web_url when you need the contents of a specific webpage or the user gives you a URL. " +
                 "Use tavily_search for public-web discovery and fresh online information. " +
-                "Use stock_market_data for stock, ETF, index, or crypto symbol lookup, quotes, and chart/OHLCV data before falling back to web search. " +
+                "Use stock_market_data for individual stock, ETF, or crypto symbol lookup, lightweight single quotes, batch quotes, and chart/OHLCV data before falling back to web search. " +
+                "For action=quote/quotes/chart, you may pass a Chinese company name such as 法拉电子 or 贵州茅台 directly as symbol; Aether will auto-resolve it. Prefer that over a separate search when the name is unambiguous. " +
+                "For multiple symbols or comparisons, use stock_market_data action=quotes; for one current snapshot with price, volume, valuation, turnover, and period-performance metrics, use action=quote; use action=chart only when historical candles/OHLCV are needed. " +
+                "Use market_overview (not stock_market_data) when the user asks about today's broad A-share market conditions, major index performance (上证/深证/创业板 etc.), or wants a market-wide summary; set include_sectors=true to also fetch sector rankings in the same call. " +
+                "Use sector_heat when the user asks which industry or concept sectors are hot/cold today, or wants to understand sector rotation; type=industry for 行业板块, type=concept for 概念板块; sort=change_desc returns strongest sectors, change_asc returns weakest sectors, turnover_desc sorts by turnover. " +
+                "Never invent or extrapolate market prices, volume, turnover, valuation, or intraday data. " +
+                "When the user's latest request asks to refresh, update, or get latest/current market or stock data, call the appropriate tool before analysis; if no symbol can be inferred from the conversation, ask for it. " +
+                "After market or stock tool results arrive, deliver the complete user-facing conclusion in the SAME turn. Do not stop after only announcing that you will look up, analyze, judge, or continue. Never end a turn with a teaser such as '接下来分析', '接着判断', or '数据拿到了，下面给你结论' without the actual conclusion. " +
+                "If a data tool fails or is unavailable, say so instead of fabricating numbers. " +
                 "Stock market data can be delayed; do not present it as financial advice. " +
                 "For tavily_search, prefer a simple query plus include_domains or max_results when useful. " +
                 "Use either time_range or start_date/end_date, never both. " +
@@ -2479,26 +3190,23 @@ class AetherAgent(
         if (planModeEnabled) {
             append("\n\n")
             append(buildPlanModeInstructions())
+        } else if (goalModeEnabled) {
+            append("\n\n")
+            append(buildGoalModeInstructions())
         }
         append("\nEnabled tool groups for this chat: $enabledToolGroupSummary. Disabled groups are intentionally unavailable for this turn.")
         append("\n\n")
         append(
-            "Persistent task state protocol: Aether keeps a compact task board for this chat across turns. " +
-                "When the user's goal, todo list, completion criteria, task status, or short progress summary changes, call update_task_state with the full current state. " +
-                "Keep task state concise and action-oriented. Use status=in_progress while working, waiting_for_user when user input is required, completed when done, blocked when stuck, and idle only when no task is active. " +
-                "Do not mention this hidden task board unless it helps answer the user."
+            "The following task state is read-only context maintained by the execution framework. " +
+                "Do not attempt to update its status or decide whether the conversation is complete."
         )
         append("\n<task_state>\n")
         append(renderTaskStateForPrompt(taskState))
         append("\n</task_state>")
-        append("\n\n")
         append(
-            "Conversation status protocol: for task-oriented work, decide whether this conversation should continue autonomously or stop for the user. " +
-                "When you know the task needs another model turn after your current visible response, call set_conversation_status with status=continue and a concise next_prompt describing the next step. " +
-                "When you need information, confirmation, permissions, or files from the user, call set_conversation_status with status=waiting_for_user. " +
-                "When the task is finished, call set_conversation_status with status=completed. " +
-                "When you cannot make meaningful progress because of a missing tool, failed setup, unavailable permission, or repeated blocker, call set_conversation_status with status=blocked and explain the blocker in reason. " +
-                "If you do not call set_conversation_status before ending a response, Aether treats the turn as completed."
+            "\n\nCompletion control belongs exclusively to the execution framework. " +
+                "You cannot mark work completed, blocked, waiting, or continuing. " +
+                "Use tools as needed, then provide the complete user-facing result in the current response."
         )
         if (agentModeEnabled) {
             append("\n\n")
@@ -2618,20 +3326,28 @@ class AetherAgent(
         val mcpSnapshots = if (extensionsEnabled) mcpClientManager.snapshots() else emptyList()
         if (mcpSnapshots.isNotEmpty()) {
             append("\n\n")
-            append(
-                "Connected MCP servers are also available in this session. " +
-                    "Use mcp_list_tools to inspect callable MCP tools. " +
-                    "Use mcp_list_resources and mcp_read_resource for resources. " +
-                    "Use mcp_list_prompts and mcp_get_prompt for prompts. " +
-                    "Never invent tool names such as server:tool."
-            )
-            if (planModeEnabled) {
-                append(" Plan Mode is read-only, so MCP tool invocation is unavailable.")
-            } else {
-                append(" Use mcp_call_tool to invoke an MCP tool with server_id, tool_name, and arguments.")
-            }
             if (exposeNamespacedMcpTools) {
-                append(" If exact MCP call names are listed below as call_name=..., you may also use those exact names directly.")
+                // 命名空间工具已直接注入 LLM tools 列表，告知模型直接调用即可
+                append(
+                    "MCP server tools are available as first-class functions in your tool list. " +
+                        "Call them directly by their function name (e.g. mcp__serverId__toolName) — " +
+                        "do NOT use mcp_call_tool or mcp_list_tools. " +
+                        "Use mcp_list_resources and mcp_read_resource for resources. " +
+                        "Use mcp_list_prompts and mcp_get_prompt for prompts."
+                )
+            } else {
+                append(
+                    "Connected MCP servers are also available in this session. " +
+                        "Use mcp_list_tools to inspect callable MCP tools. " +
+                        "Use mcp_list_resources and mcp_read_resource for resources. " +
+                        "Use mcp_list_prompts and mcp_get_prompt for prompts. " +
+                        "Never invent tool names such as server:tool."
+                )
+                if (planModeEnabled) {
+                    append(" Plan Mode is read-only, so MCP tool invocation is unavailable.")
+                } else {
+                    append(" Use mcp_call_tool to invoke an MCP tool with server_id, tool_name, and arguments.")
+                }
             }
             append("\n<mcp_servers>")
             mcpSnapshots.forEach { snapshot ->
@@ -2654,17 +3370,14 @@ class AetherAgent(
                 }
             }
             append("\n</mcp_servers>")
-            if (mcpToolBindings.isNotEmpty()) {
+            if (mcpToolBindings.isNotEmpty() && !exposeNamespacedMcpTools) {
+                // 仅在非命名空间模式下列出工具清单（命名空间模式下 LLM 已能从 tools 里看到）
                 append("\n<mcp_tools>")
                 mcpToolBindings.forEach { binding ->
                     append("\n- ")
                     append(binding.serverId)
                     append("/")
                     append(binding.toolName)
-                    if (exposeNamespacedMcpTools) {
-                        append(" call_name=")
-                        append(binding.namespacedToolName)
-                    }
                     if (binding.description.isNotBlank()) {
                         append(": ")
                         append(binding.description)
@@ -2711,45 +3424,8 @@ class AetherAgent(
         }
     }
 
-    private fun shouldForceToolUse(latestUserText: String): Boolean {
-        val normalized = latestUserText.lowercase()
-        if (normalized.isBlank()) return false
-
-        return listOf(
-            "bash",
-            "shell",
-            "termux",
-            "terminal",
-            "run pwd",
-            "run ls",
-            "run cat",
-            "execute ",
-            "command ",
-            "read ",
-            "open file",
-            "edit file",
-            "modify file",
-            "write file",
-            "create file",
-            "overwrite file",
-            "grep ",
-            "search files",
-            "find file",
-            "list directory",
-            "analyze image",
-            "inspect image",
-            "search the web",
-            "search web",
-            "browse the web",
-            "browse web",
-            "look up online",
-            "fetch url",
-            "web url",
-            "tavily",
-            "https://",
-            "http://",
-        ).any(normalized::contains)
-    }
+    private fun shouldForceToolUse(latestUserText: String): Boolean =
+        shouldForceToolUseForLatestUserText(latestUserText)
 
     private fun buildTavilySearchSummary(response: JSONObject): String = buildString {
         val answer = response.optString("answer").trim()
@@ -2803,6 +3479,29 @@ class AetherAgent(
         return rawValue / divisor
     }
 
+    private fun JSONObject.optEastmoneyPriceDelta(
+        key: String,
+        market: String,
+    ): Double? {
+        val rawValue = optNumberAsDouble(key) ?: return null
+        val divisor = when {
+            market == "105" && kotlin.math.abs(rawValue) >= 10_000.0 -> 1_000.0
+            else -> 100.0
+        }
+        return rawValue / divisor
+    }
+
+    private fun JSONObject.optEastmoneyPercent(key: String): Double? {
+        val rawValue = optNumberAsDouble(key) ?: return null
+        return rawValue / 100.0
+    }
+
+    private fun JSONObject.optEastmoneyRatio(key: String): Double? {
+        val rawValue = optNumberAsDouble(key) ?: return null
+        if (rawValue == 0.0) return null
+        return rawValue / 100.0
+    }
+
     private fun formatStockNumber(value: Double): String =
         String.format(Locale.US, "%.2f", value)
 
@@ -2851,6 +3550,19 @@ class AetherAgent(
                 }
             }
         }
+    }
+
+    private fun JSONObject.stockSymbolsValue(): List<String> {
+        val fromArray = stringArrayValue("symbols")
+        if (fromArray.isNotEmpty()) {
+            return fromArray.distinct()
+        }
+        val fromSymbol = stringValue("symbol")
+        return fromSymbol
+            .split(Regex("[,;\\s]+"))
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinct()
     }
 
     private fun JSONObject.hasUsableValue(key: String): Boolean =

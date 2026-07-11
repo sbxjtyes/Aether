@@ -95,6 +95,8 @@ class AetherAgentToolGroupsTest {
         assertTrue(isAetherToolAvailableForGroups("run_tool_batch", planModeEnabled = true))
         assertTrue(isAetherToolAvailableForGroups("mcp_list_tools", planModeEnabled = true))
         assertTrue(isAetherToolAvailableForGroups("mcp_read_resource", planModeEnabled = true))
+        assertFalse(isAetherToolAvailableForGroups("set_conversation_status", planModeEnabled = true))
+        assertFalse(isAetherToolAvailableForGroups("update_task_state", planModeEnabled = true))
 
         assertFalse(isAetherToolAvailableForGroups("edit", planModeEnabled = true))
         assertFalse(isAetherToolAvailableForGroups("write", planModeEnabled = true))
@@ -119,14 +121,34 @@ class AetherAgentToolGroupsTest {
         assertTrue(instructions.contains("Phase 3 - Produce the implementation plan"))
         assertTrue(instructions.contains("2-3 short mutually exclusive text options"))
         assertTrue(instructions.contains("(recommended)"))
-        assertTrue(instructions.contains("update_task_state with status=waiting_for_user"))
-        assertTrue(instructions.contains("set_conversation_status with status=waiting_for_user"))
+        assertTrue(instructions.contains("execution framework decides whether the turn is complete"))
         assertTrue(instructions.contains("<proposed_plan>...</proposed_plan>"))
         assertTrue(instructions.contains("single <proposed_plan>...</proposed_plan> block"))
         assertTrue(instructions.contains("Summary, Implementation Changes, Test Plan, and Assumptions"))
         assertTrue(instructions.contains("Match the user's language"))
         assertTrue(instructions.contains("must not modify files"))
         assertTrue(instructions.contains("Do not claim that implementation has been completed"))
+    }
+
+    @Test
+    fun goalModeInstructionsDescribeClosedLoopExecution() {
+        val instructions = buildGoalModeInstructions()
+
+        assertTrue(instructions.contains("GOAL MODE is enabled"))
+        assertTrue(instructions.contains("current task_state goal"))
+        assertTrue(instructions.contains("complete result in the current turn"))
+        assertTrue(instructions.contains("execution framework exclusively decides"))
+        assertFalse(instructions.contains("update_task_state"))
+        assertFalse(instructions.contains("set_conversation_status"))
+    }
+
+    @Test
+    fun forceToolUseRecognizesMarketRefreshRequests() {
+        assertTrue(shouldForceToolUseForLatestUserText("\u5237\u65b0\u6700\u65b0\u6570\u636e\u3002"))
+        assertTrue(shouldForceToolUseForLatestUserText("\u5e2e\u6211\u770b\u4e00\u4e0b\u6700\u65b0\u884c\u60c5"))
+        assertTrue(shouldForceToolUseForLatestUserText("600519 \u73b0\u4ef7\u591a\u5c11"))
+        assertTrue(shouldForceToolUseForLatestUserText("AAPL current price?"))
+        assertFalse(shouldForceToolUseForLatestUserText("thanks for the summary"))
     }
 
     private fun List<JSONObject>.toolNames(): Set<String> =

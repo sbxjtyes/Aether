@@ -27,9 +27,17 @@ private const val DefaultTavilyBaseUrl = "https://api.tavily.com/"
 private const val DefaultStockSearchBaseUrl = "https://searchapi.eastmoney.com/"
 private const val DefaultStockQuoteBaseUrl = "https://push2delay.eastmoney.com/"
 private const val DefaultStockKlineBaseUrl = "https://push2his.eastmoney.com/"
+private const val DefaultStockSectorBaseUrl = "https://push2.eastmoney.com/"
+private const val DefaultSinaQuoteBaseUrl = "https://hq.sinajs.cn/"
+private const val DefaultEastmoneyLimitPoolBaseUrl = "https://push2ex.eastmoney.com/"
 private const val EastmoneySuggestToken = "D43BF722C8E33BDC906FB84D85E326E8"
-private const val EastmoneyQuoteFields =
-    "f43,f44,f45,f46,f47,f48,f49,f57,f58,f60,f84,f85,f86,f107,f116,f117,f152"
+private const val EastmoneyUtToken = "bd1d9ddb04089700cf9c27f6f7426281"
+private const val EastmoneySectorFields = "f12,f14,f3,f128,f136,f8,f62,f184"
+private const val EastmoneyBreadthFields = "f2,f3,f12,f14,f15,f16,f17,f18"
+private const val EastmoneySingleQuoteFields =
+    "f43,f44,f45,f46,f47,f48,f49,f50,f51,f52,f57,f58,f60,f71,f84,f85,f86,f107,f116,f117,f152,f162,f164,f167,f168,f169,f170,f171"
+private const val EastmoneyBatchQuoteFields =
+    "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f62,f115,f152"
 
 data class FetchedWebPage(
     val requestUrl: String,
@@ -61,11 +69,19 @@ data class StockSearchRequest(
     val maxResults: Int = 10,
 )
 
+data class StockQuoteRequest(
+    val symbol: String,
+)
+
 data class StockChartRequest(
     val symbol: String,
     val range: String = "1d",
     val interval: String = "1m",
     val includePrePost: Boolean = false,
+)
+
+data class StockQuotesRequest(
+    val symbols: List<String>,
 )
 
 class WebToolsClient(
@@ -82,6 +98,8 @@ class WebToolsClient(
     private val stockSearchBaseUrl: String = DefaultStockSearchBaseUrl,
     private val stockQuoteBaseUrl: String = DefaultStockQuoteBaseUrl,
     private val stockKlineBaseUrl: String = DefaultStockKlineBaseUrl,
+    private val stockSectorBaseUrl: String = DefaultStockSectorBaseUrl,
+    private val eastmoneyLimitPoolBaseUrl: String = DefaultEastmoneyLimitPoolBaseUrl,
 ) {
     private val htmlToMarkdownConverter = FlexmarkHtmlConverter.builder().build()
 
@@ -216,10 +234,11 @@ class WebToolsClient(
                 error("Stock symbol is required.")
             }
 
-            val resolvedSymbol = resolveEastmoneySecid(symbol)
+            // 支持中文名/模糊输入：无法从代码推断市场时，自动走搜索取 QuoteID。
+            val resolvedSymbol = resolveEastmoneySecidFlexible(symbol)
             val quoteEndpoint = buildStockEndpoint(resolveStockBaseUrl(stockQuoteBaseUrl), "api", "qt", "stock", "get") {
                 addQueryParameter("secid", resolvedSymbol.secid)
-                addQueryParameter("fields", EastmoneyQuoteFields)
+                addQueryParameter("fields", EastmoneySingleQuoteFields)
             }
             val quoteJson = executeJsonGet(quoteEndpoint, "stock quote")
             if (quoteJson.optInt("rc", -1) != 0 || quoteJson.optJSONObject("data") == null) {
@@ -244,6 +263,7 @@ class WebToolsClient(
                 put("resolved_symbol", resolvedSymbol.symbol)
                 put("secid", resolvedSymbol.secid)
                 put("market", resolvedSymbol.market)
+                put("resolved_from_query", resolvedSymbol.resolvedFromQuery)
                 put("range", request.range)
                 put("interval", request.interval)
                 put("klt", klineConfig.klt)
@@ -260,8 +280,551 @@ class WebToolsClient(
         }
     }
 
+    suspend fun fetchStockQuote(
+        request: StockQuoteRequest,
+    ): Result<JSONObject> = runCatching {
+        withContext(Dispatchers.IO) {
+            val symbol = request.symbol.trim()
+            if (symbol.isBlank()) {
+                error("Stock symbol is required.")
+            }
+
+            // 支持中文名/模糊输入：无法从代码推断市场时，自动走搜索取 QuoteID。
+            val resolvedSymbol = resolveEastmoneySecidFlexible(symbol)
+            val quoteEndpoint = buildStockEndpoint(resolveStockBaseUrl(stockQuoteBaseUrl), "api", "qt", "stock", "get") {
+                addQueryParameter("secid", resolvedSymbol.secid)
+                addQueryParameter("fields", EastmoneySingleQuoteFields)
+            }
+            val quoteJson = executeJsonGet(quoteEndpoint, "stock quote")
+            if (quoteJson.optInt("rc", -1) != 0 || quoteJson.optJSONObject("data") == null) {
+                error("Stock quote response did not include usable data for ${resolvedSymbol.secid}.")
+            }
+
+            JSONObject().apply {
+                put("source", "Eastmoney")
+                put("resolved_symbol", resolvedSymbol.symbol)
+                put("secid", resolvedSymbol.secid)
+                put("market", resolvedSymbol.market)
+                put("resolved_from_query", resolvedSymbol.resolvedFromQuery)
+                put("quote", quoteJson)
+            }
+        }
+    }
+
+    /**
+     * 获取主要市场指数实时行情。
+     * 复用东方财富批量行情接口（ulist.np/get），传入五大指数 secid。
+     */
+    suspend fun fetchMarketIndices(
+        secids: List<String> = MainMarketIndexSecids,
+    ): Result<List<MarketIndex>> = runCatching {
+        withContext(Dispatchers.IO) {
+            // 不传 fltt 参数，沿用东财默认整数编码（值需 ÷100），与现有 normalizeEastmoneyQuote 保持一致。
+            val endpoint = buildStockEndpoint(
+                resolveStockBaseUrl(stockQuoteBaseUrl),
+                "api", "qt", "ulist.np", "get",
+            ) {
+                addQueryParameter("secids", secids.joinToString(","))
+                addQueryParameter("fields", EastmoneyBatchQuoteFields)
+                addQueryParameter("invt", "2")
+            }
+            val json = executeJsonGet(endpoint, "market indices")
+            val diff = json.optJSONObject("data")?.optJSONArray("diff") ?: JSONArray()
+            (0 until diff.length()).mapNotNull { i ->
+                val item = diff.optJSONObject(i) ?: return@mapNotNull null
+                val market = item.optString("f13")
+                val code = item.optString("f12")
+                // 东财整数编码：价格 / 100 = 实际价格（例如 335025 → 3350.25）
+                val rawPrice = item.optDouble("f2", Double.NaN)
+                val rawChange = item.optDouble("f4", Double.NaN)
+                val rawChangePct = item.optDouble("f3", Double.NaN)
+                if (rawPrice.isNaN() || rawPrice <= 0) return@mapNotNull null
+                MarketIndex(
+                    code = code,
+                    name = item.optString("f14"),
+                    secid = "$market.$code",
+                    price = rawPrice / 100.0,
+                    change = if (rawChange.isNaN()) 0.0 else rawChange / 100.0,
+                    changePercent = if (rawChangePct.isNaN()) 0.0 else rawChangePct / 100.0,
+                    volume = item.optLong("f5", 0L),
+                    amount = item.optDouble("f6", 0.0),
+                )
+            }
+        }
+    }
+
+    suspend fun fetchSectorRank(
+        type: SectorType = SectorType.Industry,
+        limit: Int = 50,
+        sort: SectorSort = SectorSort.ChangePercent,
+        ascending: Boolean = false,
+    ): Result<List<SectorItem>> = runCatching {
+        withContext(Dispatchers.IO) {
+            val fsParam = when (type) {
+                SectorType.Industry -> "m:90+t:2"
+                SectorType.Concept -> "m:90+t:3"
+            }
+            val fid = when (sort) {
+                SectorSort.ChangePercent -> "f3"
+                SectorSort.TurnoverRate -> "f8"
+            }
+            val endpoint = buildStockEndpoint(
+                stockSectorBaseUrl,
+                "api", "qt", "clist", "get",
+            ) {
+                addQueryParameter("pn", "1")
+                addQueryParameter("pz", limit.coerceIn(1, 100).toString())
+                addQueryParameter("po", if (ascending) "0" else "1")
+                addQueryParameter("np", "1")
+                addQueryParameter("ut", EastmoneyUtToken)
+                addQueryParameter("invt", "2")
+                addQueryParameter("fid", fid)
+                addQueryParameter("fs", fsParam)
+                addQueryParameter("fields", EastmoneySectorFields)
+            }
+            val json = executeJsonGet(endpoint, "sector rank")
+            val diff = json.optJSONObject("data")?.optJSONArray("diff") ?: JSONArray()
+            (0 until diff.length()).mapNotNull { i ->
+                val item = diff.optJSONObject(i) ?: return@mapNotNull null
+                val rawChangePct = item.optDouble("f3", Double.NaN)
+                SectorItem(
+                    code = item.optString("f12"),
+                    name = item.optString("f14"),
+                    changePercent = if (rawChangePct.isNaN()) 0.0 else rawChangePct / 100.0,
+                    leadingStock = item.optString("f128"),
+                    leadingStockChange = item.optDouble("f136", 0.0) / 100.0,
+                    turnoverRate = item.optDouble("f8", 0.0) / 100.0,
+                    amount = item.optDouble("f62", 0.0),
+                )
+            }
+        }
+    }
+
+    suspend fun fetchMarketBreadth(
+        pageSize: Int = 200,
+        maxPages: Int = 30,
+    ): Result<MarketBreadth> = runCatching {
+        withContext(Dispatchers.IO) {
+            var rising = 0
+            var falling = 0
+            var flat = 0
+            var estimatedLimitUp = 0
+            var estimatedLimitDown = 0
+            var page = 1
+            var total = Int.MAX_VALUE
+            val pz = pageSize.coerceIn(50, 500)
+
+            while ((page - 1) * pz < total && page <= maxPages.coerceAtLeast(1)) {
+                val endpoint = buildStockEndpoint(
+                    stockSectorBaseUrl,
+                    "api", "qt", "clist", "get",
+                ) {
+                    addQueryParameter("pn", page.toString())
+                    addQueryParameter("pz", pz.toString())
+                    addQueryParameter("po", "1")
+                    addQueryParameter("np", "1")
+                    addQueryParameter("ut", EastmoneyUtToken)
+                    addQueryParameter("invt", "2")
+                    addQueryParameter("fid", "f3")
+                    addQueryParameter("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23")
+                    addQueryParameter("fields", EastmoneyBreadthFields)
+                }
+                val json = executeJsonGet(endpoint, "market breadth")
+                val data = json.optJSONObject("data") ?: break
+                total = data.optInt("total", total)
+                val diff = data.optJSONArray("diff") ?: JSONArray()
+                if (diff.length() == 0) break
+                for (i in 0 until diff.length()) {
+                    val item = diff.optJSONObject(i) ?: continue
+                    val pct = item.optDouble("f3", Double.NaN).takeUnless { it.isNaN() }?.div(100.0) ?: continue
+                    when {
+                        pct > 0.0 -> rising++
+                        pct < 0.0 -> falling++
+                        else -> flat++
+                    }
+                    if (pct >= 9.8) estimatedLimitUp++
+                    if (pct <= -9.8) estimatedLimitDown++
+                }
+                page++
+            }
+
+            val poolCounts = fetchLimitPoolCounts().getOrNull()
+            MarketBreadth(
+                risingCount = rising,
+                fallingCount = falling,
+                flatCount = flat,
+                limitUpCount = poolCounts?.first ?: estimatedLimitUp,
+                limitDownCount = poolCounts?.second ?: estimatedLimitDown,
+                isEstimatedLimitStats = poolCounts == null,
+            )
+        }
+    }
+
+    suspend fun fetchWatchlistQuotes(
+        symbols: List<String>,
+    ): Result<List<WatchlistQuote>> = runCatching {
+        withContext(Dispatchers.IO) {
+            val normalizedSymbols = symbols
+                .map { it.trim().uppercase(Locale.US) }
+                .filter(String::isNotBlank)
+                .distinct()
+            if (normalizedSymbols.isEmpty()) return@withContext emptyList()
+
+            val quotes = mutableListOf<WatchlistQuote>()
+            normalizedSymbols.chunked(20).forEach { chunk ->
+                val resolved = chunk.mapNotNull { symbol ->
+                    runCatching { symbol to resolveEastmoneySecid(symbol) }.getOrNull()
+                }
+                if (resolved.isEmpty()) return@forEach
+                val secids = resolved.map { it.second.secid }
+                val symbolBySecid = resolved.associate { (input, secid) -> secid.secid to input }
+                val endpoint = buildStockEndpoint(resolveStockBaseUrl(stockQuoteBaseUrl), "api", "qt", "ulist.np", "get") {
+                    addQueryParameter("secids", secids.joinToString(","))
+                    addQueryParameter("fields", EastmoneyBatchQuoteFields)
+                    addQueryParameter("invt", "2")
+                }
+                val json = executeJsonGet(endpoint, "watchlist quotes")
+                val diff = json.optJSONObject("data")?.optJSONArray("diff") ?: JSONArray()
+                for (i in 0 until diff.length()) {
+                    val item = diff.optJSONObject(i) ?: continue
+                    parseWatchlistQuote(item, symbolBySecid)?.let(quotes::add)
+                }
+            }
+            quotes
+        }
+    }
+
+    private fun fetchLimitPoolCounts(): Result<Pair<Int, Int>> = runCatching {
+        val date = LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE)
+        val up = fetchLimitPoolCount("getTopicZTPool", date)
+        val down = fetchLimitPoolCount("getTopicDTPool", date)
+        up to down
+    }
+
+    private fun fetchLimitPoolCount(
+        pathSegment: String,
+        date: String,
+    ): Int {
+        val endpoint = buildStockEndpoint(eastmoneyLimitPoolBaseUrl, pathSegment) {
+            addQueryParameter("ut", EastmoneyUtToken)
+            addQueryParameter("d", date)
+            addQueryParameter("pageindex", "0")
+            addQueryParameter("pagesize", "1")
+            addQueryParameter("sort", "fbt:asc")
+        }
+        val json = executeJsonGet(endpoint, "limit pool")
+        val data = json.optJSONObject("data") ?: return 0
+        val pool = data.optJSONArray("pool")
+        if (pool != null) return data.optInt("tc", pool.length())
+        val diff = data.optJSONArray("diff")
+        if (diff != null) return data.optInt("total", diff.length())
+        return data.optInt("total", data.optInt("count", 0))
+    }
+
+    private fun parseWatchlistQuote(
+        item: JSONObject,
+        symbolBySecid: Map<String, String>,
+    ): WatchlistQuote? {
+        val market = item.optString("f13")
+        val code = item.optString("f12")
+        val secid = "$market.$code"
+        val price = item.optEastmoneyPrice("f2", market) ?: return null
+        val preClose = item.optEastmoneyPrice("f18", market) ?: 0.0
+        val change = item.optEastmoneyPriceDelta("f4", market) ?: (price - preClose)
+        val changePercent = item.optEastmoneyPercent("f3") ?: if (preClose > 0.0) {
+            change / preClose * 100.0
+        } else {
+            0.0
+        }
+        return WatchlistQuote(
+            symbol = symbolBySecid[secid] ?: code,
+            name = item.optString("f14"),
+            price = price,
+            change = change,
+            changePercent = changePercent,
+            volume = item.optLong("f5", 0L),
+            amount = item.optDouble("f6", 0.0),
+            high = item.optEastmoneyPrice("f15", market) ?: 0.0,
+            low = item.optEastmoneyPrice("f16", market) ?: 0.0,
+            open = item.optEastmoneyPrice("f17", market) ?: 0.0,
+            preClose = preClose,
+        )
+    }
+
+    private fun JSONObject.optNumberAsDouble(key: String): Double? {
+        if (!has(key) || isNull(key)) return null
+        return when (val value = opt(key)) {
+            is Number -> value.toDouble()
+            is String -> value.toDoubleOrNull()
+            else -> null
+        }
+    }
+
+    private fun JSONObject.optEastmoneyPrice(
+        key: String,
+        market: String,
+    ): Double? {
+        val rawValue = optNumberAsDouble(key) ?: return null
+        if (rawValue <= 0.0) return null
+        val divisor = if (market == "105" && rawValue >= 10_000.0) 1_000.0 else 100.0
+        return rawValue / divisor
+    }
+
+    private fun JSONObject.optEastmoneyPriceDelta(
+        key: String,
+        market: String,
+    ): Double? {
+        val rawValue = optNumberAsDouble(key) ?: return null
+        val divisor = if (market == "105" && kotlin.math.abs(rawValue) >= 10_000.0) 1_000.0 else 100.0
+        return rawValue / divisor
+    }
+
+    private fun JSONObject.optEastmoneyPercent(key: String): Double? {
+        val rawValue = optNumberAsDouble(key) ?: return null
+        return rawValue / 100.0
+    }
+
+    /**
+     * 使用新浪财经接口获取实时行情（延迟约 1–3 秒，比东方财富更快）。
+     * 符号格式转换：600519.SH → sh600519，000001.SZ → sz000001
+     */
+    suspend fun fetchSinaQuotes(
+        symbols: List<String>,
+    ): Result<List<WatchlistQuote>> = runCatching {
+        withContext(Dispatchers.IO) {
+            if (symbols.isEmpty()) return@withContext emptyList()
+            val sinaCodes = symbols.mapNotNull { sym -> convertToSinaCode(sym) }
+            if (sinaCodes.isEmpty()) return@withContext emptyList()
+
+            // 新浪接口不走用户自定义的东财 URL，固定使用新浪域名。
+            val url = "${DefaultSinaQuoteBaseUrl}list=${sinaCodes.joinToString(",")}"
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", DefaultUserAgent)
+                .header("Referer", "https://finance.sina.com.cn")
+                .header("Accept", "text/plain,*/*")
+                .build()
+
+            val body = httpClient.newCall(request).execute().use { resp ->
+                resp.body?.string().orEmpty()
+            }
+
+            parseSinaQuoteResponse(body, symbols)
+        }
+    }
+
+    private fun convertToSinaCode(symbol: String): String? {
+        val upper = symbol.trim().uppercase(Locale.US)
+        return when {
+            upper.endsWith(".SH") || upper.endsWith(".SS") -> "sh${upper.substringBefore('.')}"
+            upper.endsWith(".SZ") -> "sz${upper.substringBefore('.')}"
+            upper.matches(Regex("^6\\d{5}$")) -> "sh$upper"
+            upper.matches(Regex("^[038]\\d{5}$")) -> "sz$upper"
+            else -> null
+        }
+    }
+
+    private fun parseSinaQuoteResponse(body: String, originalSymbols: List<String>): List<WatchlistQuote> {
+        // 预先建立 sina code → 原始符号 的反查表，避免用行号匹配（行号会因空行错位）。
+        val sinaToOriginal = originalSymbols.associateBy { sym ->
+            convertToSinaCode(sym)?.lowercase(Locale.US) ?: ""
+        }.filterKeys { it.isNotBlank() }
+
+        val results = mutableListOf<WatchlistQuote>()
+        for (line in body.lines()) {
+            val trimmed = line.trim()
+            if (trimmed.isBlank() || !trimmed.startsWith("var hq_str_")) continue
+            val eqIdx = trimmed.indexOf('=')
+            if (eqIdx < 0) continue
+            val codeRaw = trimmed.substring("var hq_str_".length, eqIdx).trim().lowercase(Locale.US)
+            val dataStr = trimmed.substring(eqIdx + 1).trim().trimStart('"').trimEnd(';', '"')
+            if (dataStr.isBlank()) continue
+            val parts = dataStr.split(",")
+            if (parts.size < 10) continue
+            val name = parts.getOrElse(0) { "" }
+            val open = parts.getOrElse(1) { "0" }.toDoubleOrNull() ?: 0.0
+            val preClose = parts.getOrElse(2) { "0" }.toDoubleOrNull() ?: 0.0
+            val price = parts.getOrElse(3) { "0" }.toDoubleOrNull() ?: 0.0
+            val high = parts.getOrElse(4) { "0" }.toDoubleOrNull() ?: 0.0
+            val low = parts.getOrElse(5) { "0" }.toDoubleOrNull() ?: 0.0
+            val volume = parts.getOrElse(8) { "0" }.toLongOrNull() ?: 0L
+            val amount = parts.getOrElse(9) { "0" }.toDoubleOrNull() ?: 0.0
+            if (price <= 0 && name.isBlank()) continue
+            val change = price - preClose
+            val changePct = if (preClose > 0) (change / preClose * 100.0) else 0.0
+            // 优先从反查表取原始符号；找不到时从 codeRaw 自行还原。
+            val symbol = sinaToOriginal[codeRaw] ?: when {
+                codeRaw.startsWith("sh") -> "${codeRaw.substring(2).uppercase(Locale.US)}.SH"
+                codeRaw.startsWith("sz") -> "${codeRaw.substring(2).uppercase(Locale.US)}.SZ"
+                else -> codeRaw.uppercase(Locale.US)
+            }
+            results.add(
+                WatchlistQuote(
+                    symbol = symbol,
+                    name = name,
+                    price = price,
+                    change = change,
+                    changePercent = changePct,
+                    volume = volume,
+                    amount = amount,
+                    high = high,
+                    low = low,
+                    open = open,
+                    preClose = preClose,
+                )
+            )
+        }
+        return results
+    }
+
+    suspend fun fetchStockQuotes(
+        request: StockQuotesRequest,
+    ): Result<JSONObject> = runCatching {
+        withContext(Dispatchers.IO) {
+            val symbols = request.symbols
+                .asSequence()
+                .map(String::trim)
+                .filter(String::isNotBlank)
+                .distinct()
+                .take(20)
+                .toList()
+            if (symbols.isEmpty()) {
+                error("At least one stock symbol is required.")
+            }
+
+            val resolvedSymbols = JSONArray()
+            val errors = JSONArray()
+            val secids = buildList {
+                symbols.forEach { symbol ->
+                    // 批量行情同样支持中文名：解析失败时自动搜索。
+                    runCatching { resolveEastmoneySecidFlexible(symbol) }
+                        .onSuccess { resolved ->
+                            add(resolved.secid)
+                            resolvedSymbols.put(
+                                JSONObject().apply {
+                                    put("input", symbol)
+                                    put("symbol", resolved.symbol)
+                                    put("market", resolved.market)
+                                    put("secid", resolved.secid)
+                                    put("resolved_from_query", resolved.resolvedFromQuery)
+                                },
+                            )
+                        }
+                        .onFailure { throwable ->
+                            errors.put(
+                                JSONObject().apply {
+                                    put("symbol", symbol)
+                                    put("errmsg", throwable.message ?: "Unable to resolve stock symbol.")
+                                },
+                            )
+                        }
+                }
+            }
+            if (secids.isEmpty()) {
+                return@withContext JSONObject().apply {
+                    put("source", "Eastmoney")
+                    put("requested_symbols", JSONArray(symbols))
+                    put("resolved_symbols", resolvedSymbols)
+                    put(
+                        "quotes",
+                        JSONObject().apply {
+                            put(
+                                "data",
+                                JSONObject().apply {
+                                    put("diff", JSONArray())
+                                },
+                            )
+                        },
+                    )
+                    put("errors", errors)
+                }
+            }
+
+            val endpoint = buildStockEndpoint(resolveStockBaseUrl(stockQuoteBaseUrl), "api", "qt", "ulist.np", "get") {
+                addQueryParameter("secids", secids.joinToString(","))
+                addQueryParameter("fields", EastmoneyBatchQuoteFields)
+            }
+            val quoteJson = executeJsonGet(endpoint, "stock quotes")
+            if (quoteJson.optInt("rc", -1) != 0 || quoteJson.optJSONObject("data") == null) {
+                error("Stock quotes response did not include usable data.")
+            }
+
+            JSONObject().apply {
+                put("source", "Eastmoney")
+                put("requested_symbols", JSONArray(symbols))
+                put("resolved_symbols", resolvedSymbols)
+                put("quotes", quoteJson)
+                if (errors.length() > 0) {
+                    put("errors", errors)
+                }
+            }
+        }
+    }
+
     private fun resolveStockBaseUrl(defaultBaseUrl: String): String =
         stockBaseUrl.trim().ifBlank { defaultBaseUrl }
+
+    /**
+     * 先按代码规则解析 secid；若输入是中文名/无法推断市场的模糊文本，
+     * 则自动调用东方财富搜索接口，取最匹配结果的 QuoteID。
+     * 这样模型可以直接 quote("法拉电子")，不必先 search 再 quote。
+     */
+    private suspend fun resolveEastmoneySecidFlexible(symbol: String): EastmoneySecid {
+        val trimmed = symbol.trim()
+        if (trimmed.isBlank()) {
+            error("Stock symbol is required.")
+        }
+        runCatching { return resolveEastmoneySecid(trimmed) }
+
+        val searchJson = searchStocks(
+            StockSearchRequest(query = trimmed, maxResults = 8),
+        ).getOrElse { throwable ->
+            error(
+                "Unable to infer stock market for '$symbol', and search failed: " +
+                    (throwable.message ?: "unknown error"),
+            )
+        }
+        val matches = searchJson
+            .optJSONObject("QuotationCodeTable")
+            ?.optJSONArray("Data")
+            ?: JSONArray()
+        if (matches.length() == 0) {
+            error("Unable to infer stock market for '$symbol'. No search matches found.")
+        }
+
+        val normalizedQuery = trimmed.lowercase(Locale.US)
+        var chosen: JSONObject? = null
+        for (index in 0 until matches.length()) {
+            val item = matches.optJSONObject(index) ?: continue
+            val name = item.optString("Name")
+            val code = item.optString("Code")
+            val pinyin = item.optString("PinYin")
+            if (
+                name.equals(trimmed, ignoreCase = true) ||
+                code.equals(trimmed, ignoreCase = true) ||
+                pinyin.equals(normalizedQuery, ignoreCase = true)
+            ) {
+                chosen = item
+                break
+            }
+        }
+        val best = chosen ?: matches.optJSONObject(0)
+            ?: error("Unable to infer stock market for '$symbol'. No usable search match.")
+
+        val quoteId = best.optString("QuoteID").ifBlank {
+            val market = best.optString("MktNum")
+            val code = best.optString("Code")
+            if (market.isNotBlank() && code.isNotBlank()) "$market.$code" else ""
+        }
+        if (quoteId.isBlank()) {
+            error("Unable to resolve QuoteID for '$symbol' from search results.")
+        }
+
+        return resolveEastmoneySecid(quoteId).copy(
+            resolvedFromQuery = true,
+            matchedName = best.optString("Name"),
+        )
+    }
 
     private fun resolveEastmoneySecid(symbol: String): EastmoneySecid {
         val normalized = symbol.trim().uppercase(Locale.US)
@@ -361,6 +924,10 @@ class WebToolsClient(
         val symbol: String,
         val market: String,
         val secid: String,
+        /** 是否通过中文名/模糊搜索解析得到（而非直接从代码推断）。 */
+        val resolvedFromQuery: Boolean = false,
+        /** 搜索命中时的证券名称，便于上层回显。 */
+        val matchedName: String = "",
     )
 
     private data class EastmoneyKlineConfig(

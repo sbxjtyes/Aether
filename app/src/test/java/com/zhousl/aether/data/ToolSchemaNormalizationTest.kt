@@ -69,6 +69,15 @@ class ToolSchemaNormalizationTest {
         )
     }
 
+    @Test
+    fun parseToolArgumentsObject_acceptsJSONObjectOrJsonString() {
+        assertEquals("value", parseToolArgumentsObject(JSONObject().put("key", "value")).getOrThrow().getString("key"))
+        assertEquals("value", parseToolArgumentsObject("""{"key":"value"}""").getOrThrow().getString("key"))
+        assertEquals(0, parseToolArgumentsObject("").getOrThrow().length())
+        assertEquals(0, parseToolArgumentsObject(null).getOrThrow().length())
+        assertTrue(parseToolArgumentsObject("""{"key":""").isFailure)
+    }
+
     private fun JSONArray.toStringSet(): Set<String> =
         buildSet {
             for (index in 0 until length()) {

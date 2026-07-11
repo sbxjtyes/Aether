@@ -254,6 +254,7 @@ internal fun parseChatSessionObject(
         },
     ),
     planModeEnabled = session.optBoolean("planModeEnabled", false),
+    goalModeEnabled = session.optBoolean("goalModeEnabled", false),
     selectedModelKey = session.optString("selectedModelKey"),
     taskState = parseAgentTaskState(session.optJSONObject("taskState")),
     lastOpenedAtMillis = session.optLong("lastOpenedAtMillis"),
@@ -299,6 +300,7 @@ internal fun ChatSession.toJson(): JSONObject = JSONObject().apply {
     put("isArchived", isArchived)
     put("agentModeEnabled", agentModeEnabled)
     put("planModeEnabled", planModeEnabled)
+    put("goalModeEnabled", goalModeEnabled)
     put("selectedModelKey", selectedModelKey)
     put("selectedSkillIds", JSONArray().apply { selectedSkillIds.forEach(::put) })
     put("enabledToolGroups", JSONArray().apply { normalizeChatToolGroups(enabledToolGroups).forEach(::put) })

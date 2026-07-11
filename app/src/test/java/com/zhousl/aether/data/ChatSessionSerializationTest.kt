@@ -137,6 +137,38 @@ class ChatSessionSerializationTest {
     }
 
     @Test
+    fun explicitGoalModeRoundTrips() {
+        val enabledSession = ChatSession(
+            id = "goal-enabled",
+            title = "goal",
+            preview = "",
+            messages = emptyList(),
+            goalModeEnabled = true,
+        )
+        val disabledSession = ChatSession(
+            id = "goal-disabled",
+            title = "goal",
+            preview = "",
+            messages = emptyList(),
+            goalModeEnabled = false,
+        )
+
+        assertEquals(true, parseChatSessionObject(enabledSession.toJson()).goalModeEnabled)
+        assertEquals(false, parseChatSessionObject(disabledSession.toJson()).goalModeEnabled)
+    }
+
+    @Test
+    fun missingGoalModeDefaultsToFalse() {
+        val restored = parseChatSessionObject(
+            JSONObject(
+                "{\"id\":\"goal-missing\",\"title\":\"t\",\"preview\":\"p\",\"messages\":[]}"
+            )
+        )
+
+        assertEquals(false, restored.goalModeEnabled)
+    }
+
+    @Test
     fun taskGoalRoundTripsForSlashGoal() {
         val session = ChatSession(
             id = "goal-session",

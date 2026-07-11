@@ -59,3 +59,12 @@ internal fun stringArrayProperty(description: String): JSONObject = JSONObject()
         },
     )
 }
+
+/** 在 strict 模式下表示任意 JSON 对象：用字符串承载，避免可空 object 触发 additionalProperties 校验失败。 */
+internal fun jsonObjectStringProperty(description: String): JSONObject = JSONObject().apply {
+    put("type", "string")
+    put(
+        "description",
+        "$description Pass a JSON object as a string, for example {} or {\"path\":\"/tmp\"}.",
+    )
+}

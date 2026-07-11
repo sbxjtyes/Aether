@@ -5,16 +5,18 @@ import android.content.Context
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
-import com.posthog.android.PostHogAndroid
-import com.posthog.android.PostHogAndroidConfig
 import com.zhousl.aether.data.AgentExtensionsRepository
 import com.zhousl.aether.data.AgentModeController
 import com.zhousl.aether.data.AgentSkillManager
+import com.zhousl.aether.data.AlertEngine
 import com.zhousl.aether.data.ChatRepository
+import com.zhousl.aether.data.MarketMonitorRepository
+import com.zhousl.aether.data.MarketMonitorStartReason
 import com.zhousl.aether.data.RootSetupController
 import com.zhousl.aether.data.ChatStateStore
 import com.zhousl.aether.data.SessionExecutionManager
 import com.zhousl.aether.data.SettingsRepository
+import com.zhousl.aether.data.WatchlistRepository
 import com.zhousl.aether.data.WebToolsClient
 import com.zhousl.aether.data.WorkspaceFileBridge
 import com.zhousl.aether.termux.TermuxBashTool
@@ -24,45 +26,16 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class AetherApplication : Application() {
     val runtime: AetherAppRuntime by lazy(LazyThreadSafetyMode.NONE) {
         AetherAppRuntime(this)
     }
-    @Volatile
-    private var isPostHogInitialized = false
 
     override fun onCreate() {
         super.onCreate()
         runtime.initialize()
-    }
-
-    fun initializePostHog() {
-        if (isPostHogInitialized || BuildConfig.POSTHOG_API_KEY.isBlank()) return
-        synchronized(this) {
-            if (isPostHogInitialized || BuildConfig.POSTHOG_API_KEY.isBlank()) return
-            val config = PostHogAndroidConfig(
-                apiKey = BuildConfig.POSTHOG_API_KEY,
-                host = BuildConfig.POSTHOG_HOST,
-            ).apply {
-                captureApplicationLifecycleEvents = true
-                captureDeepLinks = true
-                captureScreenViews = true
-                debug = BuildConfig.DEBUG
-                releaseIdentifier = "${BuildConfig.APPLICATION_ID}@${BuildConfig.VERSION_NAME}+${BuildConfig.VERSION_CODE}"
-                errorTrackingConfig.autoCapture = true
-                errorTrackingConfig.inAppIncludes.addAll(
-                    listOf(
-                        "com.zhousl.aether",
-                        "com.baimoqilin.aether",
-                    ),
-                )
-            }
-            PostHogAndroid.setup(this, config)
-            isPostHogInitialized = true
-        }
     }
 }
 
@@ -93,6 +66,13 @@ class AetherAppRuntime(
         extensionsRepository = extensionsRepository,
     )
     val webToolsClient = WebToolsClient()
+    val watchlistRepository = WatchlistRepository(application)
+    val marketMonitorRepository = MarketMonitorRepository(
+        scope = appScope,
+        webToolsClient = webToolsClient,
+        watchlistRepository = watchlistRepository,
+        alertEngine = AlertEngine(),
+    )
     val appForegroundTracker = AppForegroundTracker()
     val notificationController = AetherNotificationController(application)
     val chatStateStore = ChatStateStore(
@@ -110,6 +90,7 @@ class AetherAppRuntime(
         agentModeController = agentModeController,
         skillManager = skillManager,
         webToolsClient = webToolsClient,
+        marketMonitorRepository = marketMonitorRepository,
         notificationController = notificationController,
         appForegroundTracker = appForegroundTracker,
     )
@@ -117,16 +98,27 @@ class AetherAppRuntime(
     fun initialize() {
         notificationController.ensureChannels()
         ProcessLifecycleOwner.get().lifecycle.addObserver(appForegroundTracker)
+        // 监听预警事件并发送通知
         appScope.launch {
-            if (settingsRepository.settings.first().privacyPolicyAccepted) {
-                initializePostHog()
+            marketMonitorRepository.alertEvents.collect { event ->
+                notificationController.notifyMarketAlert(event)
+            }
+        }
+        appScope.launch {
+            watchlistRepository.entries.collect { entries ->
+                val hasEnabledAlerts = entries.any { entry -> entry.alertRules.any { it.enabled } }
+                if (hasEnabledAlerts) {
+                    marketMonitorRepository.start(MarketMonitorStartReason.EnabledAlerts)
+                    runCatching { AetherForegroundService.ensureRunning(application) }
+                } else {
+                    marketMonitorRepository.stop(MarketMonitorStartReason.EnabledAlerts)
+                }
             }
         }
     }
 
-    fun initializePostHog() {
-        application.initializePostHog()
-    }
+    @Suppress("unused")
+    fun initializePostHog() = Unit
 }
 
 class AppForegroundTracker : DefaultLifecycleObserver {

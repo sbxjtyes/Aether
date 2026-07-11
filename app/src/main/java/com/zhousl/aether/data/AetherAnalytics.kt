@@ -1,27 +1,14 @@
 package com.zhousl.aether.data
 
-import com.posthog.PostHog
-
+/** PostHog 埋点已移除；保留空壳避免修改全部调用点，所有方法均为无操作。 */
 object AetherAnalytics {
     fun capture(
         event: String,
         properties: Map<String, Any> = emptyMap(),
-    ) {
-        runCatching {
-            if (properties.isEmpty()) {
-                PostHog.capture(event = event)
-            } else {
-                PostHog.capture(event = event, properties = properties)
-            }
-        }
-    }
+    ) = Unit
 
     fun captureException(
         throwable: Throwable,
         properties: Map<String, Any> = emptyMap(),
-    ) {
-        runCatching {
-            PostHog.captureException(throwable, properties)
-        }
-    }
+    ) = Unit
 }

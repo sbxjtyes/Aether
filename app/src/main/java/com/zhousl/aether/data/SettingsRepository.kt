@@ -29,6 +29,15 @@ class SettingsRepository(
             ),
             keepTasksRunningInBackground = preferences[KEEP_TASKS_RUNNING_IN_BACKGROUND] ?: true,
             notifyOnTaskCompletion = preferences[NOTIFY_ON_TASK_COMPLETION] ?: true,
+            agentLoopPolicy = normalizeAgentLoopPolicy(
+                AgentLoopPolicy(
+                    autonomousContinuationEnabled =
+                        preferences[AUTONOMOUS_CONTINUATION_ENABLED] ?: true,
+                    maxAutonomousContinuationTurns = normalizeAutonomousContinuationTurns(
+                        preferences[MAX_AUTONOMOUS_CONTINUATION_TURNS]
+                    ),
+                )
+            ),
             agentModeAuthorizationEnabled = preferences[AGENT_MODE_AUTHORIZATION_ENABLED] ?: false,
             agentModeAuthorizationMethod = AgentModeAuthorizationMethod.fromStorage(
                 preferences[AGENT_MODE_AUTHORIZATION_METHOD],
@@ -118,6 +127,9 @@ class SettingsRepository(
                 )
             it[KEEP_TASKS_RUNNING_IN_BACKGROUND] = settings.keepTasksRunningInBackground
             it[NOTIFY_ON_TASK_COMPLETION] = settings.notifyOnTaskCompletion
+            val agentLoopPolicy = normalizeAgentLoopPolicy(settings.agentLoopPolicy)
+            it[AUTONOMOUS_CONTINUATION_ENABLED] = agentLoopPolicy.autonomousContinuationEnabled
+            it[MAX_AUTONOMOUS_CONTINUATION_TURNS] = agentLoopPolicy.maxAutonomousContinuationTurns
             it[AGENT_MODE_AUTHORIZATION_ENABLED] = settings.agentModeAuthorizationEnabled
             it[AGENT_MODE_AUTHORIZATION_METHOD] = settings.agentModeAuthorizationMethod.storageValue
             it[LANGUAGE] = settings.language.storageValue
@@ -178,6 +190,9 @@ class SettingsRepository(
                 )
             it[KEEP_TASKS_RUNNING_IN_BACKGROUND] = settings.keepTasksRunningInBackground
             it[NOTIFY_ON_TASK_COMPLETION] = settings.notifyOnTaskCompletion
+            val agentLoopPolicy = normalizeAgentLoopPolicy(settings.agentLoopPolicy)
+            it[AUTONOMOUS_CONTINUATION_ENABLED] = agentLoopPolicy.autonomousContinuationEnabled
+            it[MAX_AUTONOMOUS_CONTINUATION_TURNS] = agentLoopPolicy.maxAutonomousContinuationTurns
             it[AGENT_MODE_AUTHORIZATION_ENABLED] = settings.agentModeAuthorizationEnabled
             it[AGENT_MODE_AUTHORIZATION_METHOD] = settings.agentModeAuthorizationMethod.storageValue
             it[LANGUAGE] = settings.language.storageValue
@@ -244,6 +259,10 @@ class SettingsRepository(
             booleanPreferencesKey("keep_tasks_running_in_background")
         val NOTIFY_ON_TASK_COMPLETION =
             booleanPreferencesKey("notify_on_task_completion")
+        val AUTONOMOUS_CONTINUATION_ENABLED =
+            booleanPreferencesKey("autonomous_continuation_enabled")
+        val MAX_AUTONOMOUS_CONTINUATION_TURNS =
+            intPreferencesKey("max_autonomous_continuation_turns")
         val AGENT_MODE_AUTHORIZATION_ENABLED =
             booleanPreferencesKey("agent_mode_authorization_enabled")
         val AGENT_MODE_AUTHORIZATION_METHOD =
@@ -277,6 +296,8 @@ private fun normalizeStoredSystemPrompt(value: String?): String {
 
 private val LegacyDefaultSystemPrompts = setOf(
     "You are Aether, a local-first Android agent that can call tools and complete tasks on-device. Use available tools instead of guessing local state.",
+    // v1 中文默认提示词，迁移到新版
+    "你是 Aether，一个运行在 Android 设备上的本地优先 AI 智能体。默认使用简体中文回答，除非用户明确要求其他语言。\n\n你的核心目标是把用户的任务真正完成，而不是只给建议。遇到本地文件、上传附件、设备状态、网页内容、命令执行结果时，不要凭空猜测；优先使用可用工具读取、搜索、执行或验证。\n\n运行环境：\n- 你在 Android 上工作，shell 命令通过 Termux 执行。\n- 当前会话有独立工作区，路径通常位于 ~/.aether/workspaces/<session-id>。\n- 用户上传的文件会复制到当前会话工作区，通常在 uploads/ 目录下。\n- 如果用户上传了文件，不要假设文件内容。需要查看时使用 read、grep、find、ls、bash 等工具读取。\n- 图片附件不会自动进入视觉模型。需要看图时，对工作区中的图片路径调用 analyze_image。超大图片（>5MB）会在读取前自动压缩缩放，无需手动处理。\n- 当你生成用户需要保存或下载的文件时，使用当前工作区中的绝对路径，并在回复里给出 file:// 链接。\n- 支持多模型提供方（OpenAI / Anthropic / Vertex AI / OpenAI Compatible），用户可在设置中配置。\n- 支持 MCP 服务器（HTTP / stdio）和 Agent Skills 扩展，可通过设置页面管理。\n- Agent Mode 需要 Shizuku 或 Root 授权，支持虚拟显示和设备控制。",
 )
 
 private fun parseStoredStringList(rawValue: String): List<String> {

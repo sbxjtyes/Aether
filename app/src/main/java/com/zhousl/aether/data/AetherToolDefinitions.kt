@@ -388,17 +388,42 @@ internal fun buildTavilySearchToolDefinition(): JSONObject = buildToolDefinition
 
 internal fun buildStockMarketDataToolDefinition(): JSONObject = buildToolDefinition(
     name = "stock_market_data",
-    description = "Search stock symbols or fetch current quote and historical OHLCV chart data from Eastmoney public market data endpoints. Supports A-shares and many HK/US symbols. Data may be delayed and is not financial advice.",
+    description = "Search stock symbols, fetch lightweight single or batch quotes with price, volume, valuation, turnover, and period-performance metrics, or fetch historical OHLCV chart data from Eastmoney public market data endpoints. Supports A-shares and many HK/US symbols. For quote/quotes/chart, Chinese company names such as 法拉电子 or 贵州茅台 are accepted and auto-resolved. Data may be delayed and is not financial advice.",
     properties = JSONObject().apply {
-        put("action", stringProperty("One of: search, quote, chart. Defaults to search when query is provided without symbol, otherwise quote."))
+        put("action", stringProperty("One of: search, quote, quotes, chart. batch_quote and batch are accepted aliases for quotes. Defaults to search when query is provided without symbol, otherwise quote."))
         put("query", stringProperty("Search text for action=search, such as Apple, 贵州茅台, or BTC."))
-        put("symbol", stringProperty("Stock symbol or Eastmoney QuoteID/secid for quote/chart, such as 001896.SZ, 600519.SH, 0.001896, 105.AAPL, AAPL, or 00700.HK."))
-        put("range", stringProperty("Optional chart range, such as 1d, 5d, 1mo, 6mo, 1y, 5y, max. Defaults to 1d for quote and 1mo for chart."))
-        put("interval", stringProperty("Optional chart interval, such as 1m, 5m, 15m, 1h, 1d, 1wk, 1mo. Defaults to 1m for quote and 1d for chart."))
+        put("symbol", stringProperty("Stock symbol, Chinese company name, or Eastmoney QuoteID/secid for quote/chart, such as 法拉电子, 001896.SZ, 600519.SH, 0.001896, 105.AAPL, AAPL, or 00700.HK. For action=quotes, this may also be a comma or space separated list."))
+        put("symbols", stringArrayProperty("For action=quotes, stock symbols, Chinese names, or Eastmoney QuoteID/secid values. Up to 20 symbols are requested."))
+        put("range", stringProperty("Optional chart range, such as 1d, 5d, 1mo, 6mo, 1y, 5y, max. Defaults to 1d for quote with include_chart=true and 1mo for chart."))
+        put("interval", stringProperty("Optional chart interval, such as 1m, 5m, 15m, 1h, 1d, 1wk, 1mo. Defaults to 1m for quote with include_chart=true and 1d for chart."))
+        put("include_chart", booleanProperty("For action=quote only, whether to include recent candles by using the chart data path. Defaults to false."))
+        put("includeChart", booleanProperty("Alias of include_chart."))
         put("include_pre_post", booleanProperty("Whether to include pre-market and post-market data when available."))
         put("includePrePost", booleanProperty("Alias of include_pre_post."))
         put("max_results", integerProperty("For action=search, maximum number of symbol matches to return, between 1 and 25."))
         put("maxResults", integerProperty("Alias of max_results."))
+    },
+    required = emptyList(),
+)
+
+internal fun buildMarketOverviewToolDefinition(): JSONObject = buildToolDefinition(
+    name = "market_overview",
+    description = "Fetch real-time A-share market overview: the five major indices (上证指数、深证成指、创业板指、科创50、北证50) with price, change, and change_percent. Optionally also returns top industry and concept sector rankings. Use this when the user asks about today's overall market conditions, broad index performance, or a market summary. Do NOT use stock_market_data for market-wide index queries; use this tool instead.",
+    properties = JSONObject().apply {
+        put("include_sectors", booleanProperty("Whether to also include top sector rankings (both industry and concept boards). Defaults to false. Set true when the user also asks about sectors or board performance."))
+        put("includeSectors", booleanProperty("Alias of include_sectors."))
+        put("sector_limit", integerProperty("Maximum number of sectors to return per type (industry and concept), between 5 and 50. Defaults to 20."))
+    },
+    required = emptyList(),
+)
+
+internal fun buildSectorHeatToolDefinition(): JSONObject = buildToolDefinition(
+    name = "sector_heat",
+    description = "Fetch the current A-share sector heat map, showing which industry or concept sectors are gaining or losing. Returns a ranked list with change percent, leading stock, and funds flow. Use when the user asks which sectors or themes are hot today, or wants to understand sector rotation.",
+    properties = JSONObject().apply {
+        put("type", stringProperty("Sector type: industry (行业板块) or concept (概念板块). Defaults to industry."))
+        put("limit", integerProperty("Number of sectors to return, between 5 and 100. Defaults to 50."))
+        put("sort", stringProperty("Sort order: change_desc (涨幅优先), change_asc (跌幅优先), or turnover_desc (换手率优先). Legacy desc and asc are accepted. Defaults to change_desc."))
     },
     required = emptyList(),
 )
@@ -423,7 +448,7 @@ internal fun buildRunToolBatchToolDefinition(): JSONObject = buildToolDefinition
                         put(
                             "properties",
                             JSONObject().apply {
-                                put("tool_name", stringProperty("The Aether tool name to call, such as read, bash, grep, edit, or mcp_call_tool."))
+                                put("tool_name", stringProperty("The Aether tool name to call, such as read, bash, grep, edit, or a namespaced MCP tool like mcp__serverId__toolName."))
                                 put(
                                     "arguments_json",
                                     stringProperty("JSON object string containing the arguments for that tool, for example {\"path\":\"README.md\"}. Use {} when the tool has no arguments."),
@@ -509,14 +534,10 @@ internal fun buildMcpGenericToolDefinitions(): List<JSONObject> = listOf(
             put("toolName", stringProperty("Alias of tool_name."))
             put(
                 "arguments",
-                JSONObject().apply {
-                    put("type", "object")
-                    put("description", "Arguments to pass to the MCP tool.")
-                    put("additionalProperties", true)
-                },
+                jsonObjectStringProperty("Arguments to pass to the MCP tool."),
             )
         },
-        required = listOf("server_id", "tool_name"),
+        required = listOf("server_id", "tool_name", "arguments"),
     ),
     buildToolDefinition(
         name = "mcp_list_resources",
@@ -555,14 +576,10 @@ internal fun buildMcpGenericToolDefinitions(): List<JSONObject> = listOf(
             put("name", stringProperty("The MCP prompt name."))
             put(
                 "arguments",
-                JSONObject().apply {
-                    put("type", "object")
-                    put("description", "Optional prompt arguments.")
-                    put("additionalProperties", true)
-                },
+                jsonObjectStringProperty("Optional prompt arguments."),
             )
         },
-        required = listOf("server_id", "name"),
+        required = listOf("server_id", "name", "arguments"),
     ),
 )
 
@@ -589,6 +606,8 @@ internal fun buildMcpToolDefinition(binding: McpToolBinding): JSONObject = JSONO
                 "parameters",
                 JSONObject(binding.inputSchema.toString()).apply {
                     if (!has("type")) put("type", "object")
+                    // MCP 工具 schema 来自服务端，动态参数无法预声明，禁止 strict 验证
+                    if (!has("additionalProperties")) put("additionalProperties", false)
                 },
             )
             put("strict", false)
