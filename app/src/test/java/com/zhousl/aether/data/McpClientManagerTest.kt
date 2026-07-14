@@ -4,9 +4,20 @@ import org.json.JSONObject
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
+import okhttp3.ResponseBody.Companion.toResponseBody
 
 class McpClientManagerTest {
+    @Test
+    fun limitedMcpResponseReader_acceptsLimitAndRejectsLargerBodies() {
+        assertEquals("1234", "1234".toResponseBody().readUtf8Limited(4))
+        assertThrows(IllegalStateException::class.java) {
+            "12345".toResponseBody().readUtf8Limited(4)
+        }
+    }
+
     @Test
     fun mcpToolBinding_exposesProviderSafeNamespacedToolName() {
         val binding = McpToolBinding(

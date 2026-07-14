@@ -4,6 +4,7 @@ import com.vladsch.flexmark.html2md.converter.FlexmarkHtmlConverter
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -12,6 +13,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.Interceptor
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -21,6 +24,8 @@ import org.jsoup.nodes.Element
 private const val DefaultFetchMarkdownChars = 20_000
 private const val MinFetchMarkdownChars = 500
 private const val MaxFetchMarkdownChars = 100_000
+private const val MaxWebResponseBytes = 2 * 1024 * 1024
+private const val MaxJsonResponseBytes = 4 * 1024 * 1024
 private const val DefaultUserAgent =
     "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Mobile Safari/537.36"
 private const val DefaultTavilyBaseUrl = "https://api.tavily.com/"
@@ -92,6 +97,7 @@ class WebToolsClient(
         .callTimeout(45, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
+        .addNetworkInterceptor(MetadataProtectionInterceptor)
         .build(),
     private val tavilyBaseUrl: String = DefaultTavilyBaseUrl,
     private val stockBaseUrl: String = "",
@@ -121,7 +127,7 @@ class WebToolsClient(
             httpClient.newCall(request).execute().use { response ->
                 val contentType = response.header("Content-Type").orEmpty()
                 val finalUrl = response.request.url.toString()
-                val bodyString = response.body?.string().orEmpty()
+                val bodyString = response.readBodyStringLimited(MaxWebResponseBytes)
                 if (!response.isSuccessful) {
                     error("HTTP ${response.code} while fetching $normalizedUrl.")
                 }
@@ -193,7 +199,7 @@ class WebToolsClient(
                 .build()
 
             httpClient.newCall(httpRequest).execute().use { response ->
-                val bodyString = response.body?.string().orEmpty()
+                val bodyString = response.readBodyStringLimited(MaxJsonResponseBytes)
                 val json = bodyString.toJsonObjectOrNull()
                 if (!response.isSuccessful) {
                     val detail = json?.optString("detail").orEmpty()
@@ -973,7 +979,7 @@ class WebToolsClient(
             .build()
 
         httpClient.newCall(request).execute().use { response ->
-            val bodyString = response.body?.string().orEmpty()
+            val bodyString = response.readBodyStringLimited(MaxJsonResponseBytes)
             val json = bodyString.toJsonObjectOrNull()
             if (!response.isSuccessful) {
                 val detail = json?.optString("message").orEmpty()
@@ -1122,9 +1128,47 @@ class WebToolsClient(
         return candidate.substring(0, safeCutoff).trimEnd() + "\n\n...[truncated]"
     }
 
-    private fun String.toJsonObjectOrNull(): JSONObject? = runCatching {
+private fun String.toJsonObjectOrNull(): JSONObject? = runCatching {
         JSONObject(this)
-    }.getOrNull()
+}.getOrNull()
+
+private fun Response.readBodyStringLimited(maxBytes: Int): String {
+    val responseBody = body ?: return ""
+    val declaredLength = responseBody.contentLength()
+    check(declaredLength < 0L || declaredLength <= maxBytes) {
+        "HTTP response is larger than the safe ${maxBytes}-byte limit."
+    }
+    return responseBody.byteStream().use { input ->
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            check(output.size() + read <= maxBytes) {
+                "HTTP response exceeded the safe ${maxBytes}-byte limit."
+            }
+            output.write(buffer, 0, read)
+        }
+        output.toByteArray().toString(Charsets.UTF_8)
+    }
+}
+
+private object MetadataProtectionInterceptor : Interceptor {
+    private val blockedHosts = setOf(
+        "metadata.google.internal", "metadata.google.internal.", "instance-data.ec2.internal",
+        "169.254.169.254", "100.100.100.200",
+    )
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val host = chain.request().url.host.lowercase(Locale.US)
+        check(host !in blockedHosts) { "Cloud metadata endpoints are not allowed." }
+        val addresses = runCatching { InetAddress.getAllByName(host).toList() }.getOrDefault(emptyList())
+        check(addresses.none { it.isLinkLocalAddress || it.isMulticastAddress }) {
+            "Link-local and multicast endpoints are not allowed."
+        }
+        return chain.proceed(chain.request())
+    }
+}
 
     private companion object {
         val JsonMediaType = "application/json".toMediaType()

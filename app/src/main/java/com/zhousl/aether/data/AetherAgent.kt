@@ -34,11 +34,19 @@ private const val MaxTaskStateTextChars = 2_000
 private const val MaxTaskStateItemTextChars = 240
 private const val MaxTaskStateItemCount = 24
 private const val MaxForcedMarketSynthesisContinuations = 1
+private const val MaxToolOutputChars = 200_000
+private const val MaxBatchToolCalls = 8
+private const val MaxDecodedImagePixels = 16_000_000L
 
 private val MarketDataToolNames = setOf(
     "stock_market_data",
     "market_overview",
     "sector_heat",
+)
+
+private val ParallelSafeToolNames = setOf(
+    "read", "grep", "find", "ls", "analyze_image", "fetch_web_url", "tavily_search",
+    "stock_market_data", "market_overview", "sector_heat", "read_skill_resource",
 )
 
 /**
@@ -217,6 +225,7 @@ private fun isPlanModeToolNameAllowed(toolName: String): Boolean = when (toolNam
     "find",
     "ls",
     "analyze_image",
+    "parse_document",
     "fetch_web_url",
     "tavily_search",
     "stock_market_data",
@@ -251,6 +260,7 @@ internal fun buildAetherBaseToolDefinitions(
             add(buildFindToolDefinition())
             add(buildLsToolDefinition())
             add(buildAnalyzeImageToolDefinition())
+            add(buildParseDocumentToolDefinition())
         }
         if (!planModeEnabled && isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.Terminal)) {
             add(buildBashToolDefinition())
@@ -293,7 +303,8 @@ internal fun isAetherToolAvailableForGroups(
         "grep",
         "find",
         "ls",
-        "analyze_image" -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.FilesImages)
+        "analyze_image",
+        "parse_document" -> isChatToolGroupEnabled(normalizedGroups, ChatToolGroups.FilesImages)
 
         "bash",
         "fetch_bash_output",
@@ -448,6 +459,7 @@ class AetherAgent(
     private val onParallelToolCallsUnsupported: suspend (String) -> Unit = {},
 ) {
     private val filesystemTool = TermuxFilesystemTool(bashTool)
+    private val minerUDocumentClient = MinerUDocumentClient()
 
     suspend fun runTurn(
         settings: AppSettings,
@@ -961,15 +973,7 @@ class AetherAgent(
         )
     }
 
-    private fun isParallelSafeToolCall(toolName: String): Boolean = when (toolName) {
-        "run_tool_batch",
-        "activate_skill",
-        "agent_display",
-        "set_conversation_status",
-        "update_task_state" -> false
-
-        else -> true
-    }
+    private fun isParallelSafeToolCall(toolName: String): Boolean = toolName in ParallelSafeToolNames
 
     private fun isInternalToolCall(toolName: String): Boolean =
         toolName == "set_conversation_status" || toolName == "update_task_state"
@@ -1057,6 +1061,10 @@ class AetherAgent(
                 settings = settings,
                 argumentsJson = injectDefaultWorkingDirectory(toolCall.arguments, workspaceDirectory),
             )
+            "parse_document" -> executeParseDocument(
+                settings,
+                injectDefaultWorkingDirectory(toolCall.arguments, workspaceDirectory)
+            )
             "agent_display" -> agentModeController.execute(
                 settings = settings,
                 workspaceDirectory = workspaceDirectory,
@@ -1072,6 +1080,27 @@ class AetherAgent(
                 }.toString()
             }
         }
+    }
+
+    private suspend fun executeParseDocument(settings: AppSettings, argumentsJson: String): String {
+        val arguments = JSONObject(argumentsJson)
+        val path = arguments.optString("path").trim()
+        require(path.isNotBlank()) { "path is required." }
+        val workingDirectory = arguments.optString("working_directory").ifBlank {
+            arguments.optString("workingDirectory")
+        }
+        return minerUDocumentClient.parseWorkspaceFile(
+            workspaceFileBridge = workspaceFileBridge,
+            path = path,
+            workingDirectory = workingDirectory,
+            language = arguments.optString("language", "ch"),
+            pageRange = arguments.optString("page_range"),
+            enableTable = arguments.optBoolean("enable_table", true),
+            enableOcr = arguments.optBoolean("is_ocr", false),
+            enableFormula = arguments.optBoolean("enable_formula", true),
+            timeoutSeconds = arguments.optInt("timeout_seconds", 300),
+            apiToken = settings.mineruApiToken,
+        )
     }
 
     private fun executeSetConversationStatus(argumentsJson: String): String {
@@ -1199,6 +1228,14 @@ class AetherAgent(
         toolName: String,
         output: String,
     ): String {
+        if (output.length > MaxToolOutputChars) {
+            return JSONObject().apply {
+                put("ok", runCatching { JSONObject(output).optBoolean("ok", true) }.getOrDefault(true))
+                put("truncated", true)
+                put("original_chars", output.length)
+                put("output_prefix", output.take(MaxToolOutputChars))
+            }.toString()
+        }
         if (toolName != "agent_display") return output
         val parsed = runCatching { JSONObject(output) }.getOrNull() ?: return output
         if (!parsed.has("screenshot_base64")) return output
@@ -1343,6 +1380,7 @@ class AetherAgent(
 
     private fun parseRunToolBatchCalls(calls: JSONArray?): List<BatchToolCall> {
         if (calls == null) return emptyList()
+        require(calls.length() <= MaxBatchToolCalls) { "run_tool_batch accepts at most $MaxBatchToolCalls calls." }
         return buildList {
             for (index in 0 until calls.length()) {
                 val call = calls.optJSONObject(index) ?: continue
@@ -1418,15 +1456,7 @@ class AetherAgent(
         return parsed.optBoolean("ok", !parsed.optBoolean("err", false))
     }
 
-    private fun canRunInsideExplicitParallelBatch(toolName: String): Boolean = when (toolName) {
-        "run_tool_batch",
-        "activate_skill",
-        "set_conversation_status",
-        "update_task_state",
-        "agent_display" -> false
-
-        else -> true
-    }
+    private fun canRunInsideExplicitParallelBatch(toolName: String): Boolean = toolName in ParallelSafeToolNames
 
     private suspend fun streamChatCompletionWithReconnect(
         settings: AppSettings,
@@ -2090,8 +2120,20 @@ class AetherAgent(
      * quality / dimension floor is hit.
      */
     private fun compressImageBytes(bytes: ByteArray, targetBytes: Int): ByteArray? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sampleSize = 1
+        while ((bounds.outWidth.toLong() / sampleSize) * (bounds.outHeight.toLong() / sampleSize) > MaxDecodedImagePixels) {
+            sampleSize *= 2
+        }
         val original = runCatching {
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            BitmapFactory.decodeByteArray(
+                bytes,
+                0,
+                bytes.size,
+                BitmapFactory.Options().apply { inSampleSize = sampleSize },
+            )
         }.getOrNull() ?: return null
 
         var bitmap = original
@@ -2262,7 +2304,7 @@ class AetherAgent(
         val indicesArray = JSONArray().apply {
             indices.forEach { idx ->
                 val sign = if (idx.changePercent >= 0) "+" else ""
-                summaryLines.add("${idx.name}: ${String.format("%.2f", idx.price)}  $sign${String.format("%.2f", idx.changePercent)}%")
+                summaryLines.add("${idx.name}: ${String.format(Locale.US, "%.2f", idx.price)}  $sign${String.format(Locale.US, "%.2f", idx.changePercent)}%")
                 put(JSONObject().apply {
                     put("code", idx.code)
                     put("name", idx.name)
@@ -2295,14 +2337,14 @@ class AetherAgent(
                 summaryLines.add("【行业板块 Top5】")
                 industry.take(5).forEach { s ->
                     val sign = if (s.changePercent >= 0) "+" else ""
-                    summaryLines.add("${s.name} $sign${String.format("%.2f", s.changePercent)}%")
+                    summaryLines.add("${s.name} $sign${String.format(Locale.US, "%.2f", s.changePercent)}%")
                 }
             }
             if (concept.isNotEmpty()) {
                 summaryLines.add("【概念板块 Top5】")
                 concept.take(5).forEach { s ->
                     val sign = if (s.changePercent >= 0) "+" else ""
-                    summaryLines.add("${s.name} $sign${String.format("%.2f", s.changePercent)}%")
+                    summaryLines.add("${s.name} $sign${String.format(Locale.US, "%.2f", s.changePercent)}%")
                 }
             }
         }
@@ -2336,7 +2378,7 @@ class AetherAgent(
         sectors.take(10).forEachIndexed { idx, s ->
             val sign = if (s.changePercent >= 0) "+" else ""
             val leading = if (s.leadingStock.isNotBlank()) "  领涨:${s.leadingStock}" else ""
-            summaryLines.add("${idx + 1}. ${s.name} $sign${String.format("%.2f", s.changePercent)}%$leading")
+            summaryLines.add("${idx + 1}. ${s.name} $sign${String.format(Locale.US, "%.2f", s.changePercent)}%$leading")
         }
 
         return JSONObject().apply {

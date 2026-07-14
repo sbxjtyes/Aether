@@ -6,15 +6,17 @@ import android.webkit.MimeTypeMap
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
 import com.zhousl.aether.util.AetherLog
+import com.zhousl.aether.util.awaitMergedProcessOutput
 import java.io.ByteArrayOutputStream
 import java.net.URLDecoder
 import java.nio.file.Paths
 import java.util.Base64
 import java.util.Locale
-import java.util.concurrent.TimeUnit
-import kotlin.concurrent.thread
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -24,12 +26,16 @@ private const val MaxWorkspaceImportBytes = 128 * 1024 * 1024
 private const val MaxWorkspaceDownloadBytes = 32 * 1024 * 1024
 private const val WorkspaceTransferChunkBytes = 6 * 1024
 private const val WorkspaceUploadChunkChars = 192 * 1024
+// Must be divisible by three so every non-final Base64 chunk can be concatenated safely.
+private const val WorkspaceUploadSourceChunkBytes = WorkspaceUploadChunkChars / 4 * 3
 private const val WorkspaceBaseDirectoryName = ".aether/workspaces"
 private const val WorkspaceUploadTimeoutMillis = 60_000L
 private const val WorkspaceUploadProbeTimeoutMillis = 10_000L
 private const val WorkspaceUploadVerificationTimeoutMillis = 35_000L
 private const val WorkspaceUploadVerificationIntervalMillis = 500L
 private const val RootReadTimeoutMillis = 20_000L
+private const val MaxRootReadSourceBytes = 8 * 1024 * 1024
+private const val RootReadOutputLimitBytes = 12 * 1024 * 1024
 private const val WorkspaceFileBridgeLogTag = "AetherWorkspaceFile"
 
 class WorkspaceFileBridge(
@@ -66,24 +72,9 @@ class WorkspaceFileBridge(
             displayName = displayName,
         )
         val destinationPath = "${workspaceDirectory(sessionId)}/uploads/$safeFileName"
-        val bytes = readContentBytes(
+        val bytesCopied = writeContentUriToWorkspace(
             sourceUri = sourceUri,
-            byteLimit = MaxWorkspaceImportBytes + 1,
-        ).getOrElse { throwable ->
-            error(
-                throwable.message
-                    ?.takeIf { it.isNotBlank() }
-                    ?: "Couldn't read the selected file."
-            )
-        }
-
-        if (bytes.size > MaxWorkspaceImportBytes) {
-            error("File is larger than ${formatBytes(MaxWorkspaceImportBytes.toLong())}.")
-        }
-
-        val bytesCopied = writeWorkspaceBytes(
             absolutePath = destinationPath,
-            bytes = bytes,
         ).getOrThrow()
 
         ImportedWorkspaceFile(
@@ -153,8 +144,11 @@ class WorkspaceFileBridge(
         workingDirectory: String = TermuxContract.HomeDirectory,
         byteLimit: Int,
     ): Result<WorkspaceFilePayload> = withContext(Dispatchers.IO) {
-        runCatching {
+        try {
             require(byteLimit > 0) { "byteLimit must be greater than 0." }
+            require(byteLimit <= MaxRootReadSourceBytes) {
+                "Root image reads are limited to ${formatBytes(MaxRootReadSourceBytes.toLong())}."
+            }
             val absolutePath = resolveTermuxPath(
                 path = path,
                 workingDirectory = workingDirectory,
@@ -163,7 +157,11 @@ class WorkspaceFileBridge(
                 absolutePath = absolutePath,
                 byteLimit = byteLimit,
             )
-            val result = runRootCommand(command)
+            val result = runWorkspaceRootReadProcess(
+                command = listOf("su", "-c", command),
+                timeoutMillis = RootReadTimeoutMillis,
+                maxOutputBytes = RootReadOutputLimitBytes,
+            )
             if (result.exitCode != 0 || result.timedOut) {
                 error(
                     result.combinedOutput().ifBlank {
@@ -174,6 +172,9 @@ class WorkspaceFileBridge(
                         }
                     }
                 )
+            }
+            if (result.truncated) {
+                error("Root image read output exceeded the ${formatBytes(RootReadOutputLimitBytes.toLong())} safety limit.")
             }
             val values = parseStructuredStdout(result.stdout)
             val sizeBytes = values["size_bytes"]?.toLongOrNull()
@@ -187,11 +188,17 @@ class WorkspaceFileBridge(
             if (bytes.size.toLong() != sizeBytes) {
                 error("Root image read returned ${bytes.size} bytes, expected $sizeBytes.")
             }
-            WorkspaceFilePayload(
-                absolutePath = absolutePath,
-                bytes = bytes,
-                sizeBytes = sizeBytes,
+            Result.success(
+                WorkspaceFilePayload(
+                    absolutePath = absolutePath,
+                    bytes = bytes,
+                    sizeBytes = sizeBytes,
+                )
             )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (throwable: Throwable) {
+            Result.failure(throwable)
         }
     }
 
@@ -354,6 +361,105 @@ class WorkspaceFileBridge(
                 ),
             )
             bytesWritten
+        }
+    }
+
+    /**
+     * Streams a document-provider Uri through the existing Termux command bridge. Keeping the
+     * source chunk below 144 KiB avoids retaining both a potentially 128 MiB source array and its
+     * roughly 171 MiB Base64 representation in the app process.
+     */
+    private suspend fun writeContentUriToWorkspace(
+        sourceUri: Uri,
+        absolutePath: String,
+    ): Result<Long> = workspaceUploadMutex.withLock {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val input = context.contentResolver.openInputStream(sourceUri)
+                    ?: error("Couldn't open the selected file. The document provider did not return a readable stream.")
+                val pathBase64 = encodeBase64(absolutePath)
+                var bytesRead = 0L
+                var chunkIndex = 0
+
+                try {
+                    executeUploadCommand(
+                        command = buildInitWorkspaceStreamingUploadCommand(pathBase64),
+                        stage = "init",
+                        absolutePath = absolutePath,
+                        fallbackMessage = "Couldn't prepare $absolutePath in the workspace.",
+                        verifier = { status -> status.tmpPathExists && status.tmpPathSizeBytes == 0L },
+                    )
+
+                    input.use { stream ->
+                        val buffer = ByteArray(WorkspaceUploadSourceChunkBytes)
+                        while (true) {
+                            var count = 0
+                            while (count < buffer.size) {
+                                val read = stream.read(buffer, count, buffer.size - count)
+                                if (read < 0) break
+                                if (read == 0) error("The selected file stream stopped making progress.")
+                                count += read
+                            }
+                            if (count == 0) break
+                            bytesRead += count
+                            if (bytesRead > MaxWorkspaceImportBytes) {
+                                error("File is larger than ${formatBytes(MaxWorkspaceImportBytes.toLong())}.")
+                            }
+
+                            val encodedChunk = Base64.getEncoder().encodeToString(
+                                if (count == buffer.size) buffer else buffer.copyOf(count)
+                            )
+                            executeUploadCommand(
+                                command = buildAppendWorkspaceStreamingChunkCommand(pathBase64, encodedChunk),
+                                stage = "append[$chunkIndex]",
+                                absolutePath = absolutePath,
+                                fallbackMessage = "Couldn't append a file chunk for $absolutePath in the workspace.",
+                                verifier = { status ->
+                                    status.tmpPathExists && status.tmpPathSizeBytes >= bytesRead
+                                },
+                            )
+                            chunkIndex += 1
+                            if (count < buffer.size) break
+                        }
+
+                        // If the file filled the last chunk exactly, probe one extra byte before
+                        // accepting the limit so an oversized provider stream cannot be truncated.
+                        if (bytesRead == MaxWorkspaceImportBytes.toLong() && stream.read() >= 0) {
+                            error("File is larger than ${formatBytes(MaxWorkspaceImportBytes.toLong())}.")
+                        }
+                    }
+
+                    val rawResult = executeUploadCommand(
+                        command = buildFinalizeWorkspaceStreamingUploadCommand(pathBase64),
+                        stage = "finalize",
+                        absolutePath = absolutePath,
+                        fallbackMessage = "Couldn't finalize $absolutePath in the workspace.",
+                        verifier = { status ->
+                            status.destinationExists && status.destinationIsFile &&
+                                status.destinationSizeBytes == bytesRead
+                        },
+                    )
+                    val bytesWritten = parseStructuredStdout(rawResult.optString("stdout"))
+                        .get("bytes_written")
+                        ?.toLongOrNull()
+                        ?: bytesRead
+                    check(bytesWritten == bytesRead) {
+                        "Workspace upload size check failed for $absolutePath: expected=$bytesRead actual=$bytesWritten"
+                    }
+                    bytesWritten
+                } catch (throwable: Throwable) {
+                    runCatching { input.close() }
+                    withContext(NonCancellable) {
+                        runCatching {
+                            bashTool.executeCommand(
+                                command = buildAbortWorkspaceUploadCommand(pathBase64),
+                                awaitTimeoutMillis = WorkspaceUploadProbeTimeoutMillis,
+                            )
+                        }
+                    }
+                    throw throwable
+                }
+            }
         }
     }
 
@@ -649,44 +755,6 @@ class WorkspaceFileBridge(
         appendLine("emit_kv content_b64 \"\$content_b64\"")
     }
 
-    private fun runRootCommand(
-        command: String,
-    ): RootReadCommandResult {
-        val process = runCatching {
-            ProcessBuilder("su", "-c", command).start()
-        }.getOrElse { throwable ->
-            return RootReadCommandResult(
-                exitCode = -1,
-                launchError = throwable.message.orEmpty(),
-            )
-        }
-        var stdout = ""
-        var stderr = ""
-        val stdoutThread = thread(start = true, name = "aether-root-read-stdout") {
-            stdout = runCatching { process.inputStream.bufferedReader().readText() }
-                .getOrDefault("")
-        }
-        val stderrThread = thread(start = true, name = "aether-root-read-stderr") {
-            stderr = runCatching { process.errorStream.bufferedReader().readText() }
-                .getOrDefault("")
-        }
-        val finished = process.waitFor(RootReadTimeoutMillis, TimeUnit.MILLISECONDS)
-        if (!finished) {
-            runCatching { process.destroy() }
-            if (!process.waitFor(800, TimeUnit.MILLISECONDS)) {
-                runCatching { process.destroyForcibly() }
-            }
-        }
-        stdoutThread.join(1_000)
-        stderrThread.join(1_000)
-        return RootReadCommandResult(
-            exitCode = if (finished) process.exitValue() else -1,
-            stdout = stdout,
-            stderr = stderr,
-            timedOut = !finished,
-        )
-    }
-
     private suspend fun readWorkspaceFileChunk(
         absolutePath: String,
         offsetBytes: Long,
@@ -802,6 +870,31 @@ class WorkspaceFileBridge(
         appendLine("emit_kv stage appended")
     }
 
+    private fun buildInitWorkspaceStreamingUploadCommand(
+        pathBase64: String,
+    ): String = buildString {
+        appendCommonShellPreamble(this)
+        appendLine("path=\"\$(decode_b64 '$pathBase64')\"")
+        appendLine("parent_dir=\$(dirname -- \"\$path\")")
+        appendLine("mkdir -p \"\$parent_dir\"")
+        appendLine("tmp_b64=\"\${path}.aether-upload.b64\"")
+        appendLine("tmp_path=\"\${path}.aether-tmp\"")
+        appendLine("rm -f -- \"\$tmp_b64\" \"\$tmp_path\"")
+        appendLine(": > \"\$tmp_path\"")
+        appendLine("emit_kv stage initialized")
+    }
+
+    private fun buildAppendWorkspaceStreamingChunkCommand(
+        pathBase64: String,
+        chunk: String,
+    ): String = buildString {
+        appendCommonShellPreamble(this)
+        appendLine("path=\"\$(decode_b64 '$pathBase64')\"")
+        appendLine("tmp_path=\"\${path}.aether-tmp\"")
+        appendLine("printf '%s' '$chunk' | base64 -d >> \"\$tmp_path\"")
+        appendLine("emit_kv stage appended")
+    }
+
     private fun buildWorkspaceUploadStatusCommand(
         pathBase64: String,
     ): String = buildString {
@@ -860,6 +953,30 @@ class WorkspaceFileBridge(
         appendLine("emit_kv bytes_written \"\$bytes_written\"")
     }
 
+    private fun buildFinalizeWorkspaceStreamingUploadCommand(
+        pathBase64: String,
+    ): String = buildString {
+        appendCommonShellPreamble(this)
+        appendLine("path=\"\$(decode_b64 '$pathBase64')\"")
+        appendLine("tmp_b64=\"\${path}.aether-upload.b64\"")
+        appendLine("tmp_path=\"\${path}.aether-tmp\"")
+        appendLine("trap 'rm -f \"\$tmp_path\" \"\$tmp_b64\"' EXIT")
+        appendLine("mv \"\$tmp_path\" \"\$path\"")
+        appendLine("bytes_written=\$(wc -c < \"\$path\" | tr -d '[:space:]')")
+        appendLine("rm -f -- \"\$tmp_b64\"")
+        appendLine("trap - EXIT")
+        appendLine("emit_kv bytes_written \"\$bytes_written\"")
+    }
+
+    private fun buildAbortWorkspaceUploadCommand(
+        pathBase64: String,
+    ): String = buildString {
+        appendCommonShellPreamble(this)
+        appendLine("path=\"\$(decode_b64 '$pathBase64')\"")
+        appendLine("rm -f -- \"\${path}.aether-upload.b64\" \"\${path}.aether-tmp\"")
+        appendLine("emit_kv stage aborted")
+    }
+
     private fun buildDeleteWorkspaceCommand(
         pathBase64: String,
     ): String = buildString {
@@ -871,33 +988,6 @@ class WorkspaceFileBridge(
         appendLine("esac")
         appendLine("rm -rf -- \"\$path\"")
         appendLine("emit_kv deleted \"\$path\"")
-    }
-
-    private fun readContentBytes(
-        sourceUri: Uri,
-        byteLimit: Int,
-    ): Result<ByteArray> = runCatching {
-        context.contentResolver.openInputStream(sourceUri)?.use { inputStream ->
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-            var totalRead = 0
-
-            while (true) {
-                val read = inputStream.read(buffer)
-                if (read <= 0) break
-
-                val remaining = byteLimit - totalRead
-                if (remaining <= 0) break
-
-                val writeCount = minOf(read, remaining)
-                output.write(buffer, 0, writeCount)
-                totalRead += writeCount
-
-                if (totalRead >= byteLimit) break
-            }
-
-            output.toByteArray()
-        } ?: error("Couldn't open the selected file. The document provider did not return a readable stream.")
     }
 
     private fun encodeBase64(value: String): String =
@@ -930,11 +1020,42 @@ class WorkspaceFileBridge(
     }
 }
 
-private data class RootReadCommandResult(
+internal suspend fun runWorkspaceRootReadProcess(
+    command: List<String>,
+    timeoutMillis: Long,
+    maxOutputBytes: Int,
+    processStarter: (List<String>) -> Process = { processCommand ->
+        ProcessBuilder(processCommand)
+            .redirectErrorStream(true)
+            .start()
+    },
+): RootReadCommandResult = runInterruptible(Dispatchers.IO) {
+    require(command.isNotEmpty()) { "Root read command must not be empty." }
+    val process = runCatching { processStarter(command) }.getOrElse { throwable ->
+        return@runInterruptible RootReadCommandResult(
+            exitCode = -1,
+            launchError = throwable.message.orEmpty(),
+        )
+    }
+    val output = awaitMergedProcessOutput(
+        process = process,
+        timeoutMillis = timeoutMillis,
+        maxOutputBytes = maxOutputBytes,
+    )
+    RootReadCommandResult(
+        exitCode = output.exitCode,
+        stdout = output.output,
+        timedOut = output.timedOut,
+        truncated = output.truncated,
+    )
+}
+
+internal data class RootReadCommandResult(
     val exitCode: Int,
     val stdout: String = "",
     val stderr: String = "",
     val timedOut: Boolean = false,
+    val truncated: Boolean = false,
     val launchError: String = "",
 ) {
     fun combinedOutput(): String = listOf(stdout, stderr, launchError)

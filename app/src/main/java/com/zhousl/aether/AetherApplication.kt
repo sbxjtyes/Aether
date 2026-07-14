@@ -16,16 +16,24 @@ import com.zhousl.aether.data.RootSetupController
 import com.zhousl.aether.data.ChatStateStore
 import com.zhousl.aether.data.SessionExecutionManager
 import com.zhousl.aether.data.SettingsRepository
+import com.zhousl.aether.data.AppSettings
+import com.zhousl.aether.data.hasConfiguredVoiceServer
 import com.zhousl.aether.data.WatchlistRepository
 import com.zhousl.aether.data.WebToolsClient
 import com.zhousl.aether.data.WorkspaceFileBridge
 import com.zhousl.aether.termux.TermuxBashTool
+import com.zhousl.aether.voice.VoicePlaybackConfig
+import com.zhousl.aether.voice.VoicePlaybackConfigProvider
+import com.zhousl.aether.voice.VoicePlaybackController
+import com.zhousl.aether.voice.VoiceServerConnection
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 class AetherApplication : Application() {
@@ -75,6 +83,29 @@ class AetherAppRuntime(
     )
     val appForegroundTracker = AppForegroundTracker()
     val notificationController = AetherNotificationController(application)
+    private val currentSettings = settingsRepository.settings.stateIn(
+        scope = appScope,
+        started = SharingStarted.Eagerly,
+        initialValue = AppSettings(),
+    )
+    val voicePlaybackController = VoicePlaybackController(
+        context = application,
+        configProvider = VoicePlaybackConfigProvider {
+            currentSettings.value.takeIf { settings ->
+                settings.voiceAuthorizationConfirmed &&
+                    settings.hasConfiguredVoiceServer()
+            }?.let { settings ->
+                VoicePlaybackConfig(
+                    connection = VoiceServerConnection(
+                        baseUrl = settings.voiceServerBaseUrl,
+                        bearerToken = settings.voiceServerToken,
+                    ),
+                    voiceId = settings.voiceId,
+                    language = "zh",
+                )
+            }
+        },
+    )
     val chatStateStore = ChatStateStore(
         scope = appScope,
         chatRepository = chatRepository,
@@ -98,6 +129,9 @@ class AetherAppRuntime(
     fun initialize() {
         notificationController.ensureChannels()
         ProcessLifecycleOwner.get().lifecycle.addObserver(appForegroundTracker)
+        appScope.launch {
+            settingsRepository.migrateLegacyOfflineVoiceStorage()
+        }
         // 监听预警事件并发送通知
         appScope.launch {
             marketMonitorRepository.alertEvents.collect { event ->

@@ -36,7 +36,7 @@ android {
         }
     }
     namespace = "com.zhousl.aether"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.baimoqilin.aether"
@@ -44,6 +44,10 @@ android {
         targetSdk = 35
         versionCode = 8
         versionName = "1.5.0"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -96,6 +100,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.datastore.preferences)
+    implementation(libs.androidx.documentfile)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)

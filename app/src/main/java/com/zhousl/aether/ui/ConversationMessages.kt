@@ -73,7 +73,10 @@ import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.StopCircle
 import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material.icons.automirrored.rounded.VolumeUp
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -104,6 +107,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -134,6 +139,7 @@ import com.zhousl.aether.data.AppLanguage
 import com.zhousl.aether.data.TokenUsage
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
+import com.zhousl.aether.voice.VoicePlaybackState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -186,6 +192,10 @@ fun ConversationMessageBubble(
     onRedo: () -> Unit,
     onRetry: () -> Unit,
     onSwitchBranch: (Int) -> Unit,
+    voicePlaybackEnabled: Boolean = false,
+    voicePlaybackState: VoicePlaybackState = VoicePlaybackState.Idle,
+    onReadAloud: (String, String) -> Unit = { _, _ -> },
+    onStopReading: () -> Unit = {},
 ) {
     if (message.author == MessageAuthor.User) {
         UserMessageBlock(
@@ -208,6 +218,10 @@ fun ConversationMessageBubble(
             onCopy = onCopy,
             onRedo = onRedo,
             onDelete = onDelete,
+            voicePlaybackEnabled = voicePlaybackEnabled,
+            voicePlaybackState = voicePlaybackState,
+            onReadAloud = onReadAloud,
+            onStopReading = onStopReading,
         )
     }
 }
@@ -767,6 +781,10 @@ private fun AssistantMessageBlock(
     onCopy: () -> Unit,
     onRedo: () -> Unit,
     onDelete: () -> Unit,
+    voicePlaybackEnabled: Boolean,
+    voicePlaybackState: VoicePlaybackState,
+    onReadAloud: (String, String) -> Unit,
+    onStopReading: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
     Column(
@@ -819,6 +837,14 @@ private fun AssistantMessageBlock(
         }
         if (showActions) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AssistantVoiceAction(
+                messageId = message.id,
+                markdown = message.text,
+                playbackEnabled = voicePlaybackEnabled && actionsEnabled,
+                playbackState = voicePlaybackState,
+                onReadAloud = onReadAloud,
+                onStopReading = onStopReading,
+            )
             AssistantMessageAction(
                 icon = LucideIcons.Copy,
                 contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制回复" else "Copy reply",
@@ -838,6 +864,10 @@ private fun AssistantMessageBlock(
             )
             }
         }
+        VoicePlaybackStatusLabel(
+            messageId = message.id,
+            playbackState = voicePlaybackState,
+        )
         message.tokenUsage?.let { MessageTokenUsageLabel(it) }
     }
 }
@@ -853,12 +883,20 @@ fun ConversationAssistantGroupBubble(
     onCopy: () -> Unit,
     onRedo: () -> Unit,
     onDelete: () -> Unit,
+    voicePlaybackEnabled: Boolean = false,
+    voicePlaybackState: VoicePlaybackState = VoicePlaybackState.Idle,
+    onReadAloud: (String, String) -> Unit = { _, _ -> },
+    onStopReading: () -> Unit = {},
 ) {
     if (messages.isEmpty()) return
     val strings = rememberAetherStrings()
     val thoughtDurationMillis = messages.lastOrNull()?.thoughtDurationMillis
     val hasReasoningTrace = messages.any { it.reasoningTrace != null }
     val showActions = messages.none { it.assistantActionsHidden }
+    val playbackMessageId = messages.last().id
+    val playbackMarkdown = remember(messages) {
+        messages.joinToString("\n\n") { it.text }.trim()
+    }
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
@@ -909,6 +947,14 @@ fun ConversationAssistantGroupBubble(
         }
         if (showActions) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AssistantVoiceAction(
+                messageId = playbackMessageId,
+                markdown = playbackMarkdown,
+                playbackEnabled = voicePlaybackEnabled && actionsEnabled,
+                playbackState = voicePlaybackState,
+                onReadAloud = onReadAloud,
+                onStopReading = onStopReading,
+            )
             AssistantMessageAction(
                 icon = LucideIcons.Copy,
                 contentDescription = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "复制回复" else "Copy reply",
@@ -928,6 +974,10 @@ fun ConversationAssistantGroupBubble(
             )
             }
         }
+        VoicePlaybackStatusLabel(
+            messageId = playbackMessageId,
+            playbackState = voicePlaybackState,
+        )
         messages.firstNotNullOfOrNull { it.tokenUsage }?.let { MessageTokenUsageLabel(it) }
     }
 }
@@ -2616,24 +2666,131 @@ private fun IconOnlyAction(
 }
 
 @Composable
+private fun AssistantVoiceAction(
+    messageId: String,
+    markdown: String,
+    playbackEnabled: Boolean,
+    playbackState: VoicePlaybackState,
+    onReadAloud: (String, String) -> Unit,
+    onStopReading: () -> Unit,
+) {
+    val strings = rememberAetherStrings()
+    val isCurrentMessage = playbackState.messageId == messageId
+    val isPreparing = isCurrentMessage && (
+        playbackState is VoicePlaybackState.Loading ||
+            playbackState is VoicePlaybackState.Synthesizing
+        )
+    val isPlaying = isCurrentMessage && playbackState is VoicePlaybackState.Playing
+    val hasError = isCurrentMessage && playbackState is VoicePlaybackState.Error
+    val canStop = isPreparing || isPlaying
+    val enabled = (playbackEnabled && markdown.isNotBlank()) || canStop
+    val contentDescription = when {
+        isPreparing -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+            "正在生成朗读，点按停止"
+        } else {
+            "Preparing speech, tap to stop"
+        }
+
+        isPlaying -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) "停止朗读" else "Stop reading"
+        hasError -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+            "朗读失败，点按重试"
+        } else {
+            "Reading failed, tap to retry"
+        }
+
+        else -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) "朗读回复" else "Read reply aloud"
+    }
+
+    AssistantMessageAction(
+        icon = when {
+            isPlaying -> Icons.Rounded.StopCircle
+            hasError -> Icons.Rounded.Refresh
+            else -> Icons.AutoMirrored.Rounded.VolumeUp
+        },
+        contentDescription = contentDescription,
+        enabled = enabled,
+        loading = isPreparing,
+        tint = when {
+            isPlaying -> AetherPrimary
+            hasError -> AetherError
+            else -> AetherOnSurfaceVariant
+        },
+        onClick = {
+            if (canStop) {
+                onStopReading()
+            } else {
+                onReadAloud(messageId, markdown)
+            }
+        },
+    )
+}
+
+@Composable
+private fun VoicePlaybackStatusLabel(
+    messageId: String,
+    playbackState: VoicePlaybackState,
+) {
+    if (playbackState.messageId != messageId) return
+    val strings = rememberAetherStrings()
+    val label = when (playbackState) {
+        VoicePlaybackState.Idle -> return
+        is VoicePlaybackState.Loading -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+            "正在加载离线声音…"
+        } else {
+            "Loading offline voice…"
+        }
+
+        is VoicePlaybackState.Synthesizing -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+            "正在生成朗读 ${playbackState.chunkIndex + 1}/${playbackState.chunkCount}…"
+        } else {
+            "Preparing speech ${playbackState.chunkIndex + 1}/${playbackState.chunkCount}…"
+        }
+
+        is VoicePlaybackState.Playing -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+            "正在朗读 ${playbackState.chunkIndex + 1}/${playbackState.chunkCount}"
+        } else {
+            "Reading ${playbackState.chunkIndex + 1}/${playbackState.chunkCount}"
+        }
+
+        is VoicePlaybackState.Error -> playbackState.error.message
+    }
+    Text(
+        text = label,
+        style = MaterialTheme.typography.bodySmall,
+        color = if (playbackState is VoicePlaybackState.Error) AetherError else AetherOnSurfaceVariant,
+    )
+}
+
+@Composable
 private fun AssistantMessageAction(
     icon: ImageVector,
     contentDescription: String,
     enabled: Boolean = true,
+    loading: Boolean = false,
+    tint: Color = AetherOnSurfaceVariant,
     onClick: () -> Unit,
 ) {
     Box(
         modifier = Modifier
             .size(24.dp)
+            .semantics { this.contentDescription = contentDescription }
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = contentDescription,
-            tint = if (enabled) AetherOnSurfaceVariant else AetherOnSurfaceVariant.copy(alpha = 0.36f),
-            modifier = Modifier.size(14.dp),
-        )
+        if (loading) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(13.dp),
+                color = tint,
+                strokeWidth = 1.5.dp,
+            )
+        } else {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (enabled) tint else tint.copy(alpha = 0.36f),
+                modifier = Modifier.size(14.dp),
+            )
+        }
     }
 }
 

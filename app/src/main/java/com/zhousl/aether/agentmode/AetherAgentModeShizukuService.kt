@@ -57,6 +57,9 @@ private const val DisplayFocusSettleMillis = 80L
 private const val InputRetryDelayMillis = 120L
 private const val InputInjectionMaxAttempts = 3
 private const val TextPasteMaxAttempts = 3
+private const val ForceStopTimeoutMillis = 2_000L
+private const val ActivityStartTimeoutMillis = 8_000L
+private const val InputCommandTimeoutMillis = 10_000L
 
 class AetherAgentModeShizukuService @Keep constructor(
     private val context: Context,
@@ -231,11 +234,13 @@ class AetherAgentModeShizukuService @Keep constructor(
 
         // 先停止已有实例，避免 am start 复用主屏幕上的现有 task
         runCatching {
-            val stopProcess = ProcessBuilder("/system/bin/am", "force-stop", packageName)
-                .redirectErrorStream(true)
-                .start()
-            stopProcess.inputStream.bufferedReader().use { it.readText() }
-            stopProcess.waitFor()
+            val result = runAgentModeProcess(
+                command = listOf("/system/bin/am", "force-stop", packageName),
+                timeoutMillis = ForceStopTimeoutMillis,
+            )
+            if (result.timedOut || result.exitCode != 0) {
+                error(result.failureMessage("am force-stop $packageName", ForceStopTimeoutMillis))
+            }
         }.onFailure { Log.w(TAG, "force-stop $packageName before launch: ${it.message}") }
         // force-stop 后等待进程完全退出
         SystemClock.sleep(300L)
@@ -251,14 +256,15 @@ class AetherAgentModeShizukuService @Keep constructor(
             "-n",
             component.flattenToShortString(),
         )
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .start()
-        val output = process.inputStream.bufferedReader().use { it.readText() }
-        val exitCode = process.waitFor()
-        Log.i(TAG, "am start --display $displayId -n ${component.flattenToShortString()}: exit=$exitCode output=${output.trim()}")
-        if (exitCode != 0) {
-            error(output.ifBlank { "am start failed with exit code $exitCode." })
+        val result = runAgentModeProcess(
+            command = command,
+            timeoutMillis = ActivityStartTimeoutMillis,
+        )
+        val output = result.output
+        Log.i(TAG, "am start --display $displayId -n ${component.flattenToShortString()}: " +
+            "exit=${result.exitCode} timedOut=${result.timedOut} truncated=${result.truncated} output=${output.trim()}")
+        if (result.timedOut || result.exitCode != 0) {
+            error(result.failureMessage("am start", ActivityStartTimeoutMillis))
         }
         // 检测 am 输出中的警告（如 "Activity not started, its current task has been brought to the front"）
         if (output.contains("not started", ignoreCase = true) || output.contains("brought to the front", ignoreCase = true)) {
@@ -267,13 +273,12 @@ class AetherAgentModeShizukuService @Keep constructor(
     }
 
     override fun runInputCommand(command: String) {
-        val process = ProcessBuilder("sh", "-c", command)
-            .redirectErrorStream(true)
-            .start()
-        val output = process.inputStream.bufferedReader().use { it.readText() }
-        val exitCode = process.waitFor()
-        if (exitCode != 0) {
-            error(output.ifBlank { "Input command failed with exit code $exitCode." })
+        val result = runAgentModeProcess(
+            command = listOf("sh", "-c", command),
+            timeoutMillis = InputCommandTimeoutMillis,
+        )
+        if (result.timedOut || result.exitCode != 0) {
+            error(result.failureMessage("Input command", InputCommandTimeoutMillis))
         }
     }
 

@@ -1,6 +1,8 @@
 package com.zhousl.aether.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -58,6 +60,7 @@ import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.WbSunny
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -75,6 +78,8 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -95,15 +100,18 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.zhousl.aether.BuildConfig
 import com.zhousl.aether.R
+import com.zhousl.aether.aetherRuntime
 import com.zhousl.aether.data.AetherPrivacyPolicyUrl
 import com.zhousl.aether.data.AetherWebsiteUrl
 import com.zhousl.aether.data.AgentModeAuthorizationIssue
@@ -126,6 +134,13 @@ import com.zhousl.aether.data.findModelOption
 import com.zhousl.aether.data.normalizeAgentLoopPolicy
 import com.zhousl.aether.data.normalizeAutonomousContinuationTurns
 import com.zhousl.aether.data.normalizeLlmInactivityReconnectTimeoutSeconds
+import com.zhousl.aether.data.normalizeVoiceSpeedPercent
+import com.zhousl.aether.voice.RemoteVoice
+import com.zhousl.aether.voice.RemoteVoiceEngine
+import com.zhousl.aether.voice.VoicePlaybackConfig
+import com.zhousl.aether.voice.VoiceServerConnection
+import com.zhousl.aether.voice.VoicePlaybackState
+import kotlinx.coroutines.launch
 import com.zhousl.aether.data.quickActionLabel
 import com.zhousl.aether.data.requiresApiKey
 import com.zhousl.aether.data.resolveAutomaticModelKey
@@ -166,6 +181,7 @@ private enum class SettingsPage {
     EditMcpServer,
     Termux,
     AgentMode,
+    Voice,
     RootSetupProgress,
     Developer,
     About,
@@ -184,6 +200,7 @@ private fun SettingsPage.depth(): Int = when (this) {
     SettingsPage.McpServers,
     SettingsPage.Termux,
     SettingsPage.AgentMode,
+    SettingsPage.Voice,
     SettingsPage.Developer,
     SettingsPage.About -> 1
     SettingsPage.DefaultModels,
@@ -467,6 +484,7 @@ fun SettingsScreen(
     modelId: String,
     systemPrompt: String,
     tavilyApiKey: String,
+    mineruApiToken: String,
     llmInactivityReconnectTimeoutSeconds: Int,
     keepTasksRunningInBackground: Boolean,
     notifyOnTaskCompletion: Boolean,
@@ -490,6 +508,7 @@ fun SettingsScreen(
     appUpdate: AppUpdateUiState,
     onSave: (
         LlmProvider,
+        String,
         String,
         String,
         String,
@@ -555,8 +574,19 @@ fun SettingsScreen(
     var systemPromptValue by rememberSaveable(stateSaver = TextFieldValue.Saver) {
         mutableStateOf(TextFieldValue(systemPrompt))
     }
-    var tavilyApiKeyValue by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+    var tavilyApiKeyValue by remember {
         mutableStateOf(TextFieldValue(tavilyApiKey))
+    }
+    LaunchedEffect(tavilyApiKey) {
+        if (tavilyApiKeyValue.text != tavilyApiKey) tavilyApiKeyValue = TextFieldValue(tavilyApiKey)
+    }
+    var mineruApiTokenValue by remember {
+        mutableStateOf(TextFieldValue(mineruApiToken))
+    }
+    LaunchedEffect(mineruApiToken) {
+        if (mineruApiTokenValue.text != mineruApiToken) {
+            mineruApiTokenValue = TextFieldValue(mineruApiToken)
+        }
     }
     var llmInactivityReconnectTimeoutValue by rememberSaveable(stateSaver = TextFieldValue.Saver) {
         mutableStateOf(TextFieldValue(llmInactivityReconnectTimeoutSeconds.toString()))
@@ -616,6 +646,7 @@ fun SettingsScreen(
             compatibilityOption?.modelId ?: modelId,
             systemPromptValue.text,
             tavilyApiKeyValue.text,
+            mineruApiTokenValue.text,
             normalizeLlmInactivityReconnectTimeoutSeconds(
                 llmInactivityReconnectTimeoutValue.text.trim().toIntOrNull()
             ),
@@ -649,6 +680,7 @@ fun SettingsScreen(
             compatibilityOption?.modelId ?: modelId,
             systemPromptValue.text,
             tavilyApiKeyValue.text,
+            mineruApiTokenValue.text,
             normalizeLlmInactivityReconnectTimeoutSeconds(
                 llmInactivityReconnectTimeoutValue.text.trim().toIntOrNull()
             ),
@@ -682,6 +714,7 @@ fun SettingsScreen(
             compatibilityOption?.modelId ?: modelId,
             systemPromptValue.text,
             tavilyApiKeyValue.text,
+            mineruApiTokenValue.text,
             normalizeLlmInactivityReconnectTimeoutSeconds(
                 llmInactivityReconnectTimeoutValue.text.trim().toIntOrNull()
             ),
@@ -925,6 +958,11 @@ fun SettingsScreen(
                 onBack = { currentPage = SettingsPage.Hub.name },
             )
 
+            SettingsPage.Voice -> RemoteVoiceSettingsPage(
+                strings = strings,
+                onBack = { currentPage = SettingsPage.Hub.name },
+            )
+
             SettingsPage.Providers -> ProvidersListPage(
                 providerConfigs = providerConfigs,
                 onSetProviderEnabled = onSetProviderEnabled,
@@ -1037,6 +1075,8 @@ fun SettingsScreen(
                 title = strings.webTools,
                 tavilyApiKeyValue = tavilyApiKeyValue,
                 onTavilyApiKeyChanged = { tavilyApiKeyValue = it },
+                mineruApiTokenValue = mineruApiTokenValue,
+                onMineruApiTokenChanged = { mineruApiTokenValue = it },
                 onBack = { currentPage = SettingsPage.Hub.name },
             )
 
@@ -1360,6 +1400,12 @@ private fun SettingsHub(
                             tone = if (experienceState.tone == SettingsStatusTone.Accent) SettingsStatusTone.Accent else SettingsStatusTone.Neutral,
                             onClick = { onNavigate(SettingsPage.Personalization) },
                         )
+                        SettingsQuickActionRow(
+                            icon = Icons.AutoMirrored.Rounded.VolumeUp,
+                            title = tr(strings, "Offline voice", "离线朗读"),
+                            subtitle = tr(strings, "Import and configure an authorized GPT-SoVITS voice", "导入并配置已获授权的 GPT-SoVITS 声音"),
+                            onClick = { onNavigate(SettingsPage.Voice) },
+                        )
                     }
                 }
 
@@ -1407,6 +1453,247 @@ private fun SettingsHub(
 // -----------------------------------------------------------------------------
 // Providers List Page (Multi-Provider)
 // -----------------------------------------------------------------------------
+
+@Composable
+private fun RemoteVoiceSettingsPage(strings: AetherStrings, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val repository = context.aetherRuntime.settingsRepository
+    val controller = context.aetherRuntime.voicePlaybackController
+    val playback by controller.state.collectAsState()
+    val settings by repository.settings.collectAsState(initial = com.zhousl.aether.data.AppSettings())
+    val engine = remember { RemoteVoiceEngine() }
+    val scope = rememberCoroutineScope()
+    var url by remember(settings.voiceServerBaseUrl) { mutableStateOf(TextFieldValue(settings.voiceServerBaseUrl)) }
+    var token by remember(settings.voiceServerToken) { mutableStateOf(TextFieldValue(settings.voiceServerToken)) }
+    var voiceId by remember(settings.voiceId) { mutableStateOf(settings.voiceId) }
+    var voices by remember { mutableStateOf<List<RemoteVoice>>(emptyList()) }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("") }
+    var failed by remember { mutableStateOf(false) }
+
+    DisposableEffect(engine) {
+        onDispose { engine.cancel() }
+    }
+
+    fun save(
+        enabled: Boolean = settings.voiceEnabled,
+        autoRead: Boolean = settings.voiceAutoRead,
+        authorized: Boolean = settings.voiceAuthorizationConfirmed,
+        speed: Int = settings.voiceSpeedPercent,
+    ) {
+        scope.launch {
+            repository.updateVoiceSettings(url.text, token.text, voiceId, enabled, autoRead, authorized, speed)
+        }
+    }
+
+    fun testConnection() {
+        scope.launch {
+            busy = true
+            failed = false
+            status = tr(strings, "Connecting to voice server...", "正在连接语音服务器…")
+            val connection = VoiceServerConnection(url.text, token.text)
+            runCatching { engine.checkHealth(connection) to engine.listVoices(connection) }
+                .onSuccess { (health, available) ->
+                    voices = available
+                    if (available.none { it.id == voiceId }) voiceId = available.firstOrNull()?.id.orEmpty()
+                    save()
+                    status = tr(
+                        strings,
+                        "Connected · ${health.voiceCount} voices · queue ${health.queueWaiting}/${health.queueCapacity}",
+                        "连接成功 · ${health.voiceCount} 个声音 · 队列 ${health.queueWaiting}/${health.queueCapacity}",
+                    )
+                }
+                .onFailure {
+                    failed = true
+                    status = it.message ?: tr(strings, "Connection failed", "连接失败")
+                }
+            busy = false
+        }
+    }
+
+    val configured = url.text.isNotBlank() && token.text.isNotBlank() && voiceId.isNotBlank()
+    val testing = playback.messageId == VoiceSettingsTestMessageId && playback !is VoicePlaybackState.Error
+    val testStatus = when (val state = playback) {
+        is VoicePlaybackState.Loading -> tr(strings, "Connecting to voice server...", "正在连接语音服务器…")
+        is VoicePlaybackState.Synthesizing -> tr(strings, "Server is synthesizing audio...", "服务器正在合成音频…")
+        is VoicePlaybackState.Playing -> tr(strings, "Playing test audio", "正在播放测试音频")
+        is VoicePlaybackState.Error -> state.error.message
+        VoicePlaybackState.Idle -> tr(strings, "Send a short sample to the selected server", "向所选服务器发送一段简短试听")
+    }
+
+    SubPageScaffold(
+        title = tr(strings, "Voice reading", "语音朗读"),
+        onBack = {
+            scope.launch {
+                repository.updateVoiceSettings(
+                    url.text,
+                    token.text,
+                    voiceId,
+                    settings.voiceEnabled,
+                    settings.voiceAutoRead,
+                    settings.voiceAuthorizationConfirmed,
+                    settings.voiceSpeedPercent,
+                )
+                onBack()
+            }
+        },
+    ) {
+        VoiceSectionTitle(tr(strings, "Voice server", "语音服务器"))
+        SettingsCardGroup {
+            ChatGptTextField(
+                label = tr(strings, "Server address", "服务器地址"),
+                value = url,
+                onValueChange = { url = it; status = "" },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+            )
+            ChatGptTextField(
+                label = "Bearer Token",
+                value = token,
+                onValueChange = { token = it; status = "" },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                visualTransformation = PasswordVisualTransformation(),
+            )
+            SettingsNavRow(
+                icon = Icons.Rounded.Cloud,
+                title = if (busy) tr(strings, "Testing connection", "正在测试连接") else tr(strings, "Test connection", "测试连接"),
+                subtitle = tr(strings, "Check authentication, engine status, and voices", "检查鉴权、推理引擎状态与可用声音"),
+                showChevron = false,
+                onClick = { if (!busy) testConnection() },
+            )
+            if (status.isNotBlank()) Text(
+                text = status,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (failed) MaterialTheme.colorScheme.error else AetherOnSurfaceVariant,
+                modifier = Modifier.padding(start = 54.dp, end = 16.dp, bottom = 14.dp),
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+        VoiceSectionTitle(tr(strings, "Server voice", "服务器声音"))
+        SettingsCardGroup {
+            SelectionDropdownField(
+                label = tr(strings, "Voice", "声音"),
+                supportingText = tr(strings, "Test the connection to refresh this list", "测试连接后会刷新此列表"),
+                selectedLabel = voices.firstOrNull { it.id == voiceId }?.name
+                    ?: voiceId.ifBlank { tr(strings, "No voice selected", "尚未选择声音") },
+                options = voices.map { voice ->
+                    SelectionOption(
+                        key = voice.id,
+                        title = voice.name,
+                        subtitle = "${voice.language} · ${voice.modelVersion}",
+                        selected = voice.id == voiceId,
+                        onClick = { voiceId = voice.id; save() },
+                    )
+                },
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+        VoiceSectionTitle(tr(strings, "Reading behavior", "朗读行为"))
+        SettingsCardGroup {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                SettingsToggleRow(
+                    title = tr(strings, "Voice use authorized", "已获得声音使用授权"),
+                    subtitle = tr(strings, "Confirm that you may use the selected server voice.", "确认你已获得所选服务器声音的使用授权。"),
+                    checked = settings.voiceAuthorizationConfirmed,
+                    onCheckedChange = { save(authorized = it, enabled = settings.voiceEnabled && it) },
+                )
+                SettingsToggleRow(
+                    title = tr(strings, "Voice reading", "语音朗读"),
+                    subtitle = if (configured) tr(strings, "Send readable reply text to your server", "将回复中的可读文本发送到你的服务器")
+                    else tr(strings, "Configure the server, token, and voice first", "请先配置服务器、Token 与声音"),
+                    checked = settings.voiceEnabled,
+                    enabled = configured && settings.voiceAuthorizationConfirmed,
+                    onCheckedChange = { save(enabled = it) },
+                )
+                SettingsToggleRow(
+                    title = tr(strings, "Automatic reading", "自动朗读"),
+                    subtitle = tr(strings, "Read completed foreground replies over Wi-Fi or mobile data", "在前台通过 Wi-Fi 或移动网络朗读已完成的回复"),
+                    checked = settings.voiceAutoRead,
+                    enabled = settings.voiceEnabled,
+                    onCheckedChange = { save(autoRead = it) },
+                )
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        VoiceSectionTitle(tr(strings, "Voice style", "声音样式"))
+        SettingsCardGroup {
+            SelectionDropdownField(
+                label = tr(strings, "Reading speed", "朗读速度"),
+                supportingText = tr(strings, "Applied by the synthesis server", "由语音服务器应用此速度"),
+                selectedLabel = "${settings.voiceSpeedPercent}%",
+                options = listOf(75, 100, 125).map { speed ->
+                    SelectionOption(
+                        key = speed.toString(),
+                        title = "$speed%",
+                        subtitle = when (speed) {
+                            75 -> tr(strings, "Slower and clearer", "更慢、更清晰")
+                            125 -> tr(strings, "Faster delivery", "更快的语速")
+                            else -> tr(strings, "Natural speed", "自然语速")
+                        },
+                        selected = settings.voiceSpeedPercent == speed,
+                        onClick = { save(speed = normalizeVoiceSpeedPercent(speed)) },
+                    )
+                },
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+        VoiceSectionTitle(tr(strings, "Server actions", "服务器操作"))
+        SettingsCardGroup {
+            SettingsNavRow(
+                icon = Icons.Rounded.AutoAwesome,
+                title = if (testing) tr(strings, "Stop voice test", "停止声音测试") else tr(strings, "Test selected voice", "测试所选声音"),
+                subtitle = if (playback.messageId == VoiceSettingsTestMessageId) testStatus
+                else tr(strings, "The test sentence is sent to your server", "测试句子会发送到你配置的服务器"),
+                showChevron = false,
+                onClick = {
+                    if (testing) controller.stop()
+                    else if (configured && settings.voiceAuthorizationConfirmed) scope.launch {
+                        repository.updateVoiceSettings(
+                            url.text, token.text, voiceId, settings.voiceEnabled,
+                            settings.voiceAutoRead, settings.voiceAuthorizationConfirmed, settings.voiceSpeedPercent,
+                        )
+                        controller.speak(
+                            VoiceSettingsTestMessageId,
+                            tr(strings, "Hello. This is Aether's server voice test.", "你好，这是 Aether 的服务器语音测试。"),
+                            settings.voiceSpeedPercent / 100f,
+                            VoicePlaybackConfig(
+                                connection = VoiceServerConnection(url.text, token.text),
+                                voiceId = voiceId,
+                                language = voices.firstOrNull { it.id == voiceId }?.language ?: "zh",
+                            ),
+                        )
+                    }
+                },
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = tr(
+                strings,
+                "Privacy: readable assistant reply text is sent to the voice server you configure. Aether does not fall back to system TTS.",
+                "隐私提示：助手回复中的可读文本会发送到你配置的语音服务器；Aether 不会回退到系统 TTS。",
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = AetherOnSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
+    }
+}
+
+@Composable
+private fun VoiceSectionTitle(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelLarge,
+        color = AetherOnSurface,
+        modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
+    )
+}
+
+private const val VoiceSettingsTestMessageId = "remote-voice-settings-test"
 
 @Composable
 private fun GeneralSettingsPage(
@@ -2058,6 +2345,8 @@ private fun WebToolsPage(
     title: String,
     tavilyApiKeyValue: TextFieldValue,
     onTavilyApiKeyChanged: (TextFieldValue) -> Unit,
+    mineruApiTokenValue: TextFieldValue,
+    onMineruApiTokenChanged: (TextFieldValue) -> Unit,
     onBack: () -> Unit,
 ) {
     val strings = rememberAetherStrings()
@@ -2072,12 +2361,21 @@ private fun WebToolsPage(
                 label = tr(strings, "Tavily API Key", "Tavily API 密钥"),
                 value = tavilyApiKeyValue,
                 onValueChange = onTavilyApiKeyChanged,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                visualTransformation = PasswordVisualTransformation(),
+            )
+            ChatGptTextField(
+                label = tr(strings, "MinerU API Token (precise parsing)", "MinerU API Token（精准解析）"),
+                value = mineruApiTokenValue,
+                onValueChange = onMineruApiTokenChanged,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                visualTransformation = PasswordVisualTransformation(),
             )
         }
 
         Spacer(Modifier.height(8.dp))
         Text(
-            text = tr(strings, "fetch_web_url works without extra setup and converts pages to Markdown on-device. tavily_search uses this API key for public web search.", "fetch_web_url 无需额外设置，会在设备上把网页转换为 Markdown。tavily_search 使用此 API 密钥进行公开网页搜索。"),
+            text = tr(strings, "tavily_search sends generated search queries to Tavily. Documents parsed with MinerU are uploaded to MinerU's external service. A configured MinerU token enables precise parsing first; otherwise or on failure, Aether uses the lightweight parser.", "tavily_search 会将生成的搜索查询发送给 Tavily。使用 MinerU 解析时，文档内容会上传到 MinerU 外部服务。配置 MinerU Token 后优先精准解析，否则使用轻量解析。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -2602,7 +2900,7 @@ private fun AddMcpServerPage(
     var httpServerUrlValue by rememberSaveable(existingServer?.id, stateSaver = TextFieldValue.Saver) {
         mutableStateOf(TextFieldValue(existingHttpTransport?.url.orEmpty()))
     }
-    var httpHeadersValue by rememberSaveable(existingServer?.id, stateSaver = TextFieldValue.Saver) {
+    var httpHeadersValue by remember(existingServer?.id, existingHttpTransport?.headers) {
         mutableStateOf(
             TextFieldValue(
                 existingHttpTransport?.headers
@@ -2621,7 +2919,7 @@ private fun AddMcpServerPage(
     var stdioWorkingDirectoryValue by rememberSaveable(existingServer?.id, stateSaver = TextFieldValue.Saver) {
         mutableStateOf(TextFieldValue(existingStdIoTransport?.workingDirectory.orEmpty()))
     }
-    var stdioEnvValue by rememberSaveable(existingServer?.id, stateSaver = TextFieldValue.Saver) {
+    var stdioEnvValue by remember(existingServer?.id, existingStdIoTransport?.environment) {
         mutableStateOf(
             TextFieldValue(
                 existingStdIoTransport?.environment
@@ -3754,7 +4052,7 @@ private fun DeveloperSettingsPage(
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = tr(strings, "Import or export the complete local Aether data set as JSON.", "以 JSON 格式导入或导出完整的本地 Aether 数据。"),
+                    text = tr(strings, "Import or export local Aether data as JSON. Exports exclude API keys, tokens, MCP headers, and MCP environment secrets.", "以 JSON 格式导入或导出本地 Aether 数据。导出文件会排除 API Key、Token、MCP Header 和 MCP 环境变量密钥。"),
                     style = MaterialTheme.typography.bodySmall,
                     color = AetherOnSurfaceVariant,
                 )

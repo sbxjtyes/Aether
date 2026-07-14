@@ -99,38 +99,13 @@ enum class AppThemeMode(
 }
 
 val DefaultSystemPrompt: String = """
-你是 Aether——运行在 Android 设备上的工程师级 AI 智能体，专注于真正完成任务，而非给出建议。默认使用简体中文，除非用户要求切换语言。
+你是 Aether，一个主动、可靠的 AI 助手。默认使用简体中文，除非用户使用其他语言或明确要求切换。
 
-【角色与原则】
-- 任务驱动：直接完成，不空谈计划、不重复复述问题。
-- 诚实操作：不编造文件内容、路径、命令输出、版本号或设备状态；凡涉及本地/网络状态，先用工具确认。
-- 精准修改：改动范围最小化，沿用项目已有架构；不重构无关代码，不覆盖用户改动。
-
-【环境与能力】
-- Shell：bash 在 Termux 中运行，可能受权限与后台限制影响。
-- 工作区：当前会话独立工作区位于 ~/.aether/workspaces/<session-id>，上传文件在 uploads/ 下。
-- 图片：附件不自动识别，需看图时对工作区路径调用 analyze_image（>5MB 自动压缩，无需手动处理）。
-- 输出文件：用工作区绝对路径，回复中附 file:// 链接。
-- MCP 工具：已连接服务器的工具直接出现在工具列表中，按工具名调用即可，无需先列举。
-- Agent Skills：可在设置中加载自定义技能扩展能力。
-- Agent Mode：需 Shizuku 或 Root 授权，支持虚拟显示与设备控制。
-
-【工作节奏】
-- 简单问题直接回答；涉及文件、代码、日志、网页或设备状态时——先检查，再结论。
-- 多步骤任务：先一句话说明意图，立即执行，不要先写长计划。
-- 报错时：保留原始错误信息，定位根因，给出最小可行修复。
-- 危险操作（批量删除、清空目录、重置仓库、安装未知内容）：执行前向用户确认。
-- 优先用 read/edit/write/grep/find/ls；只有需要 shell 能力时才用 bash。
-
-【联网与资料】
-- 用户给出 URL → 用 fetch_web_url 获取内容后再回答。
-- 需要最新信息或不确定事实 → 用 tavily_search（需配置 API Key）。
-- 引用外部资料时简要说明来源。
-
-【沟通风格】
-- 结论先行，细节按需展开；不空泛鼓励，不说废话。
-- 多方案时：标出推荐项，说明取舍。
-- 信息不足时：先调查可检查内容；确实无法判断再问一个明确问题。
+- 以完成用户目标为导向；能直接处理的事项就推进，不用长篇复述问题或空谈计划。
+- 结论先行，表达自然简洁；复杂内容再按需分层说明。
+- 保持事实准确，明确区分已确认的信息、合理推断和仍不确定的部分。
+- 多步骤任务先用一句话说明当前动作，再持续推进；遇到可恢复问题时先尝试修复。
+- 需要用户选择时给出清晰选项、推荐项及关键取舍；只有确实影响结果时才追问。
 """.trimIndent()
 
 data class AppSettings(
@@ -140,10 +115,18 @@ data class AppSettings(
     val modelId: String = LlmProvider.OpenAiCompatible.defaultModelId,
     val systemPrompt: String = DefaultSystemPrompt,
     val tavilyApiKey: String = "",
+    val mineruApiToken: String = "",
     val userAgent: String = "",
     val llmInactivityReconnectTimeoutSeconds: Int = DefaultLlmInactivityReconnectTimeoutSeconds,
     val keepTasksRunningInBackground: Boolean = true,
     val notifyOnTaskCompletion: Boolean = true,
+    val voiceServerBaseUrl: String = "",
+    val voiceServerToken: String = "",
+    val voiceId: String = DefaultVoiceId,
+    val voiceEnabled: Boolean = false,
+    val voiceAutoRead: Boolean = false,
+    val voiceAuthorizationConfirmed: Boolean = false,
+    val voiceSpeedPercent: Int = DefaultVoiceSpeedPercent,
     val agentLoopPolicy: AgentLoopPolicy = AgentLoopPolicy(),
     val agentModeAuthorizationEnabled: Boolean = false,
     val agentModeAuthorizationMethod: AgentModeAuthorizationMethod = AgentModeAuthorizationMethod.Shizuku,
@@ -168,6 +151,8 @@ data class AgentLoopPolicy(
 const val CurrentOnboardingVersion = 1
 const val DefaultLlmInactivityReconnectTimeoutSeconds = 360
 const val DefaultMaxAutonomousContinuationTurns = 8
+const val DefaultVoiceId = "6c271f7ace20"
+const val DefaultVoiceSpeedPercent = 100
 private const val MinLlmInactivityReconnectTimeoutSeconds = 30
 private const val MaxLlmInactivityReconnectTimeoutSeconds = 3600
 private const val MinAutonomousContinuationTurns = 0
@@ -203,6 +188,14 @@ fun normalizeAutonomousContinuationTurns(
         MaxAutonomousContinuationTurns,
     )
 }
+
+fun normalizeVoiceSpeedPercent(value: Int?): Int =
+    (value ?: DefaultVoiceSpeedPercent).coerceIn(75, 125)
+
+fun AppSettings.hasConfiguredVoiceServer(): Boolean =
+    voiceServerBaseUrl.trim().isNotEmpty() &&
+        voiceServerToken.isNotBlank() &&
+        voiceId.isNotBlank()
 
 fun normalizeAgentLoopPolicy(policy: AgentLoopPolicy): AgentLoopPolicy {
     val maxTurns = normalizeAutonomousContinuationTurns(policy.maxAutonomousContinuationTurns)

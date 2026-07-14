@@ -24,7 +24,9 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody
 import okhttp3.TlsVersion
+import okio.Buffer
 import okio.BufferedSource
 import org.json.JSONArray
 import org.json.JSONObject
@@ -1510,7 +1512,10 @@ class OpenAiCompatibleClient(
                 val requestUrl = sanitizeRequestUrl(response.request.url)
 
                 if (!response.isSuccessful) {
-                    val bodyString = responseBody.string()
+                    val bodyString = responseBody.readUtf8WithLimit(
+                        maxBytes = MaxLlmErrorResponseBytes,
+                        responseKind = "LLM error response",
+                    )
                     val responsePayload = HttpResponsePayload(
                         code = response.code,
                         isSuccessful = response.isSuccessful,
@@ -1525,7 +1530,10 @@ class OpenAiCompatibleClient(
                 }
 
                 if (!contentType.contains("text/event-stream", ignoreCase = true)) {
-                    val bodyString = responseBody.string()
+                    val bodyString = responseBody.readUtf8WithLimit(
+                        maxBytes = MaxLlmJsonResponseBytes,
+                        responseKind = "LLM JSON response",
+                    )
                     val responsePayload = HttpResponsePayload(
                         code = response.code,
                         isSuccessful = response.isSuccessful,
@@ -1615,18 +1623,35 @@ class OpenAiCompatibleClient(
                         response: Response,
                     ) {
                         response.use {
-                            val bodyString = it.body?.string().orEmpty()
-                            if (continuation.isCancelled) return
-                            continuation.resume(
-                                HttpResponsePayload(
-                                    code = it.code,
-                                    isSuccessful = it.isSuccessful,
-                                    bodyString = bodyString,
-                                    contentType = it.header("Content-Type").orEmpty(),
-                                    requestUrl = sanitizeRequestUrl(it.request.url),
-                                    retryAfterHeader = it.header("Retry-After").orEmpty(),
+                            try {
+                                val maxBytes = if (it.isSuccessful) {
+                                    MaxLlmJsonResponseBytes
+                                } else {
+                                    MaxLlmErrorResponseBytes
+                                }
+                                val responseKind = if (it.isSuccessful) {
+                                    "LLM JSON response"
+                                } else {
+                                    "LLM error response"
+                                }
+                                val bodyString = it.body
+                                    ?.readUtf8WithLimit(maxBytes, responseKind)
+                                    .orEmpty()
+                                if (continuation.isCancelled) return
+                                continuation.resume(
+                                    HttpResponsePayload(
+                                        code = it.code,
+                                        isSuccessful = it.isSuccessful,
+                                        bodyString = bodyString,
+                                        contentType = it.header("Content-Type").orEmpty(),
+                                        requestUrl = sanitizeRequestUrl(it.request.url),
+                                        retryAfterHeader = it.header("Retry-After").orEmpty(),
+                                    )
                                 )
-                            )
+                            } catch (throwable: Throwable) {
+                                if (continuation.isCancelled) return
+                                continuation.resumeWithException(throwable)
+                            }
                         }
                     }
                 }
@@ -1640,7 +1665,7 @@ class OpenAiCompatibleClient(
         val eventData = StringBuilder()
 
         while (true) {
-            val line = source.readUtf8Line() ?: break
+            val line = source.readUtf8LineWithLimit(MaxLlmSseLineBytes) ?: break
             if (line.isEmpty()) {
                 if (eventData.isNotEmpty()) {
                     onEvent(eventData.toString())
@@ -1655,7 +1680,13 @@ class OpenAiCompatibleClient(
             if (eventData.isNotEmpty()) {
                 eventData.append('\n')
             }
-            eventData.append(line.removePrefix("data:").trimStart())
+            val data = line.removePrefix("data:").trimStart()
+            if (eventData.length + data.length + 1 > MaxLlmSseEventChars) {
+                throw IOException(
+                    "LLM SSE event exceeds the ${formatByteLimit(MaxLlmSseEventChars)} safety limit."
+                )
+            }
+            eventData.append(data)
         }
 
         if (eventData.isNotEmpty()) {
@@ -2937,6 +2968,48 @@ private data class HttpResponsePayload(
     val retryAfterHeader: String = "",
 )
 
+internal fun ResponseBody.readUtf8WithLimit(
+    maxBytes: Long,
+    responseKind: String,
+): String {
+    require(maxBytes > 0L) { "maxBytes must be positive." }
+    val declaredLength = contentLength()
+    if (declaredLength > maxBytes) {
+        throw IOException("$responseKind exceeds the ${formatByteLimit(maxBytes)} safety limit.")
+    }
+
+    val source = source()
+    val buffer = Buffer()
+    var totalBytes = 0L
+    while (totalBytes <= maxBytes) {
+        val read = source.read(buffer, minOf(8_192L, maxBytes + 1L - totalBytes))
+        if (read == -1L) break
+        totalBytes += read
+    }
+    if (totalBytes > maxBytes) {
+        throw IOException("$responseKind exceeds the ${formatByteLimit(maxBytes)} safety limit.")
+    }
+    return buffer.readString(Charsets.UTF_8)
+}
+
+private fun BufferedSource.readUtf8LineWithLimit(maxBytes: Long): String? {
+    require(maxBytes > 0L) { "maxBytes must be positive." }
+    val newlineOffset = indexOf('\n'.code.toByte(), 0L, maxBytes + 1L)
+    if (newlineOffset >= 0L) {
+        return readUtf8Line()
+    }
+    if (request(maxBytes + 1L)) {
+        throw IOException("LLM SSE line exceeds the ${formatByteLimit(maxBytes)} safety limit.")
+    }
+    return if (buffer.size == 0L) null else readUtf8()
+}
+
+private fun formatByteLimit(bytes: Long): String = when {
+    bytes % (1024L * 1024L) == 0L -> "${bytes / (1024L * 1024L)} MiB"
+    bytes % 1024L == 0L -> "${bytes / 1024L} KiB"
+    else -> "$bytes-byte"
+}
+
 private fun buildLlmRequestException(
     responsePayload: HttpResponsePayload,
     message: String,
@@ -3043,6 +3116,10 @@ private const val DefaultHttpWriteTimeoutMillis = 30_000L
 private const val DefaultHttpCallTimeoutMillis = 90_000L
 private const val DefaultStreamingConnectTimeoutMillis = 30_000L
 private const val DefaultStreamingWriteTimeoutMillis = 30_000L
+internal const val MaxLlmErrorResponseBytes = 1L * 1024L * 1024L
+internal const val MaxLlmJsonResponseBytes = 32L * 1024L * 1024L
+private const val MaxLlmSseLineBytes = 16L * 1024L * 1024L
+private const val MaxLlmSseEventChars = 16L * 1024L * 1024L
 private const val DefaultAnthropicMaxTokens = 4096
 private const val AnthropicVersion = "2023-06-01"
 internal const val DefaultLlmUserAgent =

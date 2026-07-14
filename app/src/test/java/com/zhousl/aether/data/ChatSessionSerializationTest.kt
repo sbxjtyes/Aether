@@ -94,6 +94,24 @@ class ChatSessionSerializationTest {
     }
 
     @Test
+    fun placeholderCustomTitleIsRecoveredFromFirstUserMessage() {
+        val restored = parseChatSessionObject(
+            JSONObject(
+                """{
+                    "id":"title-recovery",
+                    "title":"New chat",
+                    "preview":"done",
+                    "hasCustomTitle":true,
+                    "messages":[{"id":"u1","author":"User","text":"查看这些 PDF 文件"}]
+                }""".trimIndent()
+            )
+        )
+
+        assertEquals("查看这些 PDF 文件", restored.title)
+        assertEquals(false, restored.hasCustomTitle)
+    }
+
+    @Test
     fun missingEnabledToolGroupsDefaultToAllGroups() {
         val restored = parseChatSessionObject(
             JSONObject(

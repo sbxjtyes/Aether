@@ -1,0 +1,13 @@
+{
+  "format": "getvoice-gpt-sovits-profile-v2",
+  "engine": "gpt-sovits",
+  "version": "v2",
+  "model_version": "20260713-130855-99cc74",
+  "reference_audio": "reference.wav",
+  "reference_text": "花臂男人骂了一声，一撑桌子想要站起身来，却发现自己的双腿瘫软使不上力气，于是只能继续指着山羊头说，“",
+  "reference_language": "zh",
+  "gpt_weights": "voice-gpt.ckpt",
+  "sovits_weights": "voice-sovits.pth",
+  "training_run": "20260713-130855-99cc74",
+  "created_at": "2026-07-13T05:26:34.293765+00:00"
+}

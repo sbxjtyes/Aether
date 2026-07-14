@@ -4,12 +4,21 @@ import android.content.Context
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
 import java.io.File
+import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 
 private const val RootProbeTimeoutMillis = 1_500L
 private const val RootSetupTimeoutMillis = 30_000L
+private const val RootProcessTerminationGraceMillis = 250L
+private const val RootProcessOutputJoinMillis = 1_000L
+private const val RootProcessOutputLimitChars = 256 * 1024
 private const val TermuxLaunchForBackgroundMarker = "AETHER_TERMUX_LAUNCHED_FOR_BACKGROUND"
 
 enum class RootSetupIssue {
@@ -82,7 +91,7 @@ class RootSetupController(
             )
         }
 
-        val commandResult = runProcess(
+        val commandResult = runRootProcess(
             command = listOf(suPath, "-c", buildTermuxRootSetupScript(context.packageName)),
             timeoutMillis = RootSetupTimeoutMillis,
         )
@@ -138,7 +147,7 @@ class RootSetupController(
         true
     }.getOrDefault(false)
 
-    private fun findSuPath(): String {
+    private suspend fun findSuPath(): String {
         val commonPaths = listOf(
             "/system/bin/su",
             "/system/xbin/su",
@@ -150,46 +159,11 @@ class RootSetupController(
             File(path).let { it.exists() && it.canExecute() }
         }?.let { return it }
 
-        val result = runProcess(
+        val result = runRootProcess(
             command = listOf("sh", "-c", "command -v su 2>/dev/null || true"),
             timeoutMillis = RootProbeTimeoutMillis,
         )
         return result.stdout.lineSequence().firstOrNull()?.trim().orEmpty()
-    }
-
-    private fun runProcess(
-        command: List<String>,
-        timeoutMillis: Long,
-    ): RootCommandResult {
-        val process = runCatching {
-            ProcessBuilder(command).start()
-        }.getOrElse { throwable ->
-            return RootCommandResult(
-                exitCode = -1,
-                launchError = throwable.message.orEmpty(),
-            )
-        }
-
-        val finished = process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)
-        if (!finished) {
-            runCatching { process.destroy() }
-            if (!process.waitFor(800, TimeUnit.MILLISECONDS)) {
-                runCatching { process.destroyForcibly() }
-            }
-        }
-
-        val stdout = runCatching {
-            process.inputStream.bufferedReader().readText()
-        }.getOrDefault("")
-        val stderr = runCatching {
-            process.errorStream.bufferedReader().readText()
-        }.getOrDefault("")
-        return RootCommandResult(
-            exitCode = if (finished) process.exitValue() else -1,
-            stdout = stdout,
-            stderr = stderr,
-            timedOut = !finished,
-        )
     }
 
     private fun buildTermuxRootSetupScript(
@@ -320,7 +294,7 @@ class RootSetupController(
     }
 }
 
-private data class RootCommandResult(
+internal data class RootCommandResult(
     val exitCode: Int,
     val stdout: String = "",
     val stderr: String = "",
@@ -331,4 +305,130 @@ private data class RootCommandResult(
         .map(String::trim)
         .filter(String::isNotBlank)
         .joinToString("\n")
+}
+
+/**
+ * Runs the root helper while continuously draining both output pipes. Waiting before reading can
+ * deadlock as soon as either OS pipe buffer fills. Cancellation deliberately remains distinct from
+ * a timeout so callers never turn a cancelled setup into a permission error.
+ */
+internal suspend fun runRootProcess(
+    command: List<String>,
+    timeoutMillis: Long,
+    processStarter: (List<String>) -> Process = { ProcessBuilder(it).start() },
+): RootCommandResult = coroutineScope {
+    val process = runCatching { processStarter(command) }.getOrElse { throwable ->
+        return@coroutineScope RootCommandResult(
+            exitCode = -1,
+            launchError = throwable.message.orEmpty(),
+        )
+    }
+    val stdoutReader = async(Dispatchers.IO) {
+        readProcessOutput(process.inputStream)
+    }
+    val stderrReader = async(Dispatchers.IO) {
+        readProcessOutput(process.errorStream)
+    }
+
+    var timedOut = false
+    val exitCode = try {
+        val completedExitCode = withTimeoutOrNull(timeoutMillis) {
+            runInterruptible(Dispatchers.IO) { process.waitFor() }
+        }
+        if (completedExitCode == null) {
+            timedOut = true
+            terminateProcessTree(process)
+            -1
+        } else {
+            completedExitCode
+        }
+    } catch (cancelled: CancellationException) {
+        terminateProcessTree(process)
+        throw cancelled
+    } catch (throwable: Throwable) {
+        terminateProcessTree(process)
+        throw throwable
+    } finally {
+        if (!timedOut && process.isAlive) {
+            terminateProcessTree(process)
+        }
+    }
+
+    if (timedOut) {
+        closeProcessStreams(process)
+    }
+    val stdout = withTimeoutOrNull(RootProcessOutputJoinMillis) { stdoutReader.await() }
+        ?: run {
+            runCatching { process.inputStream.close() }
+            stdoutReader.cancel()
+            ""
+        }
+    val stderr = withTimeoutOrNull(RootProcessOutputJoinMillis) { stderrReader.await() }
+        ?: run {
+            runCatching { process.errorStream.close() }
+            stderrReader.cancel()
+            ""
+        }
+    RootCommandResult(
+        exitCode = exitCode,
+        stdout = stdout,
+        stderr = stderr,
+        timedOut = timedOut,
+    )
+}
+
+private fun readProcessOutput(input: InputStream): String = runCatching {
+    input.bufferedReader().use { reader ->
+        val output = StringBuilder()
+        val buffer = CharArray(8 * 1024)
+        while (true) {
+            val count = reader.read(buffer)
+            if (count < 0) break
+            output.append(buffer, 0, count)
+            if (output.length > RootProcessOutputLimitChars) {
+                output.delete(0, output.length - RootProcessOutputLimitChars)
+            }
+        }
+        output.toString()
+    }
+}.getOrDefault("")
+
+private fun terminateProcessTree(process: Process) {
+    // ProcessHandle is not consistently implemented by Android vendors, so tree cleanup is
+    // best-effort and reflective. The direct process is always terminated below.
+    val descendants = runCatching {
+        val handle = Process::class.java.getMethod("toHandle").invoke(process)
+        val processHandleClass = Class.forName("java.lang.ProcessHandle")
+        val stream = processHandleClass.getMethod("descendants").invoke(handle) as AutoCloseable
+        val iterator = Class.forName("java.util.stream.BaseStream")
+            .getMethod("iterator")
+            .invoke(stream) as Iterator<*>
+        buildList {
+            while (iterator.hasNext()) iterator.next()?.let(::add)
+        }.also { stream.close() }
+    }.getOrDefault(emptyList())
+    descendants.asReversed().forEach { destroyProcessHandle(it, forcibly = false) }
+    runCatching { process.destroy() }
+    val exited = runCatching {
+        process.waitFor(RootProcessTerminationGraceMillis, TimeUnit.MILLISECONDS)
+    }.getOrDefault(false)
+    descendants.asReversed().forEach { destroyProcessHandle(it, forcibly = true) }
+    if (!exited) {
+        runCatching { process.destroyForcibly() }
+        runCatching { process.waitFor(RootProcessTerminationGraceMillis, TimeUnit.MILLISECONDS) }
+    }
+    closeProcessStreams(process)
+}
+
+private fun destroyProcessHandle(handle: Any, forcibly: Boolean) {
+    runCatching {
+        val methodName = if (forcibly) "destroyForcibly" else "destroy"
+        Class.forName("java.lang.ProcessHandle").getMethod(methodName).invoke(handle)
+    }
+}
+
+private fun closeProcessStreams(process: Process) {
+    runCatching { process.outputStream.close() }
+    runCatching { process.inputStream.close() }
+    runCatching { process.errorStream.close() }
 }

@@ -200,7 +200,7 @@ fun OnboardingScreen(
     var currentStep by rememberSaveable(initialStep, replayMode) {
         mutableStateOf(initialStep)
     }
-    var tavilyApiKeyValue by rememberSaveable(initialStep, replayMode, tavilyApiKey) {
+    var tavilyApiKeyValue by remember(initialStep, replayMode, tavilyApiKey) {
         mutableStateOf(tavilyApiKey)
     }
     val formState = rememberProviderFormState(existingProviderConfig)
@@ -1665,7 +1665,7 @@ private fun Modifier.tourBringIntoViewOnFocus(): Modifier = composed {
 @Composable
 private fun PrimaryActionButton(
     label: String,
-    modifier: Modifier = Modifier.fillMaxWidth(),
+    modifier: Modifier = Modifier,
     enabled: Boolean = true,
     onClick: () -> Unit,
     isLoading: Boolean = false,
@@ -1673,7 +1673,7 @@ private fun PrimaryActionButton(
     Button(
         onClick = onClick,
         enabled = enabled,
-        modifier = modifier,
+        modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(24.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = TourButton,

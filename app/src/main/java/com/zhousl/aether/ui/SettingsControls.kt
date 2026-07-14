@@ -98,6 +98,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -242,6 +243,7 @@ internal fun ChatGptTextField(
     value: TextFieldValue,
     minLines: Int = 1,
     keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
     onValueChange: (TextFieldValue) -> Unit,
 ) {
     Column(
@@ -265,6 +267,7 @@ internal fun ChatGptTextField(
             cursorBrush = SolidColor(AetherPrimary),
             minLines = minLines,
             keyboardOptions = keyboardOptions,
+            visualTransformation = visualTransformation,
             decorationBox = { innerTextField ->
                 Box {
                     if (value.text.isEmpty()) {
@@ -587,6 +590,7 @@ internal fun SettingsToggleRow(
     title: String,
     subtitle: String,
     checked: Boolean,
+    enabled: Boolean = true,
     onCheckedChange: (Boolean) -> Unit,
 ) {
     val showText = title.isNotBlank() || subtitle.isNotBlank()
@@ -616,6 +620,7 @@ internal fun SettingsToggleRow(
         Switch(
             checked = checked,
             onCheckedChange = onCheckedChange,
+            enabled = enabled,
         )
     }
 }

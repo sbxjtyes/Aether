@@ -374,6 +374,7 @@ fun ProviderConfigurationForm(
                 label = "API Key",
                 value = state.apiKey,
                 onValueChange = { state.apiKey = it },
+                saveInputState = false,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                 visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
                 trailingContent = {
@@ -456,7 +457,7 @@ fun ProviderConfigurationForm(
     }
 }
 
-private fun providerFormStateSaver(
+internal fun providerFormStateSaver(
     existingConfig: LlmProviderConfig?,
 ): Saver<ProviderFormState, Any> = listSaver(
     save = { state ->
@@ -464,7 +465,7 @@ private fun providerFormStateSaver(
             state.providerId,
             state.name,
             state.providerStorageValue,
-            state.apiKey,
+            "",
             state.baseUrl,
             state.modelId,
             state.userAgent,
@@ -476,19 +477,22 @@ private fun providerFormStateSaver(
         )
     },
     restore = { restored ->
-        @Suppress("UNCHECKED_CAST")
         val hasSavedUserAgent = restored.getOrNull(6) is String
         ProviderFormState(
             existingConfig = existingConfig,
             providerId = restored[0] as String,
             name = restored[1] as String,
             providerStorageValue = restored[2] as String,
-            apiKey = restored[3] as String,
+            apiKey = existingConfig?.apiKey.orEmpty(),
             baseUrl = restored[4] as String,
             modelId = restored[5] as String,
             userAgent = if (hasSavedUserAgent) restored[6] as String else existingConfig?.userAgent.orEmpty(),
-            cachedModels = restored[if (hasSavedUserAgent) 7 else 6] as List<String>,
-            enabledModelIds = restored[if (hasSavedUserAgent) 8 else 7] as List<String>,
+            cachedModels = (restored[if (hasSavedUserAgent) 7 else 6] as? List<*>)
+                ?.filterIsInstance<String>()
+                .orEmpty(),
+            enabledModelIds = (restored[if (hasSavedUserAgent) 8 else 7] as? List<*>)
+                ?.filterIsInstance<String>()
+                .orEmpty(),
             basicFunctionCallingCompatibilityMode = restored.getOrNull(if (hasSavedUserAgent) 9 else 8) as? Boolean
                 ?: existingConfig?.basicFunctionCallingCompatibilityMode
                 ?: false,
@@ -563,13 +567,20 @@ private fun ProviderFormTextField(
     value: String,
     onValueChange: (String) -> Unit,
     modifier: Modifier = Modifier,
+    saveInputState: Boolean = true,
     keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
     visualTransformation: VisualTransformation = VisualTransformation.None,
     trailingContent: (@Composable () -> Unit)? = null,
 ) {
-    var fieldValue by rememberSaveable(label, stateSaver = TextFieldValue.Saver) {
-        mutableStateOf(TextFieldValue(value, selection = TextRange(value.length)))
+    val initialFieldValue = { TextFieldValue(value, selection = TextRange(value.length)) }
+    val fieldValueState = if (saveInputState) {
+        rememberSaveable(label, stateSaver = TextFieldValue.Saver) {
+            mutableStateOf(initialFieldValue())
+        }
+    } else {
+        remember(label) { mutableStateOf(initialFieldValue()) }
     }
+    var fieldValue by fieldValueState
 
     LaunchedEffect(value) {
         if (value != fieldValue.text) {

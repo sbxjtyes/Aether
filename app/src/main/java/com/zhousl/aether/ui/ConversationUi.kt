@@ -1,6 +1,7 @@
 package com.zhousl.aether.ui
 
 import android.graphics.BitmapFactory
+import android.os.SystemClock
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -89,6 +90,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.State
@@ -122,6 +124,10 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -153,8 +159,10 @@ import com.zhousl.aether.data.SessionFollowUpMode
 import com.zhousl.aether.data.normalizeChatToolGroups
 import com.zhousl.aether.data.quickActionLabel
 import com.zhousl.aether.termux.TermuxSetupState
+import com.zhousl.aether.voice.VoicePlaybackState
 import com.zhousl.aether.ui.theme.AetherBackground
 import com.zhousl.aether.ui.theme.AetherBackgroundGradientTop
+import com.zhousl.aether.ui.theme.AetherError
 import com.zhousl.aether.ui.theme.AetherOnSurface
 import com.zhousl.aether.ui.theme.AetherOnPrimary
 import com.zhousl.aether.ui.theme.AetherOnSurfaceVariant
@@ -250,6 +258,8 @@ internal data class ConversationScreenState(
     val showTermuxSetupNotice: Boolean,
     val isSending: Boolean,
     val voiceInputState: VoiceInputUiState = VoiceInputUiState(),
+    val voicePlaybackEnabled: Boolean = false,
+    val voicePlaybackState: VoicePlaybackState = VoicePlaybackState.Idle,
 )
 
 internal data class ConversationScreenActions(
@@ -298,6 +308,8 @@ internal data class ConversationScreenActions(
     val onPauseGeneration: () -> Unit,
     val onResumeOnboarding: () -> Unit,
     val onDismissStarterPromptHint: () -> Unit,
+    val onReadMessage: (String, String) -> Unit = { _, _ -> },
+    val onStopReading: () -> Unit = {},
 )
 
 /**
@@ -394,6 +406,10 @@ internal fun ConversationScreen(
         isSending = state.isSending,
         voiceInputState = state.voiceInputState,
         onCancelVoiceInput = actions.onCancelVoiceInput,
+        voicePlaybackEnabled = state.voicePlaybackEnabled,
+        voicePlaybackState = state.voicePlaybackState,
+        onReadMessage = actions.onReadMessage,
+        onStopReading = actions.onStopReading,
     )
 }
 
@@ -550,6 +566,10 @@ private fun ConversationScreen(
     isSending: Boolean,
     voiceInputState: VoiceInputUiState,
     onCancelVoiceInput: () -> Unit,
+    voicePlaybackEnabled: Boolean,
+    voicePlaybackState: VoicePlaybackState,
+    onReadMessage: (String, String) -> Unit,
+    onStopReading: () -> Unit,
 ) {
     val listState = remember(conversationStateKey) { LazyListState() }
     val coroutineScope = rememberCoroutineScope()
@@ -878,6 +898,10 @@ private fun ConversationScreen(
                                         onRedo = { onRedoAgentMessage(message.id) },
                                         onRetry = { onRetryUserMessage(message.id) },
                                         onSwitchBranch = { delta -> onSwitchUserMessageBranch(message.id, delta) },
+                                        voicePlaybackEnabled = voicePlaybackEnabled,
+                                        voicePlaybackState = voicePlaybackState,
+                                        onReadAloud = onReadMessage,
+                                        onStopReading = onStopReading,
                                     )
                                 }
 
@@ -900,6 +924,10 @@ private fun ConversationScreen(
                                         },
                                         onRedo = { onRedoAgentMessage(lastMessage.id) },
                                         onDelete = { onDeleteMessage(lastMessage.id) },
+                                        voicePlaybackEnabled = voicePlaybackEnabled,
+                                        voicePlaybackState = voicePlaybackState,
+                                        onReadAloud = onReadMessage,
+                                        onStopReading = onStopReading,
                                     )
                                 }
                             }
@@ -2308,6 +2336,8 @@ private fun ChatGptPromptComposerBar(
     var followUpMenuExpanded by remember { mutableStateOf(false) }
     val followUpMenuVisibility = remember { MutableTransitionState(false) }
     followUpMenuVisibility.targetState = followUpMenuExpanded
+    var voiceCancelArmed by remember { mutableStateOf(false) }
+    var voiceElapsedMs by remember { mutableLongStateOf(0L) }
     var measuredTextLineCount by remember { mutableIntStateOf(1) }
     var measuredTextHeight by remember { mutableStateOf(26.dp) }
     var composerFieldValue by remember { mutableStateOf(TextFieldValue(value, selection = TextRange(value.length))) }
@@ -2321,7 +2351,23 @@ private fun ChatGptPromptComposerBar(
     }
     LaunchedEffect(value) {
         if (value != composerFieldValue.text) {
-            composerFieldValue = TextFieldValue(value, selection = TextRange(value.length))
+            val cursor = VoiceDraftSelectionState.consumePendingCursor(value.length)
+            composerFieldValue = TextFieldValue(value, selection = TextRange(cursor))
+            VoiceDraftSelectionState.update(cursor, cursor)
+        } else {
+            VoiceDraftSelectionState.update(composerFieldValue.selection.start, composerFieldValue.selection.end)
+        }
+    }
+    LaunchedEffect(voiceInputState.status) {
+        if (voiceInputState.status == VoiceInputStatus.Listening) {
+            val startedAt = SystemClock.elapsedRealtime()
+            voiceElapsedMs = 0L
+            while (true) {
+                voiceElapsedMs = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)
+                delay(100L)
+            }
+        } else {
+            voiceElapsedMs = 0L
         }
     }
 
@@ -2508,6 +2554,8 @@ private fun ChatGptPromptComposerBar(
         }
         VoiceInputPanel(
             state = voiceInputState,
+            elapsedMs = voiceElapsedMs,
+            cancelArmed = voiceCancelArmed,
             onCancel = onCancelVoiceInput,
         )
 
@@ -2556,6 +2604,7 @@ private fun ChatGptPromptComposerBar(
                         value = composerFieldValue,
                         onValueChange = { newValue ->
                             composerFieldValue = newValue
+                            VoiceDraftSelectionState.update(newValue.selection.start, newValue.selection.end)
                             onValueChange(newValue.text)
                         },
                         modifier = Modifier
@@ -2651,8 +2700,20 @@ private fun ChatGptPromptComposerBar(
                         iconSize = 23.dp,
                         selected = voiceInputState.status == VoiceInputStatus.Listening ||
                             voiceInputState.status == VoiceInputStatus.Processing,
-                        onPress = onVoiceInputPressed,
-                        onRelease = onVoiceInputReleased,
+                        onPress = {
+                            voiceCancelArmed = false
+                            onVoiceInputPressed()
+                        },
+                        onRelease = {
+                            val shouldCancel = voiceCancelArmed
+                            voiceCancelArmed = false
+                            if (shouldCancel) onCancelVoiceInput() else onVoiceInputReleased()
+                        },
+                        onCancel = {
+                            voiceCancelArmed = false
+                            onCancelVoiceInput()
+                        },
+                        onGestureStateChanged = { armed -> voiceCancelArmed = armed },
                     )
                     if (showPauseButton) {
                         ComposerPauseButton(onClick = onPauseGeneration)
@@ -2706,6 +2767,8 @@ internal fun goalModeTaskStatusLabel(
 @Composable
 private fun VoiceInputPanel(
     state: VoiceInputUiState,
+    elapsedMs: Long = 0L,
+    cancelArmed: Boolean = false,
     onCancel: () -> Unit,
 ) {
     if (!state.isActive) return
@@ -2719,6 +2782,11 @@ private fun VoiceInputPanel(
         VoiceInputStatus.Idle -> strings.voice
     }
     val bodyText = when {
+        cancelArmed -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
+            "松开取消"
+        } else {
+            "Release to cancel"
+        }
         state.errorMessage.isNotBlank() && state.errorMessage != "permission_denied" -> state.errorMessage
         recognizedText.isNotBlank() -> recognizedText
         state.finalText.isNotBlank() -> state.finalText
@@ -2726,6 +2794,8 @@ private fun VoiceInputPanel(
         state.status == VoiceInputStatus.Listening -> strings.voiceReleaseToAddDraft
         else -> strings.voiceHoldToTalk
     }
+    val durationLabel = formatVoiceRecordingDuration(elapsedMs)
+    val accentColor = if (cancelArmed) AetherError else AetherPrimary
     val bars = remember(state.level) { voiceLevelBars(state.level, count = 7) }
     Column(
         modifier = Modifier
@@ -2745,7 +2815,9 @@ private fun VoiceInputPanel(
                     .size(42.dp)
                     .clip(CircleShape)
                     .background(
-                        if (state.status == VoiceInputStatus.Listening) {
+                        if (cancelArmed) {
+                            AetherError.copy(alpha = 0.18f + state.level * 0.18f)
+                        } else if (state.status == VoiceInputStatus.Listening) {
                             AetherPrimary.copy(alpha = 0.18f + state.level * 0.18f)
                         } else {
                             AetherSurface.copy(alpha = 0.84f)
@@ -2756,7 +2828,7 @@ private fun VoiceInputPanel(
                 Icon(
                     imageVector = Icons.Rounded.Mic,
                     contentDescription = null,
-                    tint = if (state.status == VoiceInputStatus.Listening) AetherPrimary else AetherOnSurface,
+                    tint = if (state.status == VoiceInputStatus.Listening) accentColor else AetherOnSurface,
                     modifier = Modifier.size(21.dp),
                 )
             }
@@ -2779,10 +2851,23 @@ private fun VoiceInputPanel(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            VoiceLevelBars(
-                levels = bars,
-                active = state.status == VoiceInputStatus.Listening,
-            )
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                if (state.status == VoiceInputStatus.Listening) {
+                    Text(
+                        text = durationLabel,
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
+                        color = if (cancelArmed) AetherError else AetherOnSurfaceVariant,
+                    )
+                }
+                VoiceLevelBars(
+                    levels = bars,
+                    active = state.status == VoiceInputStatus.Listening,
+                    activeColor = accentColor,
+                )
+            }
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -2802,6 +2887,7 @@ private fun VoiceInputPanel(
 private fun VoiceLevelBars(
     levels: List<Float>,
     active: Boolean,
+    activeColor: Color = AetherPrimary,
 ) {
     Row(
         modifier = Modifier
@@ -2821,10 +2907,17 @@ private fun VoiceLevelBars(
                     .width(4.dp)
                     .height(targetHeight)
                     .clip(RoundedCornerShape(999.dp))
-                    .background(if (active) AetherPrimary.copy(alpha = 0.74f) else AetherOnSurfaceVariant.copy(alpha = 0.28f))
+                    .background(if (active) activeColor.copy(alpha = 0.74f) else AetherOnSurfaceVariant.copy(alpha = 0.28f))
             )
         }
     }
+}
+
+private fun formatVoiceRecordingDuration(elapsedMs: Long): String {
+    val totalSeconds = (elapsedMs.coerceAtLeast(0L) / 1_000L).toInt()
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return "%02d:%02d".format(minutes, seconds)
 }
 
 @Composable
@@ -3022,14 +3115,38 @@ private fun ComposerIconButton(
     onClick: (() -> Unit)? = null,
     onPress: (() -> Unit)? = null,
     onRelease: (() -> Unit)? = null,
+    onCancel: (() -> Unit)? = null,
+    onGestureStateChanged: (Boolean) -> Unit = {},
 ) {
     val inputModifier = if (onPress != null && onRelease != null) {
-        Modifier.pointerInput(onPress, onRelease) {
+        val density = LocalDensity.current
+        val cancelThresholdPx = with(density) { 64.dp.toPx() }
+        Modifier.pointerInput(onPress, onRelease, onCancel, cancelThresholdPx) {
             awaitEachGesture {
-                awaitFirstDown(requireUnconsumed = false)
+                val down = awaitFirstDown(requireUnconsumed = false)
                 onPress()
-                waitForUpOrCancellation()
-                onRelease()
+                var cancelArmed = false
+                var finished = false
+                while (!finished) {
+                    val event = awaitPointerEvent()
+                    val change = event.changes.firstOrNull { it.id == down.id }
+                    if (change == null) {
+                        onCancel?.invoke()
+                        finished = true
+                    } else if (!change.pressed) {
+                        if (cancelArmed) onCancel?.invoke() else onRelease?.invoke()
+                        finished = true
+                    } else {
+                        val dragDistance = change.position.y - down.position.y
+                        val nextCancelArmed = dragDistance <= -cancelThresholdPx
+                        if (nextCancelArmed != cancelArmed) {
+                            cancelArmed = nextCancelArmed
+                            onGestureStateChanged(cancelArmed)
+                        }
+                        change.consume()
+                    }
+                }
+                onGestureStateChanged(false)
             }
         }
     } else {
@@ -3040,6 +3157,10 @@ private fun ComposerIconButton(
             .size(38.dp)
             .clip(CircleShape)
             .background(if (selected) AetherPrimary.copy(alpha = 0.14f) else Color.Transparent)
+            .semantics {
+                this.role = Role.Button
+                if (selected) this.stateDescription = "Active"
+            }
             .then(inputModifier),
         contentAlignment = Alignment.Center,
     ) {

@@ -8,8 +8,10 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
+import java.io.File
 
 private val Context.dataStore by preferencesDataStore(name = "aether_settings")
 
@@ -24,11 +26,29 @@ class SettingsRepository(
             modelId = preferences[MODEL_ID] ?: AppSettings().modelId,
             systemPrompt = normalizeStoredSystemPrompt(preferences[SYSTEM_PROMPT]),
             tavilyApiKey = preferences[TAVILY_API_KEY].orEmpty(),
+            mineruApiToken = preferences[MINERU_API_TOKEN].orEmpty(),
             llmInactivityReconnectTimeoutSeconds = normalizeLlmInactivityReconnectTimeoutSeconds(
                 preferences[LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS]
             ),
             keepTasksRunningInBackground = preferences[KEEP_TASKS_RUNNING_IN_BACKGROUND] ?: true,
             notifyOnTaskCompletion = preferences[NOTIFY_ON_TASK_COMPLETION] ?: true,
+            voiceServerBaseUrl = preferences[VOICE_SERVER_BASE_URL].orEmpty(),
+            voiceServerToken = preferences[VOICE_SERVER_TOKEN].orEmpty(),
+            voiceId = preferences[VOICE_ID]?.trim().orEmpty().ifBlank { DefaultVoiceId },
+            voiceEnabled = (preferences[VOICE_ENABLED] ?: false) &&
+                preferences[VOICE_SERVER_BASE_URL].orEmpty().isNotBlank() &&
+                preferences[VOICE_SERVER_TOKEN].orEmpty().isNotBlank() &&
+                preferences[VOICE_ID].orEmpty().isNotBlank() &&
+                (preferences[VOICE_AUTHORIZATION_CONFIRMED] ?: false),
+            voiceAutoRead = preferences[VOICE_AUTO_READ]
+                ?: preferences[LEGACY_OFFLINE_VOICE_AUTO_READ]
+                ?: false,
+            voiceAuthorizationConfirmed = preferences[VOICE_AUTHORIZATION_CONFIRMED]
+                ?: preferences[LEGACY_OFFLINE_VOICE_AUTHORIZATION_CONFIRMED]
+                ?: false,
+            voiceSpeedPercent = normalizeVoiceSpeedPercent(
+                preferences[VOICE_SPEED_PERCENT] ?: preferences[LEGACY_OFFLINE_VOICE_SPEED_PERCENT]
+            ),
             agentLoopPolicy = normalizeAgentLoopPolicy(
                 AgentLoopPolicy(
                     autonomousContinuationEnabled =
@@ -121,12 +141,15 @@ class SettingsRepository(
             it[MODEL_ID] = settings.modelId
             it[SYSTEM_PROMPT] = settings.systemPrompt
             it[TAVILY_API_KEY] = settings.tavilyApiKey
+            it[MINERU_API_TOKEN] = settings.mineruApiToken
             it[LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS] =
                 normalizeLlmInactivityReconnectTimeoutSeconds(
                     settings.llmInactivityReconnectTimeoutSeconds
                 )
             it[KEEP_TASKS_RUNNING_IN_BACKGROUND] = settings.keepTasksRunningInBackground
             it[NOTIFY_ON_TASK_COMPLETION] = settings.notifyOnTaskCompletion
+            // Remote voice credentials are device-local secrets. Full-app imports deliberately
+            // leave all voice server settings untouched, especially the bearer token.
             val agentLoopPolicy = normalizeAgentLoopPolicy(settings.agentLoopPolicy)
             it[AUTONOMOUS_CONTINUATION_ENABLED] = agentLoopPolicy.autonomousContinuationEnabled
             it[MAX_AUTONOMOUS_CONTINUATION_TURNS] = agentLoopPolicy.maxAutonomousContinuationTurns
@@ -184,12 +207,20 @@ class SettingsRepository(
             it[MODEL_ID] = settings.modelId
             it[SYSTEM_PROMPT] = settings.systemPrompt
             it[TAVILY_API_KEY] = settings.tavilyApiKey
+            it[MINERU_API_TOKEN] = settings.mineruApiToken
             it[LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS] =
                 normalizeLlmInactivityReconnectTimeoutSeconds(
                     settings.llmInactivityReconnectTimeoutSeconds
                 )
             it[KEEP_TASKS_RUNNING_IN_BACKGROUND] = settings.keepTasksRunningInBackground
             it[NOTIFY_ON_TASK_COMPLETION] = settings.notifyOnTaskCompletion
+            it[VOICE_SERVER_BASE_URL] = settings.voiceServerBaseUrl.trim().trimEnd('/')
+            it[VOICE_SERVER_TOKEN] = settings.voiceServerToken
+            it[VOICE_ID] = settings.voiceId.trim()
+            it[VOICE_ENABLED] = settings.voiceEnabled && settings.hasConfiguredVoiceServer()
+            it[VOICE_AUTO_READ] = settings.voiceAutoRead
+            it[VOICE_AUTHORIZATION_CONFIRMED] = settings.voiceAuthorizationConfirmed
+            it[VOICE_SPEED_PERCENT] = normalizeVoiceSpeedPercent(settings.voiceSpeedPercent)
             val agentLoopPolicy = normalizeAgentLoopPolicy(settings.agentLoopPolicy)
             it[AUTONOMOUS_CONTINUATION_ENABLED] = agentLoopPolicy.autonomousContinuationEnabled
             it[MAX_AUTONOMOUS_CONTINUATION_TURNS] = agentLoopPolicy.maxAutonomousContinuationTurns
@@ -228,6 +259,62 @@ class SettingsRepository(
         }
     }
 
+    suspend fun updateVoiceSettings(
+        serverBaseUrl: String,
+        serverToken: String,
+        voiceId: String,
+        enabled: Boolean,
+        autoRead: Boolean,
+        authorizationConfirmed: Boolean,
+        speedPercent: Int,
+    ) {
+        val normalizedBaseUrl = serverBaseUrl.trim().trimEnd('/')
+        val normalizedVoiceId = voiceId.trim()
+        val configured = normalizedBaseUrl.isNotBlank() &&
+            serverToken.isNotBlank() &&
+            normalizedVoiceId.isNotBlank()
+        context.dataStore.edit {
+            it[VOICE_SERVER_BASE_URL] = normalizedBaseUrl
+            it[VOICE_SERVER_TOKEN] = serverToken
+            it[VOICE_ID] = normalizedVoiceId
+            it[VOICE_ENABLED] = enabled && configured && authorizationConfirmed
+            it[VOICE_AUTO_READ] = autoRead
+            it[VOICE_AUTHORIZATION_CONFIRMED] = authorizationConfirmed
+            it[VOICE_SPEED_PERCENT] = normalizeVoiceSpeedPercent(speedPercent)
+        }
+    }
+
+    suspend fun migrateLegacyOfflineVoiceStorage() {
+        val migrated = context.dataStore.data.first()[REMOTE_VOICE_MIGRATION_COMPLETE] ?: false
+        if (migrated) return
+
+        val legacyDirectories = listOf(
+            File(context.filesDir, "offline_voice"),
+            File(context.cacheDir, "offline_voice"),
+        )
+        val cleaned = legacyDirectories.all { directory ->
+            !directory.exists() || directory.deleteRecursively()
+        }
+        if (!cleaned) return
+
+        context.dataStore.edit { preferences ->
+            preferences[REMOTE_VOICE_MIGRATION_COMPLETE] = true
+            preferences[VOICE_ENABLED] = false
+            if (!preferences.contains(VOICE_AUTO_READ)) {
+                preferences[VOICE_AUTO_READ] = preferences[LEGACY_OFFLINE_VOICE_AUTO_READ] ?: false
+            }
+            if (!preferences.contains(VOICE_AUTHORIZATION_CONFIRMED)) {
+                preferences[VOICE_AUTHORIZATION_CONFIRMED] =
+                    preferences[LEGACY_OFFLINE_VOICE_AUTHORIZATION_CONFIRMED] ?: false
+            }
+            if (!preferences.contains(VOICE_SPEED_PERCENT)) {
+                preferences[VOICE_SPEED_PERCENT] = normalizeVoiceSpeedPercent(
+                    preferences[LEGACY_OFFLINE_VOICE_SPEED_PERCENT]
+                )
+            }
+        }
+    }
+
     suspend fun updateOnboardingSeenVersion(version: Int) {
         context.dataStore.edit { prefs ->
             prefs[ONBOARDING_SEEN_VERSION] = version
@@ -253,12 +340,25 @@ class SettingsRepository(
         val MODEL_ID = stringPreferencesKey("model_id")
         val SYSTEM_PROMPT = stringPreferencesKey("system_prompt")
         val TAVILY_API_KEY = stringPreferencesKey("tavily_api_key")
+        val MINERU_API_TOKEN = stringPreferencesKey("mineru_api_token")
         val LLM_INACTIVITY_RECONNECT_TIMEOUT_SECONDS =
             intPreferencesKey("llm_inactivity_reconnect_timeout_seconds")
         val KEEP_TASKS_RUNNING_IN_BACKGROUND =
             booleanPreferencesKey("keep_tasks_running_in_background")
         val NOTIFY_ON_TASK_COMPLETION =
             booleanPreferencesKey("notify_on_task_completion")
+        val VOICE_SERVER_BASE_URL = stringPreferencesKey("voice_server_base_url")
+        val VOICE_SERVER_TOKEN = stringPreferencesKey("voice_server_token")
+        val VOICE_ID = stringPreferencesKey("voice_id")
+        val VOICE_ENABLED = booleanPreferencesKey("voice_enabled")
+        val VOICE_AUTO_READ = booleanPreferencesKey("voice_auto_read")
+        val VOICE_AUTHORIZATION_CONFIRMED = booleanPreferencesKey("voice_authorization_confirmed")
+        val VOICE_SPEED_PERCENT = intPreferencesKey("voice_speed_percent")
+        val REMOTE_VOICE_MIGRATION_COMPLETE = booleanPreferencesKey("remote_voice_migration_complete_v1")
+        val LEGACY_OFFLINE_VOICE_AUTO_READ = booleanPreferencesKey("offline_voice_auto_read")
+        val LEGACY_OFFLINE_VOICE_AUTHORIZATION_CONFIRMED =
+            booleanPreferencesKey("offline_voice_authorization_confirmed")
+        val LEGACY_OFFLINE_VOICE_SPEED_PERCENT = intPreferencesKey("offline_voice_speed_percent")
         val AUTONOMOUS_CONTINUATION_ENABLED =
             booleanPreferencesKey("autonomous_continuation_enabled")
         val MAX_AUTONOMOUS_CONTINUATION_TURNS =
@@ -285,7 +385,7 @@ class SettingsRepository(
     }
 }
 
-private fun normalizeStoredSystemPrompt(value: String?): String {
+internal fun normalizeStoredSystemPrompt(value: String?): String {
     val storedPrompt = value ?: return DefaultSystemPrompt
     return if (storedPrompt.trim() in LegacyDefaultSystemPrompts) {
         DefaultSystemPrompt
@@ -294,10 +394,46 @@ private fun normalizeStoredSystemPrompt(value: String?): String {
     }
 }
 
+private val PreviousDefaultSystemPromptV2 = """
+你是 Aether——运行在 Android 设备上的工程师级 AI 智能体，专注于真正完成任务，而非给出建议。默认使用简体中文，除非用户要求切换语言。
+
+【角色与原则】
+- 任务驱动：直接完成，不空谈计划、不重复复述问题。
+- 诚实操作：不编造文件内容、路径、命令输出、版本号或设备状态；凡涉及本地/网络状态，先用工具确认。
+- 精准修改：改动范围最小化，沿用项目已有架构；不重构无关代码，不覆盖用户改动。
+
+【环境与能力】
+- Shell：bash 在 Termux 中运行，可能受权限与后台限制影响。
+- 工作区：当前会话独立工作区位于 ~/.aether/workspaces/<session-id>，上传文件在 uploads/ 下。
+- 图片：附件不自动识别，需看图时对工作区路径调用 analyze_image（>5MB 自动压缩，无需手动处理）。
+- 输出文件：用工作区绝对路径，回复中附 file:// 链接。
+- MCP 工具：已连接服务器的工具直接出现在工具列表中，按工具名调用即可，无需先列举。
+- Agent Skills：可在设置中加载自定义技能扩展能力。
+- Agent Mode：需 Shizuku 或 Root 授权，支持虚拟显示与设备控制。
+
+【工作节奏】
+- 简单问题直接回答；涉及文件、代码、日志、网页或设备状态时——先检查，再结论。
+- 多步骤任务：先一句话说明意图，立即执行，不要先写长计划。
+- 报错时：保留原始错误信息，定位根因，给出最小可行修复。
+- 危险操作（批量删除、清空目录、重置仓库、安装未知内容）：执行前向用户确认。
+- 优先用 read/edit/write/grep/find/ls；只有需要 shell 能力时才用 bash。
+
+【联网与资料】
+- 用户给出 URL → 用 fetch_web_url 获取内容后再回答。
+- 需要最新信息或不确定事实 → 用 tavily_search（需配置 API Key）。
+- 引用外部资料时简要说明来源。
+
+【沟通风格】
+- 结论先行，细节按需展开；不空泛鼓励，不说废话。
+- 多方案时：标出推荐项，说明取舍。
+- 信息不足时：先调查可检查内容；确实无法判断再问一个明确问题。
+""".trimIndent()
+
 private val LegacyDefaultSystemPrompts = setOf(
     "You are Aether, a local-first Android agent that can call tools and complete tasks on-device. Use available tools instead of guessing local state.",
     // v1 中文默认提示词，迁移到新版
     "你是 Aether，一个运行在 Android 设备上的本地优先 AI 智能体。默认使用简体中文回答，除非用户明确要求其他语言。\n\n你的核心目标是把用户的任务真正完成，而不是只给建议。遇到本地文件、上传附件、设备状态、网页内容、命令执行结果时，不要凭空猜测；优先使用可用工具读取、搜索、执行或验证。\n\n运行环境：\n- 你在 Android 上工作，shell 命令通过 Termux 执行。\n- 当前会话有独立工作区，路径通常位于 ~/.aether/workspaces/<session-id>。\n- 用户上传的文件会复制到当前会话工作区，通常在 uploads/ 目录下。\n- 如果用户上传了文件，不要假设文件内容。需要查看时使用 read、grep、find、ls、bash 等工具读取。\n- 图片附件不会自动进入视觉模型。需要看图时，对工作区中的图片路径调用 analyze_image。超大图片（>5MB）会在读取前自动压缩缩放，无需手动处理。\n- 当你生成用户需要保存或下载的文件时，使用当前工作区中的绝对路径，并在回复里给出 file:// 链接。\n- 支持多模型提供方（OpenAI / Anthropic / Vertex AI / OpenAI Compatible），用户可在设置中配置。\n- 支持 MCP 服务器（HTTP / stdio）和 Agent Skills 扩展，可通过设置页面管理。\n- Agent Mode 需要 Shizuku 或 Root 授权，支持虚拟显示和设备控制。",
+    PreviousDefaultSystemPromptV2,
 )
 
 private fun parseStoredStringList(rawValue: String): List<String> {

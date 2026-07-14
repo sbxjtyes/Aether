@@ -51,12 +51,35 @@ data class PersistedChatState(
  * 兼容旧版：首次加载若发现旧的 DataStore 整包数据，会迁移到新的文件存储，并保留旧数据作为备份（不删除），
  * 以避免任何迁移异常导致历史会话丢失。
  */
-class ChatRepository(
-    private val context: Context,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO),
+class ChatRepository private constructor(
+    private val context: Context?,
+    private val scope: CoroutineScope,
+    private val storeDirectoryOverride: File?,
+    private val legacyStateLoader: (suspend () -> PersistedChatState)?,
 ) {
+    constructor(
+        context: Context,
+        scope: CoroutineScope = CoroutineScope(Dispatchers.IO),
+    ) : this(
+        context = context,
+        scope = scope,
+        storeDirectoryOverride = null,
+        legacyStateLoader = null,
+    )
+
+    internal constructor(
+        storeDirectory: File,
+        scope: CoroutineScope,
+        legacyStateLoader: suspend () -> PersistedChatState = { PersistedChatState() },
+    ) : this(
+        context = null,
+        scope = scope,
+        storeDirectoryOverride = storeDirectory,
+        legacyStateLoader = legacyStateLoader,
+    )
+
     private val storeDirectory: File by lazy {
-        File(context.filesDir, ChatStoreDirectoryName).apply { mkdirs() }
+        (storeDirectoryOverride ?: File(requireNotNull(context).filesDir, ChatStoreDirectoryName)).apply { mkdirs() }
     }
     private val ioMutex = Mutex()
     private val lastWrittenSessionJson = mutableMapOf<String, String>()
@@ -68,8 +91,9 @@ class ChatRepository(
 
     init {
         scope.launch {
-            val initial = ioMutex.withLock { ensureLoadedLocked() }
-            _chatState.value = initial
+            ioMutex.withLock {
+                _chatState.value = ensureLoadedLocked()
+            }
         }
     }
 
@@ -80,8 +104,11 @@ class ChatRepository(
         ioMutex.withLock {
             ensureLoadedLocked()
             writeSessionsIncrementallyLocked(sessions, currentSessionId)
+            // Publish while still holding the same lock as the disk write. Publishing after unlock
+            // allows an older writer (or the initial load) to be pre-empted and then overwrite a
+            // newer in-memory state even though the newer state is already on disk.
+            _chatState.value = PersistedChatState(sessions = sessions, currentSessionId = currentSessionId)
         }
-        _chatState.value = PersistedChatState(sessions = sessions, currentSessionId = currentSessionId)
     }
 
     /** 确保已从磁盘加载（含旧数据迁移）。返回当前持久化状态。须在持有 ioMutex 时调用。 */
@@ -97,6 +124,10 @@ class ChatRepository(
     private fun readStateFromDiskLocked(): PersistedChatState {
         val index = readIndex()
         val sessionsById = mutableMapOf<String, ChatSession>()
+        // This map is a cache of what is verifiably present on disk, not a history of successful
+        // writes. Keeping stale entries makes an unchanged save skip repairing a deleted/corrupt
+        // session file.
+        lastWrittenSessionJson.clear()
         storeDirectory.listFiles()?.forEach { file ->
             if (!file.name.startsWith(SessionFilePrefix) || !file.name.endsWith(SessionFileSuffix)) return@forEach
             val content = runCatching { file.readText() }.getOrNull().orEmpty()
@@ -132,7 +163,10 @@ class ChatRepository(
         // 删除已不存在的会话文件。
         val removedIds = lastWrittenSessionJson.keys - incomingIds
         removedIds.forEach { id ->
-            runCatching { sessionFile(id).delete() }
+            val file = sessionFile(id)
+            check(!file.exists() || file.delete()) {
+                "Unable to delete removed chat session: ${file.name}"
+            }
             lastWrittenSessionJson.remove(id)
         }
         writeIndex(ChatIndex(order = sessions.map { it.id }, currentSessionId = currentSessionId))
@@ -163,8 +197,9 @@ class ChatRepository(
     private suspend fun migrateFromLegacyDataStoreIfNeededLocked() {
         if (indexFile().exists()) return
         val legacy = runCatching {
-            withContext(Dispatchers.IO) {
-                val preferences = context.chatDataStore.data.first()
+            legacyStateLoader?.invoke() ?: withContext(Dispatchers.IO) {
+                val appContext = requireNotNull(context)
+                val preferences = appContext.chatDataStore.data.first()
                 val sessions = parseChatSessions(preferences[SESSIONS_JSON].orEmpty())
                 val currentSessionId = preferences[CURRENT_SESSION_ID] ?: DraftSessionId
                 PersistedChatState(sessions = sessions, currentSessionId = currentSessionId)
@@ -180,15 +215,7 @@ class ChatRepository(
     private fun indexFile(): File = File(storeDirectory, IndexFileName)
 
     private fun writeFileAtomically(target: File, content: String) {
-        runCatching {
-            val tmp = File(target.parentFile, "${target.name}.tmp")
-            tmp.writeText(content)
-            if (!tmp.renameTo(target)) {
-                // 极少数文件系统 rename 失败时退化为直接写。
-                target.writeText(content)
-                tmp.delete()
-            }
-        }
+        writeTextAtomically(target, content)
     }
 
     private data class ChatIndex(
@@ -234,12 +261,26 @@ internal fun parseChatSessions(rawValue: String): List<ChatSession> {
 internal fun parseChatSessionObject(
     session: JSONObject,
     fallbackIndex: Int = 0,
-): ChatSession = ChatSession(
+): ChatSession {
+    val messages = parseMessages(session.optJSONArray("messages"))
+    val storedTitle = session.optString("title")
+    val placeholderTitle = isPlaceholderSessionTitle(storedTitle)
+    val recoveredTitle = if (placeholderTitle) {
+        messages.firstOrNull { it.author == MessageAuthor.User }
+            ?.summaryText()
+            ?.trim()
+            ?.take(36)
+            .orEmpty()
+            .ifBlank { storedTitle }
+    } else {
+        storedTitle
+    }
+    return ChatSession(
     id = session.optString("id").ifBlank { "session-$fallbackIndex" },
-    title = session.optString("title"),
+    title = recoveredTitle,
     preview = session.optString("preview"),
-    hasCustomTitle = session.optBoolean("hasCustomTitle", false),
-    messages = parseMessages(session.optJSONArray("messages")),
+    hasCustomTitle = session.optBoolean("hasCustomTitle", false) && !placeholderTitle,
+    messages = messages,
     selectedSkillIds = parseStringList(session.optJSONArray("selectedSkillIds")).ifEmpty {
         parseActiveSkillContexts(session.optString("activeSkillsJson")).map { it.skillId }
     },
@@ -262,6 +303,10 @@ internal fun parseChatSessionObject(
     isPinned = session.optBoolean("isPinned", false),
     isArchived = session.optBoolean("isArchived", false),
 )
+}
+
+internal fun isPlaceholderSessionTitle(title: String): Boolean =
+    title.isBlank() || title.trim().equals("New chat", ignoreCase = true)
 
 private fun corruptedChatStateSession(
     rawValue: String,

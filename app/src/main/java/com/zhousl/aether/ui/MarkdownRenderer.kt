@@ -1,6 +1,7 @@
 package com.zhousl.aether.ui
 
 import android.content.Context
+import android.content.ClipData
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.net.Uri
@@ -35,7 +36,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.ClickableText
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
@@ -53,11 +54,14 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.toArgb
@@ -546,7 +550,7 @@ private fun MarkdownCodeFence(
     language: String,
 ) {
     val strings = rememberAetherStrings()
-    val clipboardManager = LocalClipboardManager.current
+    val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
     var copied by remember { mutableStateOf(false) }
 
@@ -595,9 +599,9 @@ private fun MarkdownCodeFence(
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
                     .clickable {
-                        clipboardManager.setText(AnnotatedString(code.text))
-                        copied = true
                         scope.launch {
+                            clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("Aether code", code.text)))
+                            copied = true
                             kotlinx.coroutines.delay(1_600)
                             copied = false
                         }
@@ -853,7 +857,10 @@ private fun MarkdownHtmlBlock(
                     MotionEvent.ACTION_DOWN,
                     MotionEvent.ACTION_MOVE -> view.parent?.requestDisallowInterceptTouchEvent(true)
                     MotionEvent.ACTION_UP,
-                    MotionEvent.ACTION_CANCEL -> view.parent?.requestDisallowInterceptTouchEvent(false)
+                    MotionEvent.ACTION_CANCEL -> {
+                        view.parent?.requestDisallowInterceptTouchEvent(false)
+                        if (event.actionMasked == MotionEvent.ACTION_UP) view.performClick()
+                    }
                 }
             } else {
                 view.parent?.requestDisallowInterceptTouchEvent(false)
@@ -1305,19 +1312,20 @@ private fun MarkdownText(
         return
     }
 
-    ClickableText(
+    var textLayoutResult by remember(text) { mutableStateOf<TextLayoutResult?>(null) }
+    Text(
         text = text,
         style = style.copy(color = color),
-        modifier = modifier,
-    ) { offset ->
-        text.getStringAnnotations(
-            tag = LinkAnnotationTag,
-            start = offset,
-            end = offset,
-        ).firstOrNull()?.let { annotation ->
-            onLinkClick(annotation.item)
-        }
-    }
+        onTextLayout = { textLayoutResult = it },
+        modifier = modifier.pointerInput(text) {
+            detectTapGestures { position ->
+                val offset = textLayoutResult?.getOffsetForPosition(position) ?: return@detectTapGestures
+                text.getStringAnnotations(LinkAnnotationTag, offset, offset)
+                    .firstOrNull()
+                    ?.let { onLinkClick(it.item) }
+            }
+        },
+    )
 }
 
 private sealed interface MarkdownBlock {

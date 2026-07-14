@@ -3,15 +3,32 @@ package com.zhousl.aether.data
 import android.content.Context
 import android.net.Uri
 import androidx.core.content.FileProvider
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.Locale
+import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONObject
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 private const val GithubLatestReleaseUrl =
     "https://api.github.com/repos/sbxjtyes/Aether/releases/latest"
 private const val ApkMimeType = "application/vnd.android.package-archive"
+internal const val MaxUpdateMetadataBytes = 1 * 1024 * 1024
+internal const val MaxUpdateApkBytes = 512L * 1024L * 1024L
 
 data class AppUpdateRelease(
     val versionName: String,
@@ -24,20 +41,35 @@ data class AppUpdateRelease(
 class AppUpdateManager(
     private val context: Context,
     private val client: OkHttpClient = OkHttpClient(),
+    private val latestReleaseUrl: String = GithubLatestReleaseUrl,
 ) {
+    private val updatesDirectory = File(context.cacheDir, "updates").apply {
+        mkdirs()
+        pruneUpdateCache(this)
+    }
+
     suspend fun fetchLatestRelease(): AppUpdateRelease {
         val request = Request.Builder()
-            .url(GithubLatestReleaseUrl)
+            .url(latestReleaseUrl)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", "Aether-Android")
             .build()
 
-        client.newCall(request).execute().use { response ->
+        return client.newCall(request).executeCancellable { response, ensureActive ->
             if (!response.isSuccessful) {
                 error("GitHub returned HTTP ${response.code}")
             }
-            val body = response.body?.string().orEmpty()
+            val responseBody = response.body ?: error("GitHub returned an empty response.")
+            val body = responseBody.byteStream().use { input ->
+                readUtf8WithLimit(
+                    input = input,
+                    declaredLength = responseBody.contentLength(),
+                    maxBytes = MaxUpdateMetadataBytes,
+                    tooLargeMessage = "GitHub release metadata is too large.",
+                    ensureActive = ensureActive,
+                )
+            }
             val releaseJson = JSONObject(body)
             val tagName = releaseJson.optString("tag_name").trim()
             val versionName = tagName.versionCore().ifBlank {
@@ -62,7 +94,7 @@ class AppUpdateManager(
                 }
                 ?: error("Latest release does not include an APK asset.")
 
-            return AppUpdateRelease(
+            AppUpdateRelease(
                 versionName = versionName,
                 tagName = tagName.ifBlank { versionName },
                 releaseUrl = releaseJson.optString("html_url").trim(),
@@ -86,33 +118,38 @@ class AppUpdateManager(
             .header("User-Agent", "Aether-Android")
             .build()
 
-        val updatesDirectory = File(context.cacheDir, "updates").apply { mkdirs() }
         val outputFile = File(updatesDirectory, release.apkFileName.sanitizeFileName())
+        val partialFile = File(updatesDirectory, ".${outputFile.name}.${UUID.randomUUID()}.part")
+        pruneUpdateCache(updatesDirectory, keepFile = outputFile, deletePartialFiles = false)
 
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                error("Download failed with HTTP ${response.code}")
-            }
-            val body = response.body ?: error("Download returned an empty response.")
-            val contentLength = body.contentLength()
-            body.byteStream().use { input ->
-                outputFile.outputStream().use { output ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    var totalBytes = 0L
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        output.write(buffer, 0, read)
-                        totalBytes += read
-                        onProgress(
-                            if (contentLength > 0) {
-                                (totalBytes.toFloat() / contentLength.toFloat()).coerceIn(0f, 1f)
-                            } else {
-                                null
-                            }
+        client.newCall(request).executeCancellable { response, ensureActive ->
+            try {
+                if (!response.isSuccessful) {
+                    error("Download failed with HTTP ${response.code}")
+                }
+                val body = response.body ?: error("Download returned an empty response.")
+                val contentLength = body.contentLength()
+                if (contentLength > MaxUpdateApkBytes) {
+                    error("Update APK exceeds the 512 MB download limit.")
+                }
+                body.byteStream().use { input ->
+                    partialFile.outputStream().buffered().use { output ->
+                        copyWithLimit(
+                            input = input,
+                            output = output,
+                            declaredLength = contentLength,
+                            maxBytes = MaxUpdateApkBytes,
+                            tooLargeMessage = "Update APK exceeds the 512 MB download limit.",
+                            ensureActive = ensureActive,
+                            onProgress = onProgress,
                         )
                     }
                 }
+                ensureActive()
+                replaceFile(partialFile, outputFile)
+                pruneUpdateCache(updatesDirectory, keepFile = outputFile, deletePartialFiles = false)
+            } finally {
+                partialFile.delete()
             }
         }
 
@@ -120,6 +157,131 @@ class AppUpdateManager(
             context,
             "${context.packageName}.fileprovider",
             outputFile,
+        )
+    }
+}
+
+/**
+ * Bounds the private update cache to one completed APK and removes partial downloads left behind
+ * when the process was killed before [downloadApk]'s `finally` block could run.
+ */
+internal fun pruneUpdateCache(
+    directory: File,
+    keepFile: File? = null,
+    deletePartialFiles: Boolean = true,
+) {
+    val canonicalKeep = keepFile?.absoluteFile
+    val completedApks = directory.listFiles()
+        ?.filter { file -> file.isFile && file.extension.equals("apk", ignoreCase = true) }
+        .orEmpty()
+        .sortedWith(
+            compareByDescending<File> { file -> file.absoluteFile == canonicalKeep }
+                .thenByDescending(File::lastModified),
+        )
+
+    if (deletePartialFiles) {
+        directory.listFiles()
+            ?.filter { file -> file.isFile && file.name.endsWith(".part", ignoreCase = true) }
+            ?.forEach(File::delete)
+    }
+
+    completedApks.drop(1).forEach(File::delete)
+}
+
+private suspend fun <T> Call.executeCancellable(
+    transform: (Response, ensureActive: () -> Unit) -> T,
+): T = suspendCancellableCoroutine { continuation ->
+    continuation.invokeOnCancellation { cancel() }
+    enqueue(
+        object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (continuation.isActive) continuation.resumeWithException(e)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    val result = runCatching {
+                        transform(it) {
+                            if (!continuation.isActive) {
+                                throw CancellationException("Update request was cancelled.")
+                            }
+                        }
+                    }
+                    if (!continuation.isActive) return
+                    result.fold(
+                        onSuccess = continuation::resume,
+                        onFailure = continuation::resumeWithException,
+                    )
+                }
+            }
+        },
+    )
+}
+
+internal fun readUtf8WithLimit(
+    input: InputStream,
+    declaredLength: Long,
+    maxBytes: Int,
+    tooLargeMessage: String,
+    ensureActive: () -> Unit = {},
+): String {
+    val output = ByteArrayOutputStream(minOf(maxBytes, 64 * 1024))
+    copyWithLimit(
+        input = input,
+        output = output,
+        declaredLength = declaredLength,
+        maxBytes = maxBytes.toLong(),
+        tooLargeMessage = tooLargeMessage,
+        ensureActive = ensureActive,
+    )
+    return output.toString(Charsets.UTF_8.name())
+}
+
+internal fun copyWithLimit(
+    input: InputStream,
+    output: OutputStream,
+    declaredLength: Long,
+    maxBytes: Long,
+    tooLargeMessage: String,
+    ensureActive: () -> Unit = {},
+    onProgress: (Float?) -> Unit = {},
+): Long {
+    require(maxBytes > 0) { "maxBytes must be positive." }
+    if (declaredLength > maxBytes) error(tooLargeMessage)
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    var totalBytes = 0L
+    while (true) {
+        ensureActive()
+        val read = input.read(buffer)
+        if (read < 0) break
+        totalBytes += read.toLong()
+        if (totalBytes > maxBytes) error(tooLargeMessage)
+        output.write(buffer, 0, read)
+        onProgress(
+            if (declaredLength > 0) {
+                (totalBytes.toDouble() / declaredLength.toDouble()).toFloat().coerceIn(0f, 1f)
+            } else {
+                null
+            },
+        )
+    }
+    return totalBytes
+}
+
+private fun replaceFile(source: File, destination: File) {
+    destination.parentFile?.mkdirs()
+    try {
+        Files.move(
+            source.toPath(),
+            destination.toPath(),
+            StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+    } catch (_: AtomicMoveNotSupportedException) {
+        Files.move(
+            source.toPath(),
+            destination.toPath(),
+            StandardCopyOption.REPLACE_EXISTING,
         )
     }
 }

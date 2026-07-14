@@ -1732,7 +1732,11 @@ internal fun ChatSession.toTaskWorkbenchSnapshot(
     val hasLoopSignal = executionState?.loopState
         ?.let { agentLoopStatusText(it, language) } != null
     val hasTaskState = !taskState.isEmpty
-    val hasTaskSignal = hasTaskState || isRunning || hasPendingInputs || hasLoopSignal || isUnviewedComplete
+    // The workbench is also the recovery surface for completed and archived conversations.
+    // Keep ordinary conversations after their one-shot completion notification is cleared.
+    val hasConversationContent = messages.isNotEmpty()
+    val hasTaskSignal = hasTaskState || isRunning || hasPendingInputs || hasLoopSignal ||
+        isUnviewedComplete || hasConversationContent
     if (!hasTaskSignal) return null
 
     val effectiveStatus = when {
@@ -1740,7 +1744,7 @@ internal fun ChatSession.toTaskWorkbenchSnapshot(
         taskState.status != AgentTaskStatus.Idle -> taskState.status
         hasPendingInputs -> AgentTaskStatus.WaitingForUser
         hasLoopSignal -> AgentTaskStatus.WaitingForUser
-        isUnviewedComplete -> AgentTaskStatus.Completed
+        isUnviewedComplete || hasConversationContent -> AgentTaskStatus.Completed
         else -> AgentTaskStatus.Idle
     }
     val conversationLabel = title.ifBlank {

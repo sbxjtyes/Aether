@@ -13,6 +13,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -31,6 +32,125 @@ private const val MaxSkillArchiveBytes = 32L * 1024L * 1024L
 private const val MaxSkillExtractedBytes = 128L * 1024L * 1024L
 private const val MaxSkillEntryBytes = 16L * 1024L * 1024L
 private const val MaxSkillZipEntries = 4096
+
+internal fun requireSafeSkillDocumentName(rawName: String): String {
+    val name = rawName.trim()
+    require(
+        name.isNotEmpty() &&
+            name != "." &&
+            name != ".." &&
+            '/' !in name &&
+            '\\' !in name &&
+            '\u0000' !in name &&
+            !File(name).isAbsolute
+    ) { "Skill entry name must be a single safe file name." }
+    return name
+}
+
+internal fun normalizeSkillRelativePath(
+    rawPath: String,
+    allowTrailingSlash: Boolean = false,
+): String {
+    val path = rawPath.replace('\\', '/')
+    val normalized = if (allowTrailingSlash) path.trimEnd('/') else path
+    val segments = normalized.split('/')
+    require(
+        normalized.isNotBlank() &&
+            !path.startsWith('/') &&
+            !Regex("^[A-Za-z]:/").containsMatchIn(path) &&
+            segments.none { it.isBlank() || it == "." || it == ".." || '\u0000' in it } &&
+            !File(normalized).isAbsolute
+    ) { "Skill path must stay inside the skill directory." }
+    return normalized
+}
+
+internal fun resolveConfinedSkillPath(root: File, relativePath: String): File {
+    val canonicalRoot = root.canonicalFile
+    val candidate = File(canonicalRoot, relativePath).canonicalFile
+    require(candidate != canonicalRoot && candidate.toPath().startsWith(canonicalRoot.toPath())) {
+        "Skill path escaped the destination directory."
+    }
+    return candidate
+}
+
+internal suspend fun <T> replaceSkillDirectoryTransaction(
+    stagingRoot: File,
+    installRoot: File,
+    afterReplace: suspend () -> T,
+): T {
+    val parent = installRoot.parentFile?.canonicalFile ?: error("Skill install directory has no parent.")
+    require(stagingRoot.parentFile?.canonicalFile == parent && stagingRoot.isDirectory) {
+        "Skill staging and install directories must be sibling directories."
+    }
+    val backupRoot = File(parent, ".backup-${installRoot.name}-${UUID.randomUUID()}")
+    var movedExisting = false
+    var movedStaging = false
+    try {
+        if (installRoot.exists()) {
+            require(installRoot.renameTo(backupRoot)) { "Couldn't preserve the existing skill installation." }
+            movedExisting = true
+        }
+        require(stagingRoot.renameTo(installRoot)) { "Couldn't commit the staged skill installation." }
+        movedStaging = true
+        val result = afterReplace()
+        if (movedExisting) backupRoot.deleteRecursively()
+        return result
+    } catch (failure: Throwable) {
+        withContext(NonCancellable) {
+            runCatching {
+                if (movedStaging && installRoot.exists()) {
+                    require(installRoot.deleteRecursively()) { "Couldn't remove the failed skill installation." }
+                }
+                if (movedExisting) {
+                    require(backupRoot.renameTo(installRoot)) { "Couldn't restore the previous skill installation." }
+                }
+            }.exceptionOrNull()?.let(failure::addSuppressed)
+        }
+        throw failure
+    }
+}
+
+internal suspend fun <T> removeSkillDirectoryTransaction(
+    installRoot: File,
+    afterMove: suspend () -> T,
+): T {
+    val parent = installRoot.parentFile?.canonicalFile ?: error("Skill install directory has no parent.")
+    val quarantineRoot = File(parent, ".removing-${installRoot.name}-${UUID.randomUUID()}")
+    require(installRoot.renameTo(quarantineRoot)) { "Couldn't stage the skill for removal." }
+    try {
+        val result = afterMove()
+        quarantineRoot.deleteRecursively()
+        return result
+    } catch (failure: Throwable) {
+        withContext(NonCancellable) {
+            runCatching {
+                require(quarantineRoot.renameTo(installRoot)) { "Couldn't restore the skill after removal failed." }
+            }.exceptionOrNull()?.let(failure::addSuppressed)
+        }
+        throw failure
+    }
+}
+
+private class SkillImportBudget {
+    private var entries = 0
+    private var bytes = 0L
+
+    fun recordEntry() {
+        entries += 1
+        require(entries <= MaxSkillZipEntries) { "Skill folder contains too many entries." }
+    }
+
+    fun requireCapacity(additionalBytes: Long) {
+        require(additionalBytes >= 0L && bytes <= MaxSkillExtractedBytes - additionalBytes) {
+            "Skill folder contains too much data."
+        }
+    }
+
+    fun recordBytes(count: Long) {
+        requireCapacity(count)
+        bytes += count
+    }
+}
 
 class AgentSkillManager(
     private val context: Context,
@@ -124,8 +244,14 @@ class AgentSkillManager(
                 .installedSkills
                 .firstOrNull { it.id == skillId }
                 ?: return@runCatching
-            validatedInstalledSkillRoot(skill)?.deleteRecursively()
-            extensionsRepository.removeInstalledSkill(skillId)
+            val root = validatedInstalledSkillRoot(skill)
+            if (root == null) {
+                extensionsRepository.removeInstalledSkill(skillId)
+            } else {
+                removeSkillDirectoryTransaction(root) {
+                    extensionsRepository.removeInstalledSkill(skillId)
+                }
+            }
         }
     }
 
@@ -181,36 +307,39 @@ class AgentSkillManager(
         require(skillFile.isFile) { "The selected directory does not contain SKILL.md." }
         val parsed = parseSkillDocument(skillFile)
         val skillId = buildSkillId(parsed.name)
-        val installRoot = File(installedSkillsDirectory(), skillId)
-        val stagingRoot = File(context.filesDir, SkillTempDirectoryName)
-            .apply { mkdirs() }
-            .resolve("$skillId-${UUID.randomUUID()}")
-            .apply { mkdirs() }
-        sourceRoot.copyRecursively(stagingRoot, overwrite = true)
-        val checksum = sha256OfDirectory(stagingRoot)
-        installRoot.deleteRecursively()
-        if (!stagingRoot.renameTo(installRoot)) {
-            stagingRoot.copyRecursively(installRoot, overwrite = true)
+        val storageRoot = installedSkillsDirectory()
+        val installRoot = File(storageRoot, skillId)
+        val stagingRoot = File(storageRoot, ".staging-$skillId-${UUID.randomUUID()}")
+        require(stagingRoot.mkdir()) { "Couldn't create the skill staging directory." }
+        try {
+            sourceRoot.copyRecursively(stagingRoot, overwrite = false)
+            val checksum = sha256OfDirectory(stagingRoot)
+            return replaceSkillDirectoryTransaction(
+                stagingRoot = stagingRoot,
+                installRoot = installRoot,
+            ) {
+                val installedSkill = InstalledSkill(
+                    id = skillId,
+                    name = parsed.name,
+                    description = parsed.description,
+                    actionLabel = generateQuickActionLabel(parsed.name, parsed.description),
+                    license = parsed.license,
+                    compatibility = parsed.compatibility,
+                    metadataJson = parsed.metadataJson,
+                    allowedTools = parsed.allowedTools,
+                    skillRootPath = installRoot.absolutePath,
+                    skillMdPath = File(installRoot, SkillFileName).absolutePath,
+                    source = source,
+                    checksumSha256 = checksum,
+                    diagnostics = parsed.diagnostics,
+                    resourceEntries = listSkillResources(installRoot),
+                )
+                extensionsRepository.upsertInstalledSkill(installedSkill)
+                installedSkill
+            }
+        } finally {
             stagingRoot.deleteRecursively()
         }
-        val installedSkill = InstalledSkill(
-            id = skillId,
-            name = parsed.name,
-            description = parsed.description,
-            actionLabel = generateQuickActionLabel(parsed.name, parsed.description),
-            license = parsed.license,
-            compatibility = parsed.compatibility,
-            metadataJson = parsed.metadataJson,
-            allowedTools = parsed.allowedTools,
-            skillRootPath = installRoot.absolutePath,
-            skillMdPath = File(installRoot, SkillFileName).absolutePath,
-            source = source,
-            checksumSha256 = checksum,
-            diagnostics = parsed.diagnostics,
-            resourceEntries = listSkillResources(installRoot),
-        )
-        extensionsRepository.upsertInstalledSkill(installedSkill)
-        return installedSkill
     }
 
     private fun locateSkillRoot(
@@ -370,27 +499,69 @@ class AgentSkillManager(
     ): File {
         val rootDocument = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, treeUri)
             ?: error("Couldn't open the selected folder.")
-        val targetRoot = destinationRoot.resolve(rootDocument.name ?: "imported-skill")
-        copyDocumentRecursively(rootDocument, targetRoot)
+        val rootName = requireSafeSkillDocumentName(rootDocument.name ?: "imported-skill")
+        val targetRoot = resolveConfinedSkillPath(destinationRoot, rootName)
+        copyDocumentRecursively(
+            document = rootDocument,
+            destination = targetRoot,
+            budget = SkillImportBudget(),
+            visitedDirectories = mutableSetOf(),
+        )
         return targetRoot
     }
 
     private fun copyDocumentRecursively(
         document: androidx.documentfile.provider.DocumentFile,
         destination: File,
+        budget: SkillImportBudget,
+        visitedDirectories: MutableSet<String>,
     ) {
+        budget.recordEntry()
         if (document.isDirectory) {
-            destination.mkdirs()
+            require(visitedDirectories.add(document.uri.toString())) {
+                "The selected folder contains a repeated or cyclic directory reference."
+            }
+            require(destination.mkdir()) { "Couldn't create imported skill directory ${destination.name}." }
+            val childNames = mutableSetOf<String>()
             document.listFiles().forEach { child ->
-                copyDocumentRecursively(child, destination.resolve(child.name ?: child.uri.lastPathSegment ?: "file"))
+                val childName = requireSafeSkillDocumentName(
+                    child.name ?: error("A selected skill entry has no file name."),
+                )
+                require(childNames.add(childName)) {
+                    "The selected folder contains duplicate entry name: $childName"
+                }
+                copyDocumentRecursively(
+                    document = child,
+                    destination = resolveConfinedSkillPath(destination, childName),
+                    budget = budget,
+                    visitedDirectories = visitedDirectories,
+                )
             }
             return
         }
 
-        destination.parentFile?.mkdirs()
+        val declaredLength = document.length()
+        if (declaredLength > 0L) {
+            require(declaredLength <= MaxSkillEntryBytes) {
+                "Skill file is too large: ${destination.name}"
+            }
+            budget.requireCapacity(declaredLength)
+        }
         context.contentResolver.openInputStream(document.uri)?.use { input ->
             FileOutputStream(destination).use { output ->
-                input.copyTo(output)
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                var entryBytes = 0L
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    entryBytes += read.toLong()
+                    require(entryBytes <= MaxSkillEntryBytes) {
+                        "Skill file is too large: ${destination.name}"
+                    }
+                    budget.requireCapacity(read.toLong())
+                    output.write(buffer, 0, read)
+                    budget.recordBytes(read.toLong())
+                }
             }
         } ?: error("Couldn't read ${document.uri}.")
     }
@@ -409,7 +580,11 @@ class AgentSkillManager(
                 require(entryCount <= MaxSkillZipEntries) {
                     "Skill archive contains too many files."
                 }
-                val output = destinationRoot.resolve(entry.name)
+                val relativePath = normalizeSkillRelativePath(
+                    rawPath = entry.name,
+                    allowTrailingSlash = entry.isDirectory,
+                )
+                val output = resolveConfinedSkillPath(destinationRoot, relativePath)
                 val canonicalOutput = output.canonicalPath
                 require(canonicalOutput.startsWith(canonicalRoot)) {
                     "Zip entry escaped the destination directory: ${entry.name}"
@@ -565,7 +740,7 @@ class AgentSkillManager(
                     "Skill bundle contains too many files."
                 }
                 val fileJson = files.optJSONObject(index) ?: continue
-                val relativePath = normalizeBundleRelativePath(fileJson.optString("path"))
+                val relativePath = normalizeSkillRelativePath(fileJson.optString("path"))
                 val data = Base64.decode(fileJson.optString("dataBase64"), Base64.DEFAULT)
                 require(data.size.toLong() <= MaxSkillEntryBytes) {
                     "Skill file is too large: $relativePath"
@@ -616,19 +791,6 @@ class AgentSkillManager(
         val actual = runCatching { File(skill.skillMdPath).canonicalFile }.getOrNull() ?: return null
         if (actual != expected || !actual.isFile) return null
         return actual
-    }
-
-    private fun normalizeBundleRelativePath(rawPath: String): String {
-        val normalizedPath = rawPath.replace('\\', '/').trim('/')
-        require(
-            normalizedPath.isNotBlank() &&
-                !normalizedPath.startsWith("../") &&
-                !normalizedPath.contains("/../") &&
-                !File(normalizedPath).isAbsolute
-        ) {
-            "Skill bundle path must stay inside the skill directory."
-        }
-        return normalizedPath
     }
 
     private fun copyZipEntryWithLimits(

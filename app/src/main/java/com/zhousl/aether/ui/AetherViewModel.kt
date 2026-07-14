@@ -55,6 +55,7 @@ import com.zhousl.aether.data.serializeMcpServerConfigs
 import com.zhousl.aether.data.serializeProviderConfigs
 import com.zhousl.aether.data.toJson
 import com.zhousl.aether.data.isProviderSetupValid
+import com.zhousl.aether.data.isPlaceholderSessionTitle
 import com.zhousl.aether.data.isChatToolGroupEnabled
 import com.zhousl.aether.data.isVersionNewer
 import com.zhousl.aether.data.isOnboardingComplete
@@ -70,6 +71,8 @@ import com.zhousl.aether.data.withDerivedMessages
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
 import com.zhousl.aether.util.AetherLog
+import com.zhousl.aether.util.awaitMergedProcessOutput
+import com.zhousl.aether.util.readUtf8TextWithLimit
 import java.net.URI
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
@@ -91,6 +94,8 @@ import java.util.concurrent.TimeUnit
 private const val FollowUpTourAutoOpenDelayMillis = 2_500L
 private const val AppUpdateCheckIntervalMillis = 3L * 24L * 60L * 60L * 1000L
 private const val LogcatReadTimeoutSeconds = 4L
+private const val MaxLogcatOutputBytes = 2 * 1024 * 1024
+private const val CurrentAppExportSchemaVersion = 2
 private const val AetherViewModelLogTag = "AetherViewModel"
 private const val SessionTitleSystemPrompt =
     "Generate a concise chat title for this conversation. Return only the title, in the user's language when possible, with no quotes, no emoji, and at most 6 words."
@@ -99,17 +104,161 @@ internal fun mergeVoiceTranscriptDraft(
     currentDraft: String,
     transcript: String,
     language: AppLanguage,
-): String {
-    val trimmedTranscript = transcript.trim()
-    if (trimmedTranscript.isBlank()) return currentDraft
+): String = insertVoiceTranscriptDraft(
+    currentDraft = currentDraft,
+    transcript = transcript,
+    selectionStart = currentDraft.length,
+    selectionEnd = currentDraft.length,
+    language = language,
+).text
 
-    if (currentDraft.isBlank()) return trimmedTranscript
+internal data class VoiceDraftInsertion(
+    val text: String,
+    val cursor: Int,
+)
 
-    val shouldInsertSpace = language != AppLanguage.SimplifiedChinese &&
-        currentDraft.lastOrNull()?.isWhitespace() != true
-    val separator = if (shouldInsertSpace) " " else ""
-    return currentDraft + separator + trimmedTranscript
+internal object VoiceDraftSelectionState {
+    @Volatile var start: Int = 0
+    @Volatile var end: Int = 0
+    @Volatile private var pendingCursor: Int? = null
+
+    fun update(selectionStart: Int, selectionEnd: Int) {
+        start = selectionStart
+        end = selectionEnd
+    }
+
+    fun setPendingCursor(cursor: Int) {
+        pendingCursor = cursor
+    }
+
+    fun consumePendingCursor(fallback: Int): Int =
+        (pendingCursor.also { pendingCursor = null } ?: fallback).coerceIn(0, fallback)
 }
+
+internal fun insertVoiceTranscriptDraft(
+    currentDraft: String,
+    transcript: String,
+    selectionStart: Int,
+    selectionEnd: Int,
+    language: AppLanguage,
+): VoiceDraftInsertion {
+    var spokenText = transcript.trim()
+    val start = minOf(selectionStart, selectionEnd).coerceIn(0, currentDraft.length)
+    val end = maxOf(selectionStart, selectionEnd).coerceIn(0, currentDraft.length)
+    if (spokenText.isBlank()) return VoiceDraftInsertion(currentDraft, end)
+    if (currentDraft.isBlank()) return VoiceDraftInsertion(spokenText, spokenText.length)
+
+    val before = currentDraft.substring(0, start)
+    val after = currentDraft.substring(end)
+    if (start == end && (before.endsWithTranscript(spokenText, language) || after.startsWithTranscript(spokenText, language))) {
+        return VoiceDraftInsertion(currentDraft, start)
+    }
+
+    while (before.lastOrNull()?.isBoundaryPunctuation() == true && before.last() == spokenText.firstOrNull()) {
+        spokenText = spokenText.drop(1).trimStart()
+    }
+    while (after.firstOrNull()?.isBoundaryPunctuation() == true && after.first() == spokenText.lastOrNull()) {
+        spokenText = spokenText.dropLast(1).trimEnd()
+    }
+    if (spokenText.isBlank()) return VoiceDraftInsertion(currentDraft.removeRange(start, end), start)
+
+    val insertSpaceBefore = language != AppLanguage.SimplifiedChinese &&
+        before.isNotEmpty() &&
+        before.last().isWhitespace().not() &&
+        before.last().isOpeningPunctuation().not() &&
+        spokenText.first().isClosingPunctuation().not()
+    val insertSpaceAfter = language != AppLanguage.SimplifiedChinese &&
+        after.isNotEmpty() &&
+        after.first().isWhitespace().not() &&
+        after.first().isClosingPunctuation().not() &&
+        spokenText.last().isOpeningPunctuation().not()
+    val leftSeparator = if (insertSpaceBefore) " " else ""
+    val rightSeparator = if (insertSpaceAfter) " " else ""
+    val inserted = leftSeparator + spokenText
+    return VoiceDraftInsertion(
+        text = before + inserted + rightSeparator + after,
+        cursor = before.length + inserted.length,
+    )
+}
+
+private fun String.endsWithTranscript(transcript: String, language: AppLanguage): Boolean =
+    if (language == AppLanguage.SimplifiedChinese) endsWith(transcript) else endsWith(transcript, ignoreCase = true)
+
+private fun String.startsWithTranscript(transcript: String, language: AppLanguage): Boolean =
+    if (language == AppLanguage.SimplifiedChinese) startsWith(transcript) else startsWith(transcript, ignoreCase = true)
+
+private fun Char.isBoundaryPunctuation(): Boolean = this in ",.;:!?，。；：！？"
+
+private fun Char.isOpeningPunctuation(): Boolean = this in "([{（【《“‘"
+
+private fun Char.isClosingPunctuation(): Boolean = this in ",.;:!?)]}，。；：！？）】》”’"
+
+internal fun validateFullAppImportEnvelope(json: JSONObject) {
+    require(json.optString("exportType") == "app") {
+        "The selected file is not an Aether app data export."
+    }
+    val schemaVersion = json.optInt("schemaVersion", -1)
+    require(schemaVersion in 1..CurrentAppExportSchemaVersion) {
+        if (schemaVersion > CurrentAppExportSchemaVersion) {
+            "This app data export was created by a newer version of Aether."
+        } else {
+            "The app data export has an invalid schema version."
+        }
+    }
+    require(json.optJSONObject("settings") != null) {
+        "The app data export is missing settings."
+    }
+    require(json.optJSONArray("sessions") != null) {
+        "The app data export is missing sessions."
+    }
+}
+
+internal fun preserveAppCredentials(imported: AppSettings, current: AppSettings): AppSettings = imported.copy(
+    apiKey = if (
+        imported.provider == current.provider &&
+        imported.baseUrl.normalizedCredentialTarget() == current.baseUrl.normalizedCredentialTarget()
+    ) current.apiKey else imported.apiKey,
+    tavilyApiKey = current.tavilyApiKey,
+    mineruApiToken = current.mineruApiToken,
+)
+
+internal fun preserveProviderCredentials(
+    imported: List<LlmProviderConfig>,
+    current: List<LlmProviderConfig>,
+): List<LlmProviderConfig> = imported.map { importedConfig ->
+    val existing = current.firstOrNull { it.id == importedConfig.id }
+        ?: current.firstOrNull { it.providerId == importedConfig.providerId }
+    if (
+        existing != null &&
+        existing.providerType == importedConfig.providerType &&
+        existing.baseUrl.normalizedCredentialTarget() == importedConfig.baseUrl.normalizedCredentialTarget()
+    ) importedConfig.copy(apiKey = existing.apiKey) else importedConfig
+}
+
+internal fun preserveMcpCredentials(
+    imported: List<McpServerConfig>,
+    current: List<McpServerConfig>,
+): List<McpServerConfig> = imported.map { importedServer ->
+    val existingTransport = current.firstOrNull { it.id == importedServer.id }?.transport
+    val mergedTransport = when {
+        importedServer.transport is McpTransportConfig.StreamableHttp &&
+            existingTransport is McpTransportConfig.StreamableHttp &&
+            importedServer.transport.url.normalizedCredentialTarget() ==
+                existingTransport.url.normalizedCredentialTarget() ->
+            importedServer.transport.copy(headers = existingTransport.headers)
+
+        importedServer.transport is McpTransportConfig.StdIo &&
+            existingTransport is McpTransportConfig.StdIo &&
+            importedServer.transport.command.trim() == existingTransport.command.trim() &&
+            importedServer.transport.workingDirectory.trim() == existingTransport.workingDirectory.trim() ->
+            importedServer.transport.copy(environment = existingTransport.environment)
+
+        else -> importedServer.transport
+    }
+    importedServer.copy(transport = mergedTransport)
+}
+
+private fun String.normalizedCredentialTarget(): String = trim().trimEnd('/')
 
 internal data class VoiceInputResult(
     val transcript: String = "",
@@ -134,6 +283,120 @@ internal enum class VoiceInputErrorResolution {
     ShowEmptyMessage,
     ShowInterruptedMessage,
 }
+
+internal enum class VoiceRecognitionFailureKind {
+    Network,
+    Audio,
+    NoSpeech,
+    Timeout,
+    Busy,
+    Permission,
+    Language,
+    Service,
+    Client,
+    Unknown,
+}
+
+internal fun classifyVoiceRecognitionError(errorCode: Int): VoiceRecognitionFailureKind = when (errorCode) {
+    1 -> VoiceRecognitionFailureKind.Timeout // SpeechRecognizer.ERROR_NETWORK_TIMEOUT
+    2 -> VoiceRecognitionFailureKind.Network // SpeechRecognizer.ERROR_NETWORK
+    3 -> VoiceRecognitionFailureKind.Audio // SpeechRecognizer.ERROR_AUDIO
+    4, 10, 11 -> VoiceRecognitionFailureKind.Service // server, throttling, disconnected
+    5, 14, 15 -> VoiceRecognitionFailureKind.Client
+    6 -> VoiceRecognitionFailureKind.NoSpeech // SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+    7 -> VoiceRecognitionFailureKind.NoSpeech // SpeechRecognizer.ERROR_NO_MATCH
+    8 -> VoiceRecognitionFailureKind.Busy
+    9 -> VoiceRecognitionFailureKind.Permission
+    12, 13 -> VoiceRecognitionFailureKind.Language
+    else -> VoiceRecognitionFailureKind.Unknown
+}
+
+internal fun nextVoiceInputRestartAttempt(
+    completedAttempts: Int,
+    maxAttempts: Int = 3,
+): Int? {
+    val safeMaximum = maxAttempts.coerceAtLeast(0)
+    val safeCompleted = completedAttempts.coerceAtLeast(0)
+    return (safeCompleted + 1).takeIf { it <= safeMaximum }
+}
+
+internal enum class VoiceRecognitionRetryAction {
+    RestartImmediately,
+    RestartWithBackoff,
+    Stop,
+}
+
+internal data class VoiceRecognitionRetryDecision(
+    val action: VoiceRecognitionRetryAction,
+    val consecutiveFailureCount: Int,
+    val delayMillis: Long = 0L,
+)
+
+internal fun resolveVoiceRecognitionRetry(
+    failureKind: VoiceRecognitionFailureKind,
+    isHolding: Boolean,
+    completedFailures: Int,
+    maxTransientFailures: Int = 3,
+): VoiceRecognitionRetryDecision {
+    if (!isHolding || failureKind == VoiceRecognitionFailureKind.Permission ||
+        failureKind == VoiceRecognitionFailureKind.Language
+    ) {
+        return VoiceRecognitionRetryDecision(
+            action = VoiceRecognitionRetryAction.Stop,
+            consecutiveFailureCount = completedFailures.coerceAtLeast(0),
+        )
+    }
+    if (failureKind == VoiceRecognitionFailureKind.NoSpeech) {
+        return VoiceRecognitionRetryDecision(
+            action = VoiceRecognitionRetryAction.RestartImmediately,
+            consecutiveFailureCount = 0,
+            delayMillis = 120L,
+        )
+    }
+
+    val nextAttempt = nextVoiceInputRestartAttempt(completedFailures, maxTransientFailures)
+        ?: return VoiceRecognitionRetryDecision(
+            action = VoiceRecognitionRetryAction.Stop,
+            consecutiveFailureCount = completedFailures.coerceAtLeast(0),
+        )
+    return VoiceRecognitionRetryDecision(
+        action = VoiceRecognitionRetryAction.RestartWithBackoff,
+        consecutiveFailureCount = nextAttempt,
+        delayMillis = (320L * nextAttempt).coerceAtMost(1_200L),
+    )
+}
+
+internal fun shouldRunVoiceRecognizerWatchdog(
+    watchdogGeneration: Long,
+    currentGeneration: Long,
+    isHolding: Boolean,
+    isCanceled: Boolean,
+    terminalCallbackReceived: Boolean,
+): Boolean = watchdogGeneration == currentGeneration &&
+    isHolding &&
+    !isCanceled &&
+    !terminalCallbackReceived
+
+internal enum class VoiceInputReleaseDecision {
+    AwaitFinalResult,
+    CommitRecoveredTranscript,
+    ShowEmptyMessage,
+}
+
+internal fun resolveVoiceInputReleaseDecision(
+    hasActiveRecognizer: Boolean,
+    finalWaitExpired: Boolean,
+    recoveredTranscript: String,
+): VoiceInputReleaseDecision = when {
+    hasActiveRecognizer && !finalWaitExpired -> VoiceInputReleaseDecision.AwaitFinalResult
+    recoveredTranscript.isNotBlank() -> VoiceInputReleaseDecision.CommitRecoveredTranscript
+    else -> VoiceInputReleaseDecision.ShowEmptyMessage
+}
+
+internal fun shouldCancelVoiceInputDrag(
+    dragDeltaY: Float,
+    thresholdPx: Float,
+): Boolean = thresholdPx > 0f && dragDeltaY.isFinite() && dragDeltaY <= -thresholdPx
 
 internal fun resolveVoiceInputError(
     hasRecoverableTranscript: Boolean,
@@ -202,6 +465,7 @@ internal sealed interface VoiceInputEvent {
     data object PermissionDenied : VoiceInputEvent
     data object StartListening : VoiceInputEvent
     data object ContinueListening : VoiceInputEvent
+    data object SegmentEnded : VoiceInputEvent
     data class LevelChanged(val rmsDb: Float) : VoiceInputEvent
     data class PartialText(val text: String) : VoiceInputEvent
     data class CommitSegment(val text: String, val language: AppLanguage) : VoiceInputEvent
@@ -228,6 +492,11 @@ internal fun reduceVoiceInputState(
         level = 0f,
         errorMessage = "",
         isHolding = true,
+    )
+    VoiceInputEvent.SegmentEnded -> current.copy(
+        status = VoiceInputStatus.Listening,
+        level = 0f,
+        errorMessage = "",
     )
     is VoiceInputEvent.LevelChanged -> current.copy(
         status = VoiceInputStatus.Listening,
@@ -814,12 +1083,16 @@ class AetherViewModel(
         if (transcript.isBlank()) return
         val language = _uiState.value.settings.language
         _uiState.update { current ->
+            val insertion = insertVoiceTranscriptDraft(
+                currentDraft = current.draftInput,
+                transcript = transcript,
+                selectionStart = VoiceDraftSelectionState.start,
+                selectionEnd = VoiceDraftSelectionState.end,
+                language = language,
+            )
+            VoiceDraftSelectionState.setPendingCursor(insertion.cursor)
             current.copy(
-                draftInput = mergeVoiceTranscriptDraft(
-                    currentDraft = current.draftInput,
-                    transcript = transcript,
-                    language = language,
-                ),
+                draftInput = insertion.text,
                 showStarterPromptHint = false,
             )
         }
@@ -1510,6 +1783,7 @@ class AetherViewModel(
                 runCatching {
                     val rawValue = readTextFromUri(sourceUri)
                     val json = JSONObject(rawValue)
+                    validateFullAppImportEnvelope(json)
                     val importedSkills = skillManager.importSkillBundles(json.optJSONArray("skillBundles"))
                     parseFullAppImport(json, importedSkills)
                 }
@@ -1905,6 +2179,7 @@ class AetherViewModel(
         modelId: String,
         systemPrompt: String,
         tavilyApiKey: String,
+        mineruApiToken: String,
         llmInactivityReconnectTimeoutSeconds: Int,
         keepTasksRunningInBackground: Boolean,
         notifyOnTaskCompletion: Boolean,
@@ -1946,6 +2221,7 @@ class AetherViewModel(
                         compatibilitySettings.basicFunctionCallingCompatibilityMode,
                     systemPrompt = systemPrompt,
                     tavilyApiKey = tavilyApiKey.trim(),
+                    mineruApiToken = mineruApiToken.trim(),
                     llmInactivityReconnectTimeoutSeconds =
                         normalizeLlmInactivityReconnectTimeoutSeconds(
                             llmInactivityReconnectTimeoutSeconds
@@ -3069,6 +3345,8 @@ class AetherViewModel(
                 val existingIndex = updatedSessions.indexOfFirst { it.id == targetSessionId }
                 if (existingIndex >= 0) {
                     val existing = updatedSessions.removeAt(existingIndex)
+                    shouldGenerateSessionTitle = !existing.hasCustomTitle &&
+                        isPlaceholderSessionTitle(existing.title)
                     val updated = existing
                         .withMessages(existing.messages + userMessage)
                         .copy(isArchived = false)
@@ -3089,7 +3367,7 @@ class AetherViewModel(
                         id = targetSessionId,
                         messages = listOf(userMessage),
                         title = "New chat",
-                        hasCustomTitle = true,
+                        hasCustomTitle = false,
                         selectedModelKey = current.draftSelectedModelKey.ifBlank {
                             resolveDefaultChatModelKey(current.settings, current.providerConfigs)
                         },
@@ -4623,7 +4901,7 @@ class AetherViewModel(
 
     private fun readTextFromUri(uri: Uri): String =
         getApplication<Application>().contentResolver.openInputStream(uri)?.use { input ->
-            input.readBytes().toString(Charsets.UTF_8)
+            input.readUtf8TextWithLimit(MaxFullAppImportBytes)
         } ?: error("Unable to read the selected file.")
 
     private fun buildDiagnosticLogText(snapshot: AetherUiState): String = buildString {
@@ -4672,12 +4950,18 @@ class AetherViewModel(
         val process = ProcessBuilder(command)
             .redirectErrorStream(true)
             .start()
-        val output = process.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
-            reader.readText()
-        }
-        if (!process.waitFor(LogcatReadTimeoutSeconds, TimeUnit.SECONDS)) {
-            process.destroy()
+        val result = awaitMergedProcessOutput(
+            process = process,
+            timeoutMillis = TimeUnit.SECONDS.toMillis(LogcatReadTimeoutSeconds),
+            maxOutputBytes = MaxLogcatOutputBytes,
+        )
+        if (result.timedOut) {
             return "Logcat command timed out: ${command.joinToString(" ")}"
+        }
+        val output = if (result.truncated) {
+            result.output + "\n[logcat output truncated]"
+        } else {
+            result.output
         }
         return output.ifBlank {
             "Logcat command returned no output: ${command.joinToString(" ")}"
@@ -4686,30 +4970,59 @@ class AetherViewModel(
 
     private fun buildFullAppExportJson(snapshot: AetherUiState): JSONObject =
         JSONObject().apply {
-            put("schemaVersion", 2)
+            put("schemaVersion", CurrentAppExportSchemaVersion)
             put("exportType", "app")
             put("exportedAtMillis", System.currentTimeMillis())
-            put("settings", snapshot.settings.toJson())
-            put("providerConfigs", JSONArray(serializeProviderConfigs(snapshot.providerConfigs)))
+            put("credentialsExcluded", true)
+            put("settings", snapshot.settings.toJson().apply {
+                put("apiKey", "")
+                put("tavilyApiKey", "")
+                put("mineruApiToken", "")
+            })
+            put("providerConfigs", JSONArray(serializeProviderConfigs(snapshot.providerConfigs)).apply {
+                for (index in 0 until length()) optJSONObject(index)?.put("apiKey", "")
+            })
             put("sessions", JSONArray(serializeChatSessions(snapshot.sessions.map { it.copy(activeSkills = emptyList()) })))
             put("currentSessionId", snapshot.currentSessionId)
             put("skillBundles", skillManager.exportSkillBundles(snapshot.installedSkills))
-            put("mcpServers", JSONArray(serializeMcpServerConfigs(snapshot.mcpServers)))
+            put("mcpServers", JSONArray(serializeMcpServerConfigs(snapshot.mcpServers)).apply {
+                for (index in 0 until length()) {
+                    optJSONObject(index)?.apply {
+                        optJSONObject("transport")?.apply {
+                            put("headers", JSONArray())
+                            put("environment", JSONArray())
+                        }
+                    }
+                }
+            })
         }
 
     private fun parseFullAppImport(
         json: JSONObject,
         installedSkills: List<InstalledSkill>,
     ): ImportedAppData {
-        val mcpServers = parseMcpServerConfigs(json.optJSONArray("mcpServers")?.toString().orEmpty())
+        val credentialsExcluded = json.optBoolean("credentialsExcluded", false)
+        val current = _uiState.value
+        val parsedMcpServers = parseMcpServerConfigs(json.optJSONArray("mcpServers")?.toString().orEmpty())
+        val mcpServers = if (credentialsExcluded) {
+            preserveMcpCredentials(parsedMcpServers, current.mcpServers)
+        } else {
+            parsedMcpServers
+        }
+        val parsedSettings = parseImportedSettings(json.optJSONObject("settings"))
+        val parsedProviderConfigs = parseProviderConfigs(json.optJSONArray("providerConfigs")?.toString().orEmpty())
         val sessions = sanitizeImportedSessions(
             sessions = parseChatSessions(json.optJSONArray("sessions")?.toString().orEmpty()),
             installedSkillIds = installedSkills.map { it.id }.toSet(),
             mcpServerIds = mcpServers.map { it.id }.toSet(),
         )
         return ImportedAppData(
-            settings = parseImportedSettings(json.optJSONObject("settings")),
-            providerConfigs = parseProviderConfigs(json.optJSONArray("providerConfigs")?.toString().orEmpty()),
+            settings = if (credentialsExcluded) preserveAppCredentials(parsedSettings, current.settings) else parsedSettings,
+            providerConfigs = if (credentialsExcluded) {
+                preserveProviderCredentials(parsedProviderConfigs, current.providerConfigs)
+            } else {
+                parsedProviderConfigs
+            },
             sessions = sessions,
             currentSessionId = json.optString("currentSessionId")
                 .takeIf { id -> id == DraftSessionId || sessions.any { it.id == id } }
@@ -4739,6 +5052,7 @@ class AetherViewModel(
         put("modelId", modelId)
         put("systemPrompt", systemPrompt)
         put("tavilyApiKey", tavilyApiKey)
+        put("mineruApiToken", mineruApiToken)
         put("llmInactivityReconnectTimeoutSeconds", llmInactivityReconnectTimeoutSeconds)
         put("keepTasksRunningInBackground", keepTasksRunningInBackground)
         put("notifyOnTaskCompletion", notifyOnTaskCompletion)
@@ -4772,6 +5086,7 @@ class AetherViewModel(
             modelId = json.optString("modelId", defaults.modelId),
             systemPrompt = json.optString("systemPrompt", defaults.systemPrompt),
             tavilyApiKey = json.optString("tavilyApiKey", defaults.tavilyApiKey),
+            mineruApiToken = json.optString("mineruApiToken", defaults.mineruApiToken),
             llmInactivityReconnectTimeoutSeconds = normalizeLlmInactivityReconnectTimeoutSeconds(
                 json.optInt(
                     "llmInactivityReconnectTimeoutSeconds",
@@ -4886,4 +5201,8 @@ class AetherViewModel(
         val installedSkills: List<InstalledSkill>,
         val mcpServers: List<McpServerConfig>,
     )
+
+    private companion object {
+        const val MaxFullAppImportBytes = 32 * 1024 * 1024
+    }
 }

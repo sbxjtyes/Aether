@@ -1,9 +1,17 @@
 package com.zhousl.aether.data
 
+import java.io.IOException
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -28,6 +36,8 @@ object LlmApiClient {
                 LlmProvider.VertexExpress -> fetchVertexModels(config)
                 LlmProvider.AnthropicMessages -> fetchAnthropicModels(config)
             }
+        } catch (cancellation: CancellationException) {
+            throw cancellation
         } catch (e: Exception) {
             FetchModelsResult(emptyList(), e.message ?: "Unknown error")
         }
@@ -116,13 +126,54 @@ object LlmApiClient {
 
     private suspend fun executeModelsRequest(request: Request): ModelsHttpResponse =
         executeLlmCallWithTlsFallback(httpClient, request) { client, candidateRequest ->
-            client.newCall(candidateRequest).execute().use { response ->
-                ModelsHttpResponse(
-                    code = response.code,
-                    body = response.body?.string().orEmpty(),
-                )
-            }
+            executeModelsRequestOnce(client, candidateRequest)
         }
+
+    private suspend fun executeModelsRequestOnce(
+        client: OkHttpClient,
+        request: Request,
+    ): ModelsHttpResponse = suspendCancellableCoroutine { continuation ->
+        val call = client.newCall(request)
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(
+            object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (continuation.isActive) continuation.resumeWithException(e)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    response.use {
+                        val result = runCatching {
+                            val body = it.body
+                            ModelsHttpResponse(
+                                code = it.code,
+                                body = if (body == null) {
+                                    ""
+                                } else {
+                                    readUtf8WithLimit(
+                                        input = body.byteStream(),
+                                        declaredLength = body.contentLength(),
+                                        maxBytes = MaxModelsResponseBytes,
+                                        tooLargeMessage = ModelsResponseTooLargeMessage,
+                                        ensureActive = {
+                                            if (!continuation.isActive) {
+                                                throw CancellationException("Model list request was cancelled.")
+                                            }
+                                        },
+                                    )
+                                },
+                            )
+                        }
+                        if (!continuation.isActive) return
+                        result.fold(
+                            onSuccess = continuation::resume,
+                            onFailure = continuation::resumeWithException,
+                        )
+                    }
+                }
+            },
+        )
+    }
 
     private fun parseModelIds(responseText: String): List<String> {
         val json = JSONObject(responseText)
@@ -148,6 +199,10 @@ object LlmApiClient {
         val code: Int,
         val body: String,
     )
+
+    private const val MaxModelsResponseBytes = 4 * 1024 * 1024
+    private const val ModelsResponseTooLargeMessage =
+        "Model list response exceeds the 4 MiB limit."
 }
 
 internal fun LlmProviderConfig.resolvedUserAgent(): String =

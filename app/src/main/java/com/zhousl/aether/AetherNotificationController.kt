@@ -173,8 +173,8 @@ class AetherNotificationController(
         }
         val body = buildString {
             val sign = if (quote.change >= 0) "+" else ""
-            append("当前价：${String.format("%.2f", quote.price)}")
-            append("  $sign${String.format("%.2f", quote.changePercent)}%")
+            append("当前价：${String.format(java.util.Locale.US, "%.2f", quote.price)}")
+            append("  $sign${String.format(java.util.Locale.US, "%.2f", quote.changePercent)}%")
         }
         val contentIntent = PendingIntent.getActivity(
             context,

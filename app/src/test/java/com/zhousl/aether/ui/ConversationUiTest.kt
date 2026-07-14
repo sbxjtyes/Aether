@@ -272,6 +272,24 @@ class ConversationUiTest {
     }
 
     @Test
+    fun voiceInputSegmentEndKeepsHeldSessionListening() {
+        val ended = reduceVoiceInputState(
+            VoiceInputUiState(
+                status = VoiceInputStatus.Listening,
+                partialText = "first part",
+                level = 0.8f,
+                isHolding = true,
+            ),
+            VoiceInputEvent.SegmentEnded,
+        )
+
+        assertEquals(VoiceInputStatus.Listening, ended.status)
+        assertTrue(ended.isHolding)
+        assertEquals("first part", ended.partialText)
+        assertEquals(0f, ended.level, 0.0001f)
+    }
+
+    @Test
     fun voiceInputPendingSegmentAvoidsRecommittingAccumulatedText() {
         val state = VoiceInputUiState(
             status = VoiceInputStatus.Listening,
@@ -375,6 +393,150 @@ class ConversationUiTest {
     }
 
     @Test
+    fun voiceRecognitionErrorsAreClassifiedForRecoveryPolicy() {
+        assertEquals(VoiceRecognitionFailureKind.Network, classifyVoiceRecognitionError(2))
+        assertEquals(VoiceRecognitionFailureKind.NoSpeech, classifyVoiceRecognitionError(6))
+        assertEquals(VoiceRecognitionFailureKind.NoSpeech, classifyVoiceRecognitionError(7))
+        assertEquals(VoiceRecognitionFailureKind.Permission, classifyVoiceRecognitionError(9))
+        assertEquals(VoiceRecognitionFailureKind.Language, classifyVoiceRecognitionError(12))
+        assertEquals(VoiceRecognitionFailureKind.Unknown, classifyVoiceRecognitionError(999))
+    }
+
+    @Test
+    fun voiceRestartAttemptsStopAtConfiguredLimit() {
+        assertEquals(1, nextVoiceInputRestartAttempt(completedAttempts = 0))
+        assertEquals(3, nextVoiceInputRestartAttempt(completedAttempts = 2))
+        assertNull(nextVoiceInputRestartAttempt(completedAttempts = 3))
+        assertNull(nextVoiceInputRestartAttempt(completedAttempts = 0, maxAttempts = 0))
+    }
+
+    @Test
+    fun silenceSegmentsContinueWithoutConsumingFailureBudget() {
+        val decision = resolveVoiceRecognitionRetry(
+            failureKind = VoiceRecognitionFailureKind.NoSpeech,
+            isHolding = true,
+            completedFailures = 99,
+        )
+
+        assertEquals(VoiceRecognitionRetryAction.RestartImmediately, decision.action)
+        assertEquals(0, decision.consecutiveFailureCount)
+        assertEquals(120L, decision.delayMillis)
+    }
+
+    @Test
+    fun transientRecognitionFailuresUseBoundedBackoff() {
+        val first = resolveVoiceRecognitionRetry(
+            failureKind = VoiceRecognitionFailureKind.Busy,
+            isHolding = true,
+            completedFailures = 0,
+        )
+        val third = resolveVoiceRecognitionRetry(
+            failureKind = VoiceRecognitionFailureKind.Audio,
+            isHolding = true,
+            completedFailures = 2,
+        )
+        val exhausted = resolveVoiceRecognitionRetry(
+            failureKind = VoiceRecognitionFailureKind.Network,
+            isHolding = true,
+            completedFailures = 3,
+        )
+
+        assertEquals(VoiceRecognitionRetryAction.RestartWithBackoff, first.action)
+        assertEquals(1, first.consecutiveFailureCount)
+        assertEquals(320L, first.delayMillis)
+        assertEquals(VoiceRecognitionRetryAction.RestartWithBackoff, third.action)
+        assertEquals(3, third.consecutiveFailureCount)
+        assertEquals(960L, third.delayMillis)
+        assertEquals(VoiceRecognitionRetryAction.Stop, exhausted.action)
+    }
+
+    @Test
+    fun permissionLanguageAndReleasedHoldDoNotRestartRecognition() {
+        assertEquals(
+            VoiceRecognitionRetryAction.Stop,
+            resolveVoiceRecognitionRetry(
+                failureKind = VoiceRecognitionFailureKind.Permission,
+                isHolding = true,
+                completedFailures = 0,
+            ).action,
+        )
+        assertEquals(
+            VoiceRecognitionRetryAction.Stop,
+            resolveVoiceRecognitionRetry(
+                failureKind = VoiceRecognitionFailureKind.Language,
+                isHolding = true,
+                completedFailures = 0,
+            ).action,
+        )
+        assertEquals(
+            VoiceRecognitionRetryAction.Stop,
+            resolveVoiceRecognitionRetry(
+                failureKind = VoiceRecognitionFailureKind.NoSpeech,
+                isHolding = false,
+                completedFailures = 0,
+            ).action,
+        )
+    }
+
+    @Test
+    fun watchdogOnlyRecoversCurrentUnfinishedHeldRecognizer() {
+        assertTrue(
+            shouldRunVoiceRecognizerWatchdog(
+                watchdogGeneration = 7L,
+                currentGeneration = 7L,
+                isHolding = true,
+                isCanceled = false,
+                terminalCallbackReceived = false,
+            ),
+        )
+        assertFalse(
+            shouldRunVoiceRecognizerWatchdog(7L, 8L, true, false, false),
+        )
+        assertFalse(
+            shouldRunVoiceRecognizerWatchdog(7L, 7L, true, false, true),
+        )
+        assertFalse(
+            shouldRunVoiceRecognizerWatchdog(7L, 7L, false, false, false),
+        )
+    }
+
+    @Test
+    fun releasedVoiceInputWaitsThenCommitsRecoveredTextOnTimeout() {
+        assertEquals(
+            VoiceInputReleaseDecision.AwaitFinalResult,
+            resolveVoiceInputReleaseDecision(
+                hasActiveRecognizer = true,
+                finalWaitExpired = false,
+                recoveredTranscript = "partial text",
+            ),
+        )
+        assertEquals(
+            VoiceInputReleaseDecision.CommitRecoveredTranscript,
+            resolveVoiceInputReleaseDecision(
+                hasActiveRecognizer = true,
+                finalWaitExpired = true,
+                recoveredTranscript = "partial text",
+            ),
+        )
+        assertEquals(
+            VoiceInputReleaseDecision.ShowEmptyMessage,
+            resolveVoiceInputReleaseDecision(
+                hasActiveRecognizer = false,
+                finalWaitExpired = true,
+                recoveredTranscript = "  ",
+            ),
+        )
+    }
+
+    @Test
+    fun upwardVoiceDragCancelsOnlyAfterThreshold() {
+        assertFalse(shouldCancelVoiceInputDrag(dragDeltaY = -79f, thresholdPx = 80f))
+        assertTrue(shouldCancelVoiceInputDrag(dragDeltaY = -80f, thresholdPx = 80f))
+        assertFalse(shouldCancelVoiceInputDrag(dragDeltaY = 100f, thresholdPx = 80f))
+        assertFalse(shouldCancelVoiceInputDrag(dragDeltaY = Float.NaN, thresholdPx = 80f))
+    }
+
+    @Test
     fun composerToolsEntryLabelSwitchesForPlanMode() {
         assertEquals("Auto", composerToolsEntryLabel(planModeSelected = false))
         assertEquals("Plan", composerToolsEntryLabel(planModeSelected = true))
@@ -411,7 +573,7 @@ class ConversationUiTest {
     }
 
     @Test
-    fun taskWorkbenchSnapshotSkipsPlainConversationThreads() {
+    fun taskWorkbenchSnapshotKeepsPlainConversationThreadsAsCompleted() {
         val session = ChatSession(
             id = "thread-plain",
             title = "Plain thread",
@@ -433,7 +595,8 @@ class ConversationUiTest {
             language = AppLanguage.English,
         )
 
-        assertNull(snapshot)
+        assertEquals("Plain thread", snapshot!!.conversationLabel)
+        assertEquals(AgentTaskStatus.Completed, snapshot.effectiveStatus)
     }
 
     @Test
@@ -887,6 +1050,131 @@ class ConversationUiTest {
                     is ReasoningTimelineItem.Tool -> item.toolInvocation.id
                 }
             },
+        )
+    }
+
+    @Test
+    fun autoReadIgnoresHistoricalAssistantMessage() {
+        val message = ChatMessage("assistant-old", MessageAuthor.Agent, "Existing reply")
+
+        assertNull(
+            resolveCompletedAssistantSpeech(
+                candidate = PendingAutoReadCandidate("session", message.id),
+                sessionId = "session",
+                isRunning = false,
+                messages = listOf(message),
+            )
+        )
+    }
+
+    @Test
+    fun autoReadResolvesOnlyNewPersistedAssistantReply() {
+        val oldMessage = ChatMessage("assistant-old", MessageAuthor.Agent, "Existing reply")
+        val newMessage = ChatMessage("assistant-new", MessageAuthor.Agent, "Completed reply")
+
+        assertEquals(
+            AssistantSpeechPayload("assistant-new", "Completed reply"),
+            resolveCompletedAssistantSpeech(
+                candidate = PendingAutoReadCandidate("session", oldMessage.id),
+                sessionId = "session",
+                isRunning = false,
+                messages = listOf(oldMessage, newMessage),
+            ),
+        )
+        assertNull(
+            resolveCompletedAssistantSpeech(
+                candidate = PendingAutoReadCandidate("session", oldMessage.id),
+                sessionId = "session",
+                isRunning = true,
+                messages = listOf(oldMessage, newMessage),
+            )
+        )
+    }
+
+    @Test
+    fun autoReadCombinesPersistedResponseGroup() {
+        val messages = listOf(
+            ChatMessage("assistant-old", MessageAuthor.Agent, "Existing reply"),
+            ChatMessage("assistant-tool", MessageAuthor.Agent, "First part", responseGroupId = "response"),
+            ChatMessage("assistant-final", MessageAuthor.Agent, "Second part", responseGroupId = "response"),
+            ChatMessage("assistant-metadata", MessageAuthor.Agent, "", responseGroupId = "response"),
+        )
+
+        assertEquals(
+            AssistantSpeechPayload("assistant-metadata", "First part\n\nSecond part"),
+            resolveCompletedAssistantSpeech(
+                candidate = PendingAutoReadCandidate("session", "assistant-old"),
+                sessionId = "session",
+                isRunning = false,
+                messages = messages,
+            ),
+        )
+    }
+
+    @Test
+    fun voiceTranscriptReplacesSelectionAndKeepsCursorAfterInsertedText() {
+        val insertion = insertVoiceTranscriptDraft(
+            currentDraft = "Please tomorrow send report",
+            transcript = "today",
+            selectionStart = 7,
+            selectionEnd = 15,
+            language = AppLanguage.English,
+        )
+
+        assertEquals("Please today send report", insertion.text)
+        assertEquals(12, insertion.cursor)
+    }
+
+    @Test
+    fun voiceTranscriptInsertsAtCursorWithoutLosingSurroundingText() {
+        val insertion = insertVoiceTranscriptDraft(
+            currentDraft = "Please send report",
+            transcript = "quickly",
+            selectionStart = 7,
+            selectionEnd = 7,
+            language = AppLanguage.English,
+        )
+
+        assertEquals("Please quickly send report", insertion.text)
+        assertEquals("Please quickly".length, insertion.cursor)
+    }
+
+    @Test
+    fun voiceTranscriptAvoidsDuplicateAdjacentCallbackText() {
+        val draft = "Please send the update"
+        val insertion = insertVoiceTranscriptDraft(
+            currentDraft = draft,
+            transcript = "send the update",
+            selectionStart = draft.length,
+            selectionEnd = draft.length,
+            language = AppLanguage.English,
+        )
+
+        assertEquals(draft, insertion.text)
+        assertEquals(draft.length, insertion.cursor)
+    }
+
+    @Test
+    fun voiceTranscriptHandlesPunctuationAtInsertionBoundary() {
+        assertEquals(
+            "Hello,",
+            insertVoiceTranscriptDraft(
+                currentDraft = "Hello",
+                transcript = ",",
+                selectionStart = 5,
+                selectionEnd = 5,
+                language = AppLanguage.English,
+            ).text,
+        )
+        assertEquals(
+            "Hello, world",
+            insertVoiceTranscriptDraft(
+                currentDraft = "Hello,",
+                transcript = ", world",
+                selectionStart = 6,
+                selectionEnd = 6,
+                language = AppLanguage.English,
+            ).text,
         )
     }
 

@@ -21,7 +21,12 @@ import org.json.JSONObject
 private const val ManagedCommandWatchWindowSeconds = 45
 private const val DefaultManagedLogTailBytes = 64 * 1024
 private const val MaxManagedLogTailBytes = 256 * 1024
+private const val ManagedLogMaxBytes = 4 * 1024 * 1024
+private const val ManagedLogRetainedBytes = 2 * 1024 * 1024
+private const val ManagedRunRetentionDays = 7
+private const val ManagedRunRetentionCount = 50
 private const val InternalCommandTimeoutMillis = 15_000L
+private const val ManagedDispatchTimeoutMillis = 20_000L
 private const val SetupProbeTimeoutMillis = 12_000L
 private const val SessionWorkspaceRoot = "${TermuxContract.HomeDirectory}/.aether/workspaces"
 private const val TermuxLogTag = "AetherTermux"
@@ -248,9 +253,10 @@ class TermuxBashTool(
                 dispatchCommand(
                     command = script,
                     workingDirectory = TermuxContract.HomeDirectory,
+                    awaitTimeoutMillis = ManagedDispatchTimeoutMillis,
                 )
             )
-        }.getOrNull()
+        }.onFailure { if (it is CancellationException) throw it }.getOrNull()
             ?: return buildManagedToolError(
                 command = commandFallback,
                 workingDirectory = workingDirectoryFallback,
@@ -464,6 +470,7 @@ class TermuxBashTool(
             }
         } catch (throwable: Throwable) {
             TermuxPendingResults.remove(executionId)
+            if (throwable is CancellationException) throw throwable
             logTermux(
                 "dispatch failure duration_ms=${System.currentTimeMillis() - startedAt} " +
                     "message=${throwable.message.orEmpty()} command=${summarizeCommand(command)}",
@@ -694,6 +701,7 @@ class TermuxBashTool(
         appendLine("tail_bytes=$tailBytes")
         appendCommonManagedPaths(this)
         appendSnapshotHelpers(this)
+        appendManagedRunCleanup(this)
         appendLine("mkdir -p \"\$run_dir\"")
         appendLine("printf '%s' '${encodeBase64(command)}' > \"\$command_meta_path\"")
         appendLine("printf '%s' '${encodeBase64(workingDirectory)}' > \"\$working_directory_meta_path\"")
@@ -821,8 +829,48 @@ class TermuxBashTool(
         builder.appendLine("}")
     }
 
+    private fun appendManagedRunCleanup(builder: StringBuilder) {
+        builder.appendLine("managed_root='${escapeForSingleQuoted(TermuxContract.ManagedCommandsDirectory)}'")
+        builder.appendLine("mkdir -p \"\$managed_root\"")
+        builder.appendLine("# Remove only finished runs; active executions are never cleanup candidates.")
+        builder.appendLine("find \"\$managed_root\" -mindepth 1 -maxdepth 1 -type d -mtime +$ManagedRunRetentionDays -print0 2>/dev/null | while IFS= read -r -d '' old_dir; do")
+        builder.appendLine("  old_state=\"\$(cat \"\$old_dir/state\" 2>/dev/null || printf 'unknown')\"")
+        builder.appendLine("  case \"\$old_state\" in running|launching) ;; *) rm -rf -- \"\$old_dir\" ;; esac")
+        builder.appendLine("done")
+        builder.appendLine("finished_count=0")
+        builder.appendLine("find \"\$managed_root\" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\\0' 2>/dev/null | sort -z -nr | while IFS= read -r -d '' entry; do")
+        builder.appendLine("  candidate=\"\${entry#* }\"")
+        builder.appendLine("  candidate_state=\"\$(cat \"\$candidate/state\" 2>/dev/null || printf 'unknown')\"")
+        builder.appendLine("  case \"\$candidate_state\" in")
+        builder.appendLine("    running|launching) continue ;;")
+        builder.appendLine("  esac")
+        builder.appendLine("  finished_count=\$((finished_count + 1))")
+        builder.appendLine("  if [ \"\$finished_count\" -gt $ManagedRunRetentionCount ]; then rm -rf -- \"\$candidate\"; fi")
+        builder.appendLine("done")
+    }
+
     private fun appendCommonManagedPaths(builder: StringBuilder) {
         builder.appendLine("command_path=\"\$run_dir/command.sh\"")
+        builder.appendLine("log_monitor_pid=''")
+        builder.appendLine("cap_log_file() {")
+        builder.appendLine("  local log_path=\"\$1\"")
+        builder.appendLine("  local marker_path=\"\$2\"")
+        builder.appendLine("  local current_bytes")
+        builder.appendLine("  current_bytes=\"\$(wc -c < \"\$log_path\" 2>/dev/null || printf '0')\"")
+        builder.appendLine("  if [ \"\$current_bytes\" -gt $ManagedLogMaxBytes ]; then")
+        builder.appendLine("    tail -c $ManagedLogRetainedBytes -- \"\$log_path\" > \"\${log_path}.aether-tail\"")
+        builder.appendLine("    cat \"\${log_path}.aether-tail\" > \"\$log_path\"")
+        builder.appendLine("    rm -f -- \"\${log_path}.aether-tail\"")
+        builder.appendLine("    : > \"\$marker_path\"")
+        builder.appendLine("  fi")
+        builder.appendLine("}")
+        builder.appendLine("monitor_logs() {")
+        builder.appendLine("  while kill -0 \"\$child_pid\" 2>/dev/null; do")
+        builder.appendLine("    sleep 2")
+        builder.appendLine("    cap_log_file \"\$stdout_path\" \"\$run_dir/stdout.capped\"")
+        builder.appendLine("    cap_log_file \"\$stderr_path\" \"\$run_dir/stderr.capped\"")
+        builder.appendLine("  done")
+        builder.appendLine("}")
         builder.appendLine("runner_path=\"\$run_dir/runner.sh\"")
         builder.appendLine("command_meta_path=\"\$run_dir/command.b64\"")
         builder.appendLine("working_directory_meta_path=\"\$run_dir/working_directory.b64\"")
@@ -850,10 +898,10 @@ class TermuxBashTool(
         builder.appendLine("  stderr_bytes=\"\$(file_bytes \"\$stderr_path\")\"")
         builder.appendLine("  stdout_truncated=false")
         builder.appendLine("  stderr_truncated=false")
-        builder.appendLine("  if [ \"\$stdout_bytes\" -gt \"\$tail_bytes\" ]; then")
+        builder.appendLine("  if [ \"\$stdout_bytes\" -gt \"\$tail_bytes\" ] || [ -f \"\$run_dir/stdout.capped\" ]; then")
         builder.appendLine("    stdout_truncated=true")
         builder.appendLine("  fi")
-        builder.appendLine("  if [ \"\$stderr_bytes\" -gt \"\$tail_bytes\" ]; then")
+        builder.appendLine("  if [ \"\$stderr_bytes\" -gt \"\$tail_bytes\" ] || [ -f \"\$run_dir/stderr.capped\" ]; then")
         builder.appendLine("    stderr_truncated=true")
         builder.appendLine("  fi")
         builder.appendLine("  started_at=\"\$(read_file_trimmed \"\$started_path\")\"")
@@ -917,10 +965,16 @@ class TermuxBashTool(
         builder.appendLine("bash \"\$command_path\" > \"\$stdout_path\" 2> \"\$stderr_path\" &")
         builder.appendLine("child_pid=\$!")
         builder.appendLine("printf '%s' \"\$child_pid\" > \"\$child_pid_path\"")
+        builder.appendLine("monitor_logs &")
+        builder.appendLine("log_monitor_pid=\$!")
         builder.appendLine("set +e")
         builder.appendLine("wait \"\$child_pid\"")
         builder.appendLine("exit_code=\$?")
         builder.appendLine("set -e")
+        builder.appendLine("kill \"\$log_monitor_pid\" 2>/dev/null || true")
+        builder.appendLine("wait \"\$log_monitor_pid\" 2>/dev/null || true")
+        builder.appendLine("cap_log_file \"\$stdout_path\" \"\$run_dir/stdout.capped\"")
+        builder.appendLine("cap_log_file \"\$stderr_path\" \"\$run_dir/stderr.capped\"")
         builder.appendLine("current_state=\"\$(cat \"\$state_path\" 2>/dev/null || printf '')\"")
         builder.appendLine("if [ \"\$current_state\" = 'cancelled' ] || [ \"\$current_state\" = 'killed' ]; then")
         builder.appendLine("  if [ ! -f \"\$exit_code_path\" ]; then")

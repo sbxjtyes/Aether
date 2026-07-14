@@ -22,6 +22,7 @@ import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.util.Base64
 import android.view.Display
+import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import com.rosan.app_process.AppProcess
 import com.zhousl.aether.agentmode.AetherAgentModeProcessContract
@@ -31,17 +32,20 @@ import com.zhousl.aether.agentmode.IAetherAgentModeService
 import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.util.AetherLog
 import java.io.File
+import java.io.InputStream
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
 
@@ -56,12 +60,48 @@ private const val AgentDisplayDensityDpi = 440
 private const val AgentDisplayName = "aether-agent-mode"
 private const val ShizukuPermissionRequestCode = 4201
 private const val RootAuthorizationProbeTimeoutMillis = 2_000L
+private const val AgentModeRemoteCallTimeoutMillis = 15_000L
+private const val AgentModeScreenshotTimeoutMillis = 20_000L
+private const val AgentModeScreenshotMaxBytes = 16 * 1024 * 1024
 private const val TAG = "AetherAgentMode"
 private const val RootAgentModeServiceUid = "1000"
 
 private val ShizukuManagerPackages = listOf(
     "moe.shizuku.privileged.api",
     "moe.shizuku.manager",
+)
+
+internal fun InputStream.readBytesBounded(maxBytes: Int): ByteArray {
+    require(maxBytes > 0) { "maxBytes must be positive." }
+    val output = java.io.ByteArrayOutputStream(minOf(maxBytes, 64 * 1024))
+    val buffer = ByteArray(16 * 1024)
+    var total = 0
+    while (true) {
+        val read = read(buffer)
+        if (read < 0) break
+        if (read == 0) continue
+        total += read
+        if (total > maxBytes) {
+            throw IllegalStateException("Agent Mode screenshot exceeded the ${maxBytes}-byte safety limit.")
+        }
+        output.write(buffer, 0, read)
+    }
+    return output.toByteArray()
+}
+
+/**
+ * Runs the short-lived commands used while detecting and probing root access for Agent Mode.
+ * Sharing the root setup runner keeps both output pipes drained, bounds retained output, and
+ * guarantees that timeout or caller cancellation terminates the process tree.
+ */
+internal suspend fun runAgentModeProbeProcess(
+    command: List<String>,
+    timeoutMillis: Long,
+    processStarter: (List<String>) -> Process = { ProcessBuilder(it).start() },
+): RootCommandResult = runRootProcess(
+    command = command,
+    timeoutMillis = timeoutMillis,
+    processStarter = processStarter,
 )
 
 data class AgentModeDisplayState(
@@ -278,7 +318,7 @@ class AgentModeController(
                     invalidArguments("点击坐标不完整：需要同时提供 x 和 y，范围为 0 到 1000。", "missing_tap_coordinates")
                 } else {
                     runRemoteCall(settings, "tap", "tap_failed", "点击虚拟显示失败。", "请确认 Agent 模式显示仍处于活动状态；如果刚重启过 Shizuku 或 Root，请重新启动 Agent 模式。") {
-                        requireAgentModeService(settings).tap(displayId, x, y)
+                        connectedAgentModeService(settings).tap(displayId, x, y)
                     }
                     captureAfterDelay(settings, workspaceDirectory, delayMillis = 350)
                 }
@@ -295,7 +335,7 @@ class AgentModeController(
                     invalidArguments("滑动坐标不完整：需要提供 x1、y1、x2、y2，范围为 0 到 1000。", "missing_swipe_coordinates")
                 } else {
                     runRemoteCall(settings, "swipe", "swipe_failed", "滑动虚拟显示失败。", "请确认虚拟显示未被释放，并检查 Shizuku/Root 服务是否仍可用。") {
-                        requireAgentModeService(settings).swipe(displayId, x1, y1, x2, y2, durationMs)
+                        connectedAgentModeService(settings).swipe(displayId, x1, y1, x2, y2, durationMs)
                     }
                     captureAfterDelay(settings, workspaceDirectory, delayMillis = durationMs.toLong() + 250)
                 }
@@ -307,7 +347,7 @@ class AgentModeController(
                     invalidArguments("缺少按键名称。请提供 key，例如 BACK、HOME 或 ENTER。", "missing_key")
                 } else {
                     runRemoteCall(settings, "key", "key_failed", "发送按键失败。", "请确认按键名称有效，并检查 Agent 模式服务连接是否正常。") {
-                        requireAgentModeService(settings).key(displayId, keyCode)
+                        connectedAgentModeService(settings).key(displayId, keyCode)
                     }
                     captureAfterDelay(settings, workspaceDirectory, delayMillis = 300)
                 }
@@ -319,7 +359,7 @@ class AgentModeController(
                     invalidArguments("缺少要输入的文本。请提供 text 后重试。", "missing_text")
                 } else {
                     runRemoteCall(settings, "text", "text_failed", "输入文本失败。", "请确认目标应用处于可输入状态；如果服务已断开，请重新启动 Agent 模式后重试。") {
-                        requireAgentModeService(settings).text(displayId, text)
+                        connectedAgentModeService(settings).text(displayId, text)
                     }
                     captureAfterDelay(settings, workspaceDirectory, delayMillis = 350)
                 }
@@ -355,6 +395,7 @@ class AgentModeController(
             }
             }
         }.getOrElse { throwable ->
+            if (throwable is CancellationException) throw throwable
             val userError = throwable.toAgentModeUserError(settings, action.ifBlank { "unknown" })
             AetherLog.e(TAG, "Agent Mode action '${action.ifBlank { "unknown" }}' failed: ${userError.developerDetail.ifBlank { throwable.message }}", throwable)
             captureAgentModeFailed(
@@ -482,6 +523,7 @@ class AgentModeController(
             )
             return displayId
         } catch (throwable: Throwable) {
+            if (throwable is CancellationException) throw throwable
             val userError = throwable.toAgentModeUserError(settings, "start")
             updateDisplayFailure(userError)
             throw throwable
@@ -498,6 +540,7 @@ class AgentModeController(
         val state = _displayState.value
         val displays = runCatching { currentDisplays(settings, state.displayId) }
             .onFailure { throwable ->
+                if (throwable is CancellationException) throw throwable
                 val userError = throwable.toAgentModeUserError(settings, "status")
                 AetherLog.w(TAG, "Failed to refresh Agent Mode displays: ${userError.developerDetail}", throwable)
                 updateDisplayFailure(userError)
@@ -569,6 +612,7 @@ class AgentModeController(
         if (delayMillis > 0) delay(delayMillis)
         val bytes = runCatching { capturePngBytes(settings) }
             .getOrElse { throwable ->
+                if (throwable is CancellationException) throw throwable
                 val userError = throwable.toAgentModeUserError(settings, "screenshot")
                 updateDisplayFailure(userError)
                 throw throwable
@@ -589,14 +633,20 @@ class AgentModeController(
         runCatching { File(cacheDirectory, "latest.jpg").writeBytes(bytes) }
             .onFailure { throwable -> AetherLog.w(TAG, "Failed to update latest Agent Mode preview cache.", throwable) }
         val workspacePath = "$workspaceDirectory/agent-mode/$captureId.jpg"
-        // 异步写入工作区文件，不阻塞截图响应返回给模型
-        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
-            workspaceFileBridge.writeWorkspaceBytes(
-                absolutePath = workspacePath,
-                bytes = bytes,
-            ).onFailure { throwable ->
-                AetherLog.e(TAG, "Failed to write Agent Mode screenshot to workspace: ${AetherLog.summarizePath(workspacePath)}", throwable)
-            }
+        // 在返回路径前确认工作区文件已经落盘，避免悬空路径和脱离生命周期的写入任务。
+        workspaceFileBridge.writeWorkspaceBytes(
+            absolutePath = workspacePath,
+            bytes = bytes,
+        ).getOrElse { throwable ->
+            if (throwable is CancellationException) throw throwable
+            AetherLog.e(TAG, "Failed to write Agent Mode screenshot to workspace: ${AetherLog.summarizePath(workspacePath)}", throwable)
+            throwAgentModeError(
+                code = "screenshot_workspace_write_failed",
+                message = "截图已生成，但无法保存到当前工作区。",
+                suggestion = "请检查工作区连接和可用存储空间后重试。",
+                developerDetail = throwable.message.orEmpty(),
+                cause = throwable,
+            )
         }
         val displayId = shizukuDisplayId
         val state = _displayState.value
@@ -649,10 +699,11 @@ class AgentModeController(
                 code = "screenshot_failed",
                 message = "捕获 Agent 模式截图失败。",
                 suggestion = "请确认虚拟显示仍在运行；如果 Shizuku/Root 服务刚重启，请重新启动 Agent 模式。",
+                timeoutMillis = AgentModeScreenshotTimeoutMillis,
             ) {
                 service.capturePngPipe(displayId).use { descriptor ->
                     ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input ->
-                        input.readBytes().takeIf { it.isNotEmpty() }
+                        input.readBytesBounded(AgentModeScreenshotMaxBytes).takeIf { it.isNotEmpty() }
                             ?: error("Agent Mode screenshot returned 0 bytes.")
                     }
                 }
@@ -694,6 +745,7 @@ class AgentModeController(
         val state = _displayState.value
         val displays = runCatching { currentDisplays(settings, state.displayId) }
             .onFailure { throwable ->
+                if (throwable is CancellationException) throw throwable
                 val userError = throwable.toAgentModeUserError(settings, "status")
                 AetherLog.w(TAG, "Failed to query Agent Mode display status: ${userError.developerDetail}", throwable)
                 updateDisplayFailure(userError)
@@ -823,6 +875,7 @@ class AgentModeController(
                 parseDisplays(service.listDisplaysJson(), aetherDisplayId)
             }
         } catch (throwable: Throwable) {
+            if (throwable is CancellationException) throw throwable
             AetherLog.w(TAG, "Falling back to local display list because privileged display query failed.", throwable)
             currentDisplaysLocal(aetherDisplayId)
         }
@@ -873,6 +926,16 @@ class AgentModeController(
             AgentModeAuthorizationMethod.Root -> requireRootService()
         }
 
+    private fun connectedAgentModeService(settings: AppSettings): IAetherAgentModeService =
+        when (settings.agentModeAuthorizationMethod) {
+            AgentModeAuthorizationMethod.Shizuku -> shizukuService
+            AgentModeAuthorizationMethod.Root -> rootService
+        } ?: throwAgentModeError(
+            code = "service_disconnected",
+            message = "Agent 模式服务连接已断开。",
+            suggestion = "请重新启动 Agent 模式后重试。",
+        )
+
     private suspend fun requireRootService(): IAetherAgentModeService = withContext(Dispatchers.IO) {
         val existing = rootService
         if (existing != null) return@withContext existing
@@ -902,7 +965,20 @@ class AgentModeController(
             val process = object : AppProcess.Terminal() {
                 override fun newTerminal(): List<String?> = listOf(suPath, RootAgentModeServiceUid)
             }
-            if (!process.init(context)) {
+            val initialized = try {
+                withTimeout(AgentModeRemoteCallTimeoutMillis) {
+                    runInterruptible(Dispatchers.IO) { process.init(context) }
+                }
+            } catch (timeout: TimeoutCancellationException) {
+                runCatching { process.close() }
+                throwAgentModeError(
+                    code = "root_service_start_timeout",
+                    message = "Root Agent 模式服务启动超时。",
+                    suggestion = "请检查 Root 授权弹窗或 Root 管理器状态后重试。",
+                    cause = timeout,
+                )
+            }
+            if (!initialized) {
                 _authorizationState.value = AgentModeAuthorizationState(
                     issue = AgentModeAuthorizationIssue.RootPermissionDenied,
                     detail = "Root Agent 模式服务启动失败。",
@@ -916,8 +992,13 @@ class AgentModeController(
                 )
             }
             val binder = runCatching {
-                process.serviceBinder(ComponentName(context, AetherAgentModeShizukuService::class.java))
+                withTimeout(AgentModeRemoteCallTimeoutMillis) {
+                    runInterruptible(Dispatchers.IO) {
+                        process.serviceBinder(ComponentName(context, AetherAgentModeShizukuService::class.java))
+                    }
+                }
             }.getOrElse { throwable ->
+                if (throwable is CancellationException && throwable !is TimeoutCancellationException) throw throwable
                 runCatching { process.close() }
                 throwAgentModeError(
                     code = "root_service_binder_failed",
@@ -1028,7 +1109,7 @@ class AgentModeController(
                 cause = timeout,
             )
         } catch (throwable: Throwable) {
-            if (throwable is AgentModeException) throw throwable
+            if (throwable is CancellationException || throwable is AgentModeException) throw throwable
             runCatching { shizukuProcess?.destroy() }
             shizukuProcess = null
             throwAgentModeError(
@@ -1046,7 +1127,7 @@ class AgentModeController(
     /**
      * 通过 Shizuku 的远程 app_process 能力启动 Agent Mode 进程并接收服务 Binder。
      */
-    private fun startShizukuAgentModeProcess(): IBinder {
+    private suspend fun startShizukuAgentModeProcess(): IBinder {
         val token = UUID.randomUUID().toString()
         val binderQueue = java.util.concurrent.ArrayBlockingQueue<IBinder>(1)
         val workerThread = HandlerThread("aether-shizuku-agentmode-bind").apply { start() }
@@ -1061,15 +1142,18 @@ class AgentModeController(
         try {
             val filter = IntentFilter(AetherAgentModeProcessContract.ActionServiceStarted)
             val handler = Handler(workerThread.looper)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(receiver, filter, null, handler, Context.RECEIVER_EXPORTED)
-            } else {
-                @Suppress("DEPRECATION")
-                context.registerReceiver(receiver, filter, null, handler)
-            }
+            ContextCompat.registerReceiver(
+                context,
+                receiver,
+                filter,
+                null,
+                handler,
+                ContextCompat.RECEIVER_EXPORTED,
+            )
             shizukuProcess = launchShizukuRemoteProcess(token)
-            return binderQueue.poll(15, TimeUnit.SECONDS)
-                ?: throw TimeoutException("Timed out waiting for Agent Mode app_process binder.")
+            return runInterruptible(Dispatchers.IO) {
+                binderQueue.poll(15, TimeUnit.SECONDS)
+            } ?: throw TimeoutException("Timed out waiting for Agent Mode app_process binder.")
         } finally {
             runCatching { context.unregisterReceiver(receiver) }
             workerThread.quitSafely()
@@ -1241,7 +1325,7 @@ class AgentModeController(
             }.getOrDefault(false)
         }
 
-    private fun findSuPath(): String {
+    private suspend fun findSuPath(): String {
         val commonPaths = listOf(
             "/system/bin/su",
             "/system/xbin/su",
@@ -1253,53 +1337,18 @@ class AgentModeController(
             File(path).let { it.exists() && it.canExecute() }
         }?.let { return it }
 
-        val result = runProcess(
+        val result = runAgentModeProbeProcess(
             command = listOf("sh", "-c", "command -v su 2>/dev/null || true"),
             timeoutMillis = RootAuthorizationProbeTimeoutMillis,
         )
         return result.stdout.lineSequence().firstOrNull()?.trim().orEmpty()
     }
 
-    private fun runRootAuthorizationProbe(suPath: String): RootCommandResult =
-        runProcess(
+    private suspend fun runRootAuthorizationProbe(suPath: String): RootCommandResult =
+        runAgentModeProbeProcess(
             command = listOf(suPath, "-c", "true"),
             timeoutMillis = RootAuthorizationProbeTimeoutMillis,
         )
-
-    private fun runProcess(
-        command: List<String>,
-        timeoutMillis: Long,
-    ): RootCommandResult {
-        val process = runCatching {
-            ProcessBuilder(command).start()
-        }.getOrElse { throwable ->
-            return RootCommandResult(
-                exitCode = -1,
-                launchError = throwable.message.orEmpty(),
-            )
-        }
-
-        val finished = process.waitFor(timeoutMillis, TimeUnit.MILLISECONDS)
-        if (!finished) {
-            runCatching { process.destroy() }
-            if (!process.waitFor(400, TimeUnit.MILLISECONDS)) {
-                runCatching { process.destroyForcibly() }
-            }
-        }
-
-        val stdout = runCatching {
-            process.inputStream.bufferedReader().readText()
-        }.getOrDefault("")
-        val stderr = runCatching {
-            process.errorStream.bufferedReader().readText()
-        }.getOrDefault("")
-        return RootCommandResult(
-            exitCode = if (finished) process.exitValue() else -1,
-            stdout = stdout,
-            stderr = stderr,
-            timedOut = !finished,
-        )
-    }
 
 
     private fun normalizedX(value: Double): Int? =
@@ -1328,7 +1377,9 @@ class AgentModeController(
                     val x = normalizedX(step.optDouble("x", Double.NaN))
                     val y = normalizedY(step.optDouble("y", Double.NaN))
                     if (x != null && y != null) {
-                        service.tap(displayId, x, y)
+                        runRemoteCall(settings, "sequence_tap", "sequence_tap_failed", "序列点击失败。", "请检查 Agent 模式服务连接后重试。") {
+                            service.tap(displayId, x, y)
+                        }
                     }
                 }
                 "swipe" -> {
@@ -1339,16 +1390,26 @@ class AgentModeController(
                     val dur = step.optInt("duration_ms", step.optInt("durationMs", 500))
                         .coerceIn(50, 10_000)
                     if (x1 != null && y1 != null && x2 != null && y2 != null) {
-                        service.swipe(displayId, x1, y1, x2, y2, dur)
+                        runRemoteCall(settings, "sequence_swipe", "sequence_swipe_failed", "序列滑动失败。", "请检查 Agent 模式服务连接后重试。") {
+                            service.swipe(displayId, x1, y1, x2, y2, dur)
+                        }
                     }
                 }
                 "key" -> {
                     val key = step.optString("key").trim()
-                    if (key.isNotBlank()) service.key(displayId, key)
+                    if (key.isNotBlank()) {
+                        runRemoteCall(settings, "sequence_key", "sequence_key_failed", "序列按键失败。", "请检查 Agent 模式服务连接后重试。") {
+                            service.key(displayId, key)
+                        }
+                    }
                 }
                 "text" -> {
                     val text = step.optString("text")
-                    if (text.isNotBlank()) service.text(displayId, text)
+                    if (text.isNotBlank()) {
+                        runRemoteCall(settings, "sequence_text", "sequence_text_failed", "序列文本输入失败。", "请检查 Agent 模式服务连接后重试。") {
+                            service.text(displayId, text)
+                        }
+                    }
                 }
                 "wait" -> {
                     // wait_ms 在下方统一处理
@@ -1397,9 +1458,12 @@ class AgentModeController(
         code: String,
         message: String,
         suggestion: String,
-        block: suspend () -> T,
+        timeoutMillis: Long = AgentModeRemoteCallTimeoutMillis,
+        block: () -> T,
     ): T = try {
-        block()
+        withTimeout(timeoutMillis) {
+            runInterruptible(Dispatchers.IO) { block() }
+        }
     } catch (deadObject: DeadObjectException) {
         clearDeadAgentModeService(settings, deadObject)
         throwAgentModeError(
@@ -1430,6 +1494,8 @@ class AgentModeController(
         )
     } catch (agentMode: AgentModeException) {
         throw agentMode
+    } catch (cancelled: CancellationException) {
+        throw cancelled
     } catch (throwable: Throwable) {
         throwAgentModeError(
             code = code,
@@ -1609,19 +1675,6 @@ class AgentModeController(
         val height: Int,
         val densityDpi: Int,
     )
-
-    private data class RootCommandResult(
-        val exitCode: Int,
-        val stdout: String = "",
-        val stderr: String = "",
-        val timedOut: Boolean = false,
-        val launchError: String = "",
-    ) {
-        fun combinedOutput(): String = listOf(stdout, stderr, launchError)
-            .map(String::trim)
-            .filter(String::isNotEmpty)
-            .joinToString("\n")
-    }
 
     /**
      * 检测当前设备是否为 MIUI/HyperOS 系统。

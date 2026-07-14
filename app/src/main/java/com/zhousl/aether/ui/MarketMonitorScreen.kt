@@ -90,10 +90,10 @@ private fun changeColor(pct: Double): Color = when {
 
 private fun formatPct(pct: Double): String {
     val sign = if (pct > 0) "+" else ""
-    return "${sign}${String.format("%.2f", pct)}%"
+    return "${sign}${String.format(java.util.Locale.US, "%.2f", pct)}%"
 }
 
-private fun formatPrice(price: Double): String = String.format("%.2f", price)
+private fun formatPrice(price: Double): String = String.format(java.util.Locale.US, "%.2f", price)
 
 // ── 入口 Screen ─────────────────────────────────────────────────────────────
 

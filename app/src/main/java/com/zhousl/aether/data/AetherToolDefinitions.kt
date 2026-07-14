@@ -355,6 +355,23 @@ internal fun buildAnalyzeImageToolDefinition(): JSONObject = buildToolDefinition
     required = listOf("path"),
 )
 
+internal fun buildParseDocumentToolDefinition(): JSONObject = buildToolDefinition(
+    name = "parse_document",
+    description = "Parse a PDF, DOCX, PPTX, XLSX, or supported image from the current workspace into Markdown with MinerU. Use this to inspect uploaded documents that the text read tool cannot read. Files are sent to MinerU's external service. A configured Token enables precise parsing first (app safety cap 32 MB, service limit 200 pages); otherwise the lightweight fallback supports up to 10 MB and 20 pages.",
+    properties = JSONObject().apply {
+        put("path", stringProperty("Workspace file path to parse. Relative paths resolve from the current workspace."))
+        put("language", stringProperty("OCR language, default ch. Common values include ch, en, japan, korean, latin, arabic, and cyrillic."))
+        put("page_range", stringProperty("Optional PDF page range such as 1-10 or a single page such as 5. Omit it to parse the full document. Never use an open-ended value such as 1-; if the page count is unknown, omit this field instead of probing with another tool."))
+        put("enable_table", booleanProperty("Whether to request table recognition. Default true."))
+        put("is_ocr", booleanProperty("Whether to force OCR for PDFs. Default false."))
+        put("enable_formula", booleanProperty("Whether to request formula recognition. Default true."))
+        put("timeout_seconds", integerProperty("Polling timeout in seconds, from 15 to 600. Default 300."))
+        put("working_directory", stringProperty("Optional working directory used to resolve relative paths."))
+        put("workingDirectory", stringProperty("Alias of working_directory."))
+    },
+    required = listOf("path"),
+)
+
 internal fun buildFetchWebUrlToolDefinition(): JSONObject = buildToolDefinition(
     name = "fetch_web_url",
     description = "Fetch a specific HTTP or HTTPS URL and return the page content converted to Markdown. Use this when the user gives you a URL or you need the contents of one page.",

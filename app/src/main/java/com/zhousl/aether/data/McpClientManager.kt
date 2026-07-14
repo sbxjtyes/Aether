@@ -4,6 +4,8 @@ import com.zhousl.aether.termux.TermuxBashTool
 import com.zhousl.aether.termux.TermuxContract
 import com.zhousl.aether.util.AetherLog
 import java.security.MessageDigest
+import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -13,17 +15,28 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 private const val DefaultMcpProtocolVersion = "2025-11-25"
 private const val McpRequestPollIntervalMillis = 150L
 private const val McpDefaultRequestTimeoutMillis = 60_000L
 private const val McpValidationTimeoutMillis = 20_000L
+private const val McpMaxHttpResponseBytes = 4 * 1024 * 1024
+private const val McpMaxStdioMessageBytes = 2 * 1024 * 1024
+private const val McpMaxStdioPollBytes = 4 * 1024 * 1024
+private const val McpMaxStdioMessagesPerPoll = 128
+private const val McpMaxStdioLogBytes = 8 * 1024 * 1024
 private const val McpLogTag = "AetherMcp"
 private const val EnableMcpLogging = false
 
@@ -146,8 +159,9 @@ class McpClientManager(
     private val callbacks: McpClientCallbacks = DenyingMcpClientCallbacks(),
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .readTimeout(McpDefaultRequestTimeoutMillis, TimeUnit.MILLISECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(McpDefaultRequestTimeoutMillis, TimeUnit.MILLISECONDS)
         .build(),
 ) {
     private val sessions = ConcurrentHashMap<String, McpServerSession>()
@@ -406,6 +420,7 @@ class McpClientManager(
             config = transportConfig,
             initialProtocolVersion = DefaultMcpProtocolVersion,
             httpClient = httpClient,
+            requestTimeoutMillis = server.requestTimeoutMillis,
         )
     }
 
@@ -602,7 +617,9 @@ private class McpServerSession(
     private suspend fun call(
         method: String,
         params: JSONObject? = null,
-    ): JSONObject {
+    ): JSONObject = withTimeout(
+        config.requestTimeoutMillis.coerceIn(1_000L, McpDefaultRequestTimeoutMillis * 5),
+    ) {
         val requestId = nextRequestId()
         val startedAt = System.currentTimeMillis()
         val request = JSONObject().apply {
@@ -618,9 +635,8 @@ private class McpServerSession(
         }] -> method=$method id=$requestId")
 
         var messages = transport.sendMessage(request)
-        val deadline = System.currentTimeMillis() + config.requestTimeoutMillis.coerceAtLeast(
-            McpDefaultRequestTimeoutMillis,
-        )
+        val deadline = System.currentTimeMillis() +
+            config.requestTimeoutMillis.coerceIn(1_000L, McpDefaultRequestTimeoutMillis * 5)
 
         while (System.currentTimeMillis() < deadline) {
             val result = consumeMessages(requestId, messages)
@@ -629,7 +645,7 @@ private class McpServerSession(
                     "[${config.id}] <- method=$method id=$requestId " +
                         "duration_ms=${System.currentTimeMillis() - startedAt}",
                 )
-                return result
+                return@withTimeout result
             }
             delay(McpRequestPollIntervalMillis)
             messages = transport.pollMessages()
@@ -776,9 +792,14 @@ private class StreamableHttpMcpTransport(
     private val config: McpTransportConfig.StreamableHttp,
     initialProtocolVersion: String,
     private val httpClient: OkHttpClient,
+    requestTimeoutMillis: Long,
 ) : McpSessionTransport {
     private var protocolVersion: String = initialProtocolVersion
     private var sessionId: String = ""
+    private val requestTimeoutMillis = requestTimeoutMillis.coerceIn(
+        1_000L,
+        McpDefaultRequestTimeoutMillis * 5,
+    )
 
     override fun updateProtocolVersion(version: String) {
         if (version.isNotBlank()) {
@@ -802,7 +823,10 @@ private class StreamableHttpMcpTransport(
             }
             .post(message.toString().toRequestBody("application/json".toMediaType()))
             .build()
-        httpClient.newCall(request).execute().use { response ->
+        val call = httpClient.newCall(request).apply {
+            timeout().timeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
+        }
+        call.awaitResponse().use { response ->
             response.header("Mcp-Session-Id")
                 ?.trim()
                 ?.takeIf(String::isNotBlank)
@@ -815,7 +839,7 @@ private class StreamableHttpMcpTransport(
                 return@withContext emptyList()
             }
             val contentType = response.header("Content-Type").orEmpty()
-            val responseText = body.string()
+            val responseText = body.readUtf8Limited(McpMaxHttpResponseBytes)
             if (responseText.isBlank()) {
                 return@withContext emptyList()
             }
@@ -830,6 +854,47 @@ private class StreamableHttpMcpTransport(
     override suspend fun pollMessages(): List<JSONObject> = emptyList()
 
     override suspend fun close() = Unit
+}
+
+private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { continuation ->
+    continuation.invokeOnCancellation { cancel() }
+    enqueue(
+        object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (continuation.isActive) continuation.resumeWithException(e)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (continuation.isActive) {
+                    continuation.resume(response)
+                } else {
+                    response.close()
+                }
+            }
+        },
+    )
+}
+
+internal fun okhttp3.ResponseBody.readUtf8Limited(maxBytes: Int): String {
+    val declaredLength = contentLength()
+    if (declaredLength > maxBytes) {
+        error("MCP response exceeds the ${maxBytes / (1024 * 1024)} MB limit.")
+    }
+    val output = ByteArrayOutputStream(minOf(maxBytes, 64 * 1024))
+    val buffer = ByteArray(16 * 1024)
+    byteStream().use { input ->
+        var total = 0
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > maxBytes) {
+                error("MCP response exceeds the ${maxBytes / (1024 * 1024)} MB limit.")
+            }
+            output.write(buffer, 0, read)
+        }
+    }
+    return output.toString(Charsets.UTF_8.name())
 }
 
 private class StdIoMcpTransport(
@@ -859,7 +924,12 @@ private class StdIoMcpTransport(
 
     override suspend fun sendMessage(message: JSONObject): List<JSONObject> {
         logMcp("[$serverId] send ${describeMcpMessage(message)}")
-        val payloadBase64 = encodeBase64(message.toString())
+        val payload = message.toString()
+        val payloadBytes = payload.toByteArray(Charsets.UTF_8).size
+        if (payloadBytes > McpMaxStdioMessageBytes) {
+            error("MCP stdio message exceeds the ${McpMaxStdioMessageBytes / (1024 * 1024)} MB limit.")
+        }
+        val payloadBase64 = encodeBase64(payload)
         val command = buildString {
             appendLine("set -euo pipefail")
             appendLine("root='${brokerRootPath()}'")
@@ -910,6 +980,11 @@ private class StdIoMcpTransport(
             appendLine("  exit 0")
             appendLine("fi")
             appendLine("size=\$(wc -c < \"\$events_path\" | tr -d '[:space:]')")
+            appendLine("if [ \"\$size\" -eq \"\$current_offset\" ] && [ \"\$size\" -gt $McpMaxStdioLogBytes ]; then")
+            appendLine("  : > \"\$events_path\"")
+            appendLine("  size=0")
+            appendLine("  current_offset=0")
+            appendLine("fi")
             appendLine("if [ \"\$size\" -le \"\$current_offset\" ]; then")
             appendLine("  printf 'offset=%s\\n' \"\$size\"")
             appendLine("  printf 'server_pid=%s\\n' \"\$server_pid\"")
@@ -921,6 +996,7 @@ private class StdIoMcpTransport(
             appendLine("  exit 0")
             appendLine("fi")
             appendLine("byte_count=\$((size - current_offset))")
+            appendLine("[ \"\$byte_count\" -le $McpMaxStdioPollBytes ] || byte_count=$McpMaxStdioPollBytes")
             appendLine("chunk=\"\$(dd if=\"\$events_path\" bs=1 skip=\"\$current_offset\" count=\"\$byte_count\" status=none 2>/dev/null; printf '\\037')\"")
             appendLine("chunk=\"\${chunk%\$'\\037'}\"")
             appendLine("complete_chunk=''")
@@ -932,6 +1008,11 @@ private class StdIoMcpTransport(
             appendLine("    complete_chunk=\"\${chunk%$'\\n'*}\"\$'\\n'")
             appendLine("    ;;")
             appendLine("esac")
+            appendLine("if [ -n \"\$complete_chunk\" ]; then")
+            appendLine("  limited_chunk=\"\$(printf '%s' \"\$complete_chunk\" | head -n $McpMaxStdioMessagesPerPoll; printf '\\037')\"")
+            appendLine("  complete_chunk=\"\${limited_chunk%\$'\\037'}\"")
+            appendLine("  [ -z \"\$complete_chunk\" ] || complete_chunk=\"\$complete_chunk\"\$'\\n'")
+            appendLine("fi")
             appendLine("complete_bytes=\$(printf '%s' \"\$complete_chunk\" | wc -c | tr -d '[:space:]')")
             appendLine("next_offset=\$((current_offset + complete_bytes))")
             appendLine("printf 'offset=%s\\n' \"\$next_offset\"")
@@ -957,7 +1038,13 @@ private class StdIoMcpTransport(
                 if (payloadBase64.isBlank()) {
                     null
                 } else {
-                    runCatching { JSONObject(decodeBase64(payloadBase64)) }.getOrNull()
+                    runCatching {
+                        val decoded = decodeBase64(payloadBase64)
+                        if (decoded.toByteArray(Charsets.UTF_8).size > McpMaxStdioMessageBytes) {
+                            error("MCP stdio message exceeds the size limit.")
+                        }
+                        JSONObject(decoded)
+                    }.getOrNull()
                 }
             }
             .toList()
@@ -972,14 +1059,22 @@ private class StdIoMcpTransport(
     }
 
     override suspend fun close() {
-        if (runId.isBlank()) return
+        if (runId.isNotBlank()) {
+            runCatching {
+                bashTool.killExecution(
+                    JSONObject().apply {
+                        put("run_id", runId)
+                    }.toString(),
+                )
+            }
+        }
         runCatching {
-            bashTool.killExecution(
-                JSONObject().apply {
-                    put("run_id", runId)
-                }.toString(),
+            bashTool.executeCommand(
+                "rm -rf -- '${escapeForSingleQuoted(brokerRootPath())}'",
             )
         }
+        runId = ""
+        logOffset = 0L
     }
 
     private fun buildBrokerScript(): String = buildString {
@@ -1017,8 +1112,12 @@ private class StdIoMcpTransport(
         appendLine("      found=true")
         appendLine("      payload=\"\$(cat \"\$request_path\")\"")
         appendLine("      payload_bytes=\$(printf '%s' \"\$payload\" | wc -c | tr -d '[:space:]')")
+        appendLine("      if [ \"\$payload_bytes\" -gt $McpMaxStdioMessageBytes ]; then")
+        appendLine("        rm -f -- \"\$request_path\"")
+        appendLine("        continue")
+        appendLine("      fi")
         appendLine("      printf 'Content-Length: %s\\r\\n\\r\\n%s' \"\$payload_bytes\" \"\$payload\" >&\"\$stdin_fd\"")
-        appendLine("      mv \"\$request_path\" \"\$root/processed/\"")
+        appendLine("      rm -f -- \"\$request_path\"")
         appendLine("    done")
         appendLine("    [ \"\$found\" = true ] || sleep 0.1")
         appendLine("  done")
@@ -1035,11 +1134,22 @@ private class StdIoMcpTransport(
         appendLine("    esac")
         appendLine("  done || break")
         appendLine("  [ -n \"\$content_length\" ] || continue")
+        appendLine("  case \"\$content_length\" in (*[!0-9]*|'') break ;; esac")
+        appendLine("  if [ \"\$content_length\" -gt $McpMaxStdioMessageBytes ]; then")
+        appendLine("    break")
+        appendLine("  fi")
         appendLine("  payload=\"\$(dd bs=1 count=\"\$content_length\" iflag=fullblock 2>/dev/null <&\"\$stdout_fd\"; printf '\\037')\"")
         appendLine("  payload=\"\${payload%\$'\\037'}\"")
         appendLine("  payload_b64=\"\$(printf '%s' \"\$payload\" | base64 | tr -d '\\n')\"")
         appendLine("  sequence=\$((sequence + 1))")
         appendLine("  printf '%s|%s\\n' \"\$sequence\" \"\$payload_b64\" >> \"\$events_path\"")
+        appendLine("  stderr_size=\$(wc -c < \"\$stderr_path\" 2>/dev/null || printf '0')")
+        appendLine("  if [ \"\$stderr_size\" -gt $McpMaxStdioLogBytes ]; then")
+        appendLine("    tail -c ${McpMaxStdioLogBytes / 2} -- \"\$stderr_path\" > \"\$root/.stderr-tail.tmp\" 2>/dev/null || true")
+        appendLine("    : > \"\$stderr_path\"")
+        appendLine("    cat \"\$root/.stderr-tail.tmp\" >> \"\$stderr_path\" 2>/dev/null || true")
+        appendLine("    rm -f -- \"\$root/.stderr-tail.tmp\"")
+        appendLine("  fi")
         appendLine("done")
         appendLine("kill \"\$writer_pid\" 2>/dev/null || true")
         appendLine("kill \"\$server_pid\" 2>/dev/null || true")
