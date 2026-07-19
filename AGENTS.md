@@ -9,6 +9,7 @@
 ## Android Development
 
 - Keep signing keys and release credentials outside the repository.
+- Always build and install the Release APK on the connected device; do not use the Debug variant.
 - Install an updated APK to the connected ADB device after code changes before handing off, unless the user explicitly asks otherwise.
 - Do not perform post-install manual testing unless the user explicitly asks; the user will handle verification on-device.
 

@@ -115,6 +115,17 @@ class CredentialPreservationTest {
         assertTrue((merged[1].transport as McpTransportConfig.StdIo).environment.isEmpty())
     }
 
+    @Test
+    fun ambiguousLegacyProviderIdDoesNotCopyCredentials() {
+        val imported = provider("export", "relay", "").copy(baseUrl = "https://new.example/v1")
+        val current = listOf(
+            provider("one", "relay", "secret-one").copy(baseUrl = "https://old-one.example/v1"),
+            provider("two", "relay", "secret-two").copy(baseUrl = "https://old-two.example/v1"),
+        )
+
+        assertEquals("", preserveProviderCredentials(listOf(imported), current).single().apiKey)
+    }
+
     private fun provider(id: String, providerId: String, apiKey: String) = LlmProviderConfig(
         id = id,
         providerId = providerId,

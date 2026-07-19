@@ -22,7 +22,7 @@ class ProviderFormStateSaverTest {
 
         val saved = providerFormStateSaver(existingConfig).saveState(state) as List<*>
 
-        assertEquals("", saved[3])
+        assertEquals("", saved[2])
         assertFalse(saved.contains("persisted-secret"))
         assertFalse(saved.contains("edited-secret"))
     }
@@ -34,7 +34,7 @@ class ProviderFormStateSaverTest {
             providerFormStateSaver(existingConfig)
                 .saveState(ProviderFormState.fromConfig(existingConfig)) as List<*>
             ).toMutableList()
-        saved[3] = "legacy-saved-secret"
+        saved[2] = "legacy-saved-secret"
 
         val restored = providerFormStateSaver(existingConfig).restore(saved as Any)
 

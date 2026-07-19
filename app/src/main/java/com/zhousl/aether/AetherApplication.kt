@@ -26,6 +26,7 @@ import com.zhousl.aether.voice.VoicePlaybackConfig
 import com.zhousl.aether.voice.VoicePlaybackConfigProvider
 import com.zhousl.aether.voice.VoicePlaybackController
 import com.zhousl.aether.voice.VoiceServerConnection
+import com.zhousl.aether.voice.RemoteVoiceEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -88,20 +89,22 @@ class AetherAppRuntime(
         started = SharingStarted.Eagerly,
         initialValue = AppSettings(),
     )
+    private val remoteVoiceEngine = RemoteVoiceEngine()
     val voicePlaybackController = VoicePlaybackController(
-        context = application,
+        engine = remoteVoiceEngine,
+        player = com.zhousl.aether.voice.AndroidVoiceAudioPlayer(application),
         configProvider = VoicePlaybackConfigProvider {
             currentSettings.value.takeIf { settings ->
-                settings.voiceAuthorizationConfirmed &&
-                    settings.hasConfiguredVoiceServer()
+                settings.voiceEnabled && settings.voiceAuthorizationConfirmed
             }?.let { settings ->
                 VoicePlaybackConfig(
-                    connection = VoiceServerConnection(
-                        baseUrl = settings.voiceServerBaseUrl,
-                        bearerToken = settings.voiceServerToken,
-                    ),
                     voiceId = settings.voiceId,
                     language = "zh",
+                    connection = if (settings.hasConfiguredVoiceServer()) {
+                        VoiceServerConnection(settings.voiceServerBaseUrl, settings.voiceServerToken)
+                    } else {
+                        VoiceServerConnection.Unconfigured
+                    },
                 )
             }
         },

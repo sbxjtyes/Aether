@@ -2737,7 +2737,7 @@ private fun VoicePlaybackStatusLabel(
         is VoicePlaybackState.Loading -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) {
             "正在加载离线声音…"
         } else {
-            "Loading offline voice…"
+            "Loading remote voice…"
         }
 
         is VoicePlaybackState.Synthesizing -> if (strings.appLanguage == AppLanguage.SimplifiedChinese) {

@@ -48,11 +48,20 @@ class AetherForegroundService : Service() {
                 val settings = state.settings
                 val activeCount = executionStates.values.count { it.isRunning }
                 val isMonitoring = state.isMarketMonitoring
-                if ((activeCount == 0 && !isMonitoring) || (!settings.keepTasksRunningInBackground && !isMonitoring)) {
+                if (!shouldKeepAetherForeground(
+                        activeTaskCount = activeCount,
+                        keepTasksRunningInBackground = settings.keepTasksRunningInBackground,
+                        isMarketMonitoring = isMonitoring,
+                    )
+                ) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 } else {
-                    val signature = foregroundNotificationSignature(sessions, executionStates, isMonitoring)
+                    val signature = foregroundNotificationSignature(
+                        sessions,
+                        executionStates,
+                        isMonitoring,
+                    )
                     val now = System.currentTimeMillis()
                     if (
                         signature != lastForegroundSignature ||

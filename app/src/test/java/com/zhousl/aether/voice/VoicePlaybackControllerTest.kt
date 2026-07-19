@@ -105,7 +105,8 @@ class VoicePlaybackControllerTest {
         controller.speak("message", "甲".repeat(180) + "。" + "乙".repeat(180))
 
         assertEquals(1, player.played.size)
-        assertEquals(1, player.drainCount)
+        assertEquals(0, player.drainCount)
+        assertEquals(2, player.stopCount)
         val state = controller.state.value
         assertTrue(state is VoicePlaybackState.Error)
         assertEquals(
@@ -152,6 +153,7 @@ private class RecordingPlayer : VoiceAudioPlayer {
     val played = mutableListOf<VoiceAudio>()
     var sequenceCount = 0
     var drainCount = 0
+    var stopCount = 0
 
     override suspend fun playSequence(block: suspend VoiceAudioSink.() -> Unit) {
         sequenceCount++
@@ -168,7 +170,9 @@ private class RecordingPlayer : VoiceAudioPlayer {
         sink.drain()
     }
 
-    override fun stop() = Unit
+    override fun stop() {
+        stopCount++
+    }
 
     override fun release() = Unit
 }

@@ -1,8 +1,7 @@
 package com.zhousl.aether.ui
 
+
 import androidx.activity.compose.BackHandler
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
@@ -141,9 +140,12 @@ import com.zhousl.aether.voice.VoicePlaybackConfig
 import com.zhousl.aether.voice.VoiceServerConnection
 import com.zhousl.aether.voice.VoicePlaybackState
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.zhousl.aether.data.quickActionLabel
 import com.zhousl.aether.data.requiresApiKey
 import com.zhousl.aether.data.resolveAutomaticModelKey
+import com.zhousl.aether.data.summarizeProviderBaseHost
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
 import com.zhousl.aether.ui.theme.AetherBackground
@@ -852,7 +854,6 @@ fun SettingsScreen(
                     ?: tr(strings, "Automatic", "自动选择")
                 val hasIncompleteProvider = enabledProviders.any { config ->
                     config.baseUrl.trim().isBlank() ||
-                        config.providerId.trim().isBlank() ||
                         config.enabledModels().isEmpty() ||
                         (config.providerType.requiresApiKey(config.baseUrl) && config.apiKey.trim().isBlank())
                 }
@@ -958,7 +959,7 @@ fun SettingsScreen(
                 onBack = { currentPage = SettingsPage.Hub.name },
             )
 
-            SettingsPage.Voice -> RemoteVoiceSettingsPage(
+            SettingsPage.Voice -> VoiceSettingsPage(
                 strings = strings,
                 onBack = { currentPage = SettingsPage.Hub.name },
             )
@@ -1039,7 +1040,6 @@ fun SettingsScreen(
 
             SettingsPage.AddProvider -> ProviderEditPage(
                 existingConfig = null,
-                existingProviderIds = providerConfigs.map { it.providerId }.toSet(),
                 isFetchingModels = isFetchingModels,
                 onSave = { config ->
                     onUpsertProviderConfig(config)
@@ -1053,7 +1053,6 @@ fun SettingsScreen(
                 val configToEdit = providerConfigs.firstOrNull { it.id == editingProviderId }
                 ProviderEditPage(
                     existingConfig = configToEdit,
-                    existingProviderIds = providerConfigs.map { it.providerId }.toSet(),
                     isFetchingModels = isFetchingModels,
                     onSave = { config ->
                         onUpsertProviderConfig(config)
@@ -1402,8 +1401,8 @@ private fun SettingsHub(
                         )
                         SettingsQuickActionRow(
                             icon = Icons.AutoMirrored.Rounded.VolumeUp,
-                            title = tr(strings, "Offline voice", "离线朗读"),
-                            subtitle = tr(strings, "Import and configure an authorized GPT-SoVITS voice", "导入并配置已获授权的 GPT-SoVITS 声音"),
+                            title = tr(strings, "Voice reading", "语音朗读"),
+                            subtitle = tr(strings, "Configure the remote voice server", "配置远程语音服务器"),
                             onClick = { onNavigate(SettingsPage.Voice) },
                         )
                     }
@@ -1455,24 +1454,25 @@ private fun SettingsHub(
 // -----------------------------------------------------------------------------
 
 @Composable
-private fun RemoteVoiceSettingsPage(strings: AetherStrings, onBack: () -> Unit) {
+private fun VoiceSettingsPage(strings: AetherStrings, onBack: () -> Unit) {
     val context = LocalContext.current
-    val repository = context.aetherRuntime.settingsRepository
-    val controller = context.aetherRuntime.voicePlaybackController
+    val runtime = context.aetherRuntime
+    val repository = runtime.settingsRepository
+    val controller = runtime.voicePlaybackController
     val playback by controller.state.collectAsState()
     val settings by repository.settings.collectAsState(initial = com.zhousl.aether.data.AppSettings())
-    val engine = remember { RemoteVoiceEngine() }
+    val remoteEngine = remember { RemoteVoiceEngine() }
     val scope = rememberCoroutineScope()
     var url by remember(settings.voiceServerBaseUrl) { mutableStateOf(TextFieldValue(settings.voiceServerBaseUrl)) }
     var token by remember(settings.voiceServerToken) { mutableStateOf(TextFieldValue(settings.voiceServerToken)) }
     var voiceId by remember(settings.voiceId) { mutableStateOf(settings.voiceId) }
     var voices by remember { mutableStateOf<List<RemoteVoice>>(emptyList()) }
-    var busy by remember { mutableStateOf(false) }
-    var status by remember { mutableStateOf("") }
-    var failed by remember { mutableStateOf(false) }
+    var remoteBusy by remember { mutableStateOf(false) }
+    var remoteStatus by remember { mutableStateOf("") }
+    var remoteFailed by remember { mutableStateOf(false) }
 
-    DisposableEffect(engine) {
-        onDispose { engine.cancel() }
+    DisposableEffect(remoteEngine) {
+        onDispose { remoteEngine.cancel() }
     }
 
     fun save(
@@ -1482,100 +1482,99 @@ private fun RemoteVoiceSettingsPage(strings: AetherStrings, onBack: () -> Unit) 
         speed: Int = settings.voiceSpeedPercent,
     ) {
         scope.launch {
-            repository.updateVoiceSettings(url.text, token.text, voiceId, enabled, autoRead, authorized, speed)
+            repository.updateVoiceSettings(
+                serverBaseUrl = url.text,
+                serverToken = token.text,
+                voiceId = voiceId,
+                enabled = enabled,
+                autoRead = autoRead,
+                authorizationConfirmed = authorized,
+                speedPercent = speed,
+            )
         }
     }
 
-    fun testConnection() {
+    fun testRemoteConnection() {
         scope.launch {
-            busy = true
-            failed = false
-            status = tr(strings, "Connecting to voice server...", "正在连接语音服务器…")
+            remoteBusy = true
+            remoteFailed = false
+            remoteStatus = tr(strings, "Connecting to voice server...", "正在连接语音服务器…")
             val connection = VoiceServerConnection(url.text, token.text)
-            runCatching { engine.checkHealth(connection) to engine.listVoices(connection) }
+            runCatching { remoteEngine.checkHealth(connection) to remoteEngine.listVoices(connection) }
                 .onSuccess { (health, available) ->
                     voices = available
                     if (available.none { it.id == voiceId }) voiceId = available.firstOrNull()?.id.orEmpty()
                     save()
-                    status = tr(
+                    remoteStatus = tr(
                         strings,
                         "Connected · ${health.voiceCount} voices · queue ${health.queueWaiting}/${health.queueCapacity}",
                         "连接成功 · ${health.voiceCount} 个声音 · 队列 ${health.queueWaiting}/${health.queueCapacity}",
                     )
                 }
                 .onFailure {
-                    failed = true
-                    status = it.message ?: tr(strings, "Connection failed", "连接失败")
+                    remoteFailed = true
+                    remoteStatus = it.message ?: tr(strings, "Connection failed", "连接失败")
                 }
-            busy = false
+            remoteBusy = false
         }
     }
 
-    val configured = url.text.isNotBlank() && token.text.isNotBlank() && voiceId.isNotBlank()
+    val remoteConfigured = url.text.isNotBlank() && token.text.isNotBlank() && voiceId.isNotBlank()
     val testing = playback.messageId == VoiceSettingsTestMessageId && playback !is VoicePlaybackState.Error
     val testStatus = when (val state = playback) {
-        is VoicePlaybackState.Loading -> tr(strings, "Connecting to voice server...", "正在连接语音服务器…")
-        is VoicePlaybackState.Synthesizing -> tr(strings, "Server is synthesizing audio...", "服务器正在合成音频…")
+        is VoicePlaybackState.Loading -> tr(strings, "Preparing remote voice...", "正在准备远程语音…")
+        is VoicePlaybackState.Synthesizing -> tr(strings, "Synthesizing test audio...", "正在合成测试音频…")
         is VoicePlaybackState.Playing -> tr(strings, "Playing test audio", "正在播放测试音频")
         is VoicePlaybackState.Error -> state.error.message
-        VoicePlaybackState.Idle -> tr(strings, "Send a short sample to the selected server", "向所选服务器发送一段简短试听")
+        VoicePlaybackState.Idle -> tr(strings, "Test the configured voice server", "测试已配置的语音服务器")
     }
 
-    SubPageScaffold(
-        title = tr(strings, "Voice reading", "语音朗读"),
-        onBack = {
-            scope.launch {
-                repository.updateVoiceSettings(
-                    url.text,
-                    token.text,
-                    voiceId,
-                    settings.voiceEnabled,
-                    settings.voiceAutoRead,
-                    settings.voiceAuthorizationConfirmed,
-                    settings.voiceSpeedPercent,
-                )
-                onBack()
-            }
-        },
-    ) {
-        VoiceSectionTitle(tr(strings, "Voice server", "语音服务器"))
+    SubPageScaffold(title = tr(strings, "Voice reading", "语音朗读"), onBack = {
+        scope.launch {
+            repository.updateVoiceSettings(
+                serverBaseUrl = url.text,
+                serverToken = token.text,
+                voiceId = voiceId,
+                enabled = settings.voiceEnabled,
+                autoRead = settings.voiceAutoRead,
+                authorizationConfirmed = settings.voiceAuthorizationConfirmed,
+                speedPercent = settings.voiceSpeedPercent,
+            )
+            onBack()
+        }
+    }) {
+        VoiceSectionTitle(tr(strings, "Remote voice server", "远程语音服务器"))
         SettingsCardGroup {
             ChatGptTextField(
                 label = tr(strings, "Server address", "服务器地址"),
                 value = url,
-                onValueChange = { url = it; status = "" },
+                onValueChange = { url = it; remoteStatus = "" },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
             )
             ChatGptTextField(
                 label = "Bearer Token",
                 value = token,
-                onValueChange = { token = it; status = "" },
+                onValueChange = { token = it; remoteStatus = "" },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                 visualTransformation = PasswordVisualTransformation(),
             )
             SettingsNavRow(
                 icon = Icons.Rounded.Cloud,
-                title = if (busy) tr(strings, "Testing connection", "正在测试连接") else tr(strings, "Test connection", "测试连接"),
-                subtitle = tr(strings, "Check authentication, engine status, and voices", "检查鉴权、推理引擎状态与可用声音"),
+                title = if (remoteBusy) tr(strings, "Testing connection", "正在测试连接") else tr(strings, "Test connection", "测试连接"),
+                subtitle = tr(strings, "Check authentication, engine status, and available voices", "检查鉴权、引擎状态和可用声音"),
                 showChevron = false,
-                onClick = { if (!busy) testConnection() },
+                onClick = { if (!remoteBusy) testRemoteConnection() },
             )
-            if (status.isNotBlank()) Text(
-                text = status,
+            if (remoteStatus.isNotBlank()) Text(
+                text = remoteStatus,
                 style = MaterialTheme.typography.bodySmall,
-                color = if (failed) MaterialTheme.colorScheme.error else AetherOnSurfaceVariant,
+                color = if (remoteFailed) MaterialTheme.colorScheme.error else AetherOnSurfaceVariant,
                 modifier = Modifier.padding(start = 54.dp, end = 16.dp, bottom = 14.dp),
             )
-        }
-
-        Spacer(Modifier.height(16.dp))
-        VoiceSectionTitle(tr(strings, "Server voice", "服务器声音"))
-        SettingsCardGroup {
             SelectionDropdownField(
                 label = tr(strings, "Voice", "声音"),
-                supportingText = tr(strings, "Test the connection to refresh this list", "测试连接后会刷新此列表"),
-                selectedLabel = voices.firstOrNull { it.id == voiceId }?.name
-                    ?: voiceId.ifBlank { tr(strings, "No voice selected", "尚未选择声音") },
+                supportingText = tr(strings, "Test the connection to refresh this list", "测试连接后刷新声音列表"),
+                selectedLabel = voices.firstOrNull { it.id == voiceId }?.name ?: voiceId,
                 options = voices.map { voice ->
                     SelectionOption(
                         key = voice.id,
@@ -1593,22 +1592,25 @@ private fun RemoteVoiceSettingsPage(strings: AetherStrings, onBack: () -> Unit) 
         SettingsCardGroup {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
                 SettingsToggleRow(
-                    title = tr(strings, "Voice use authorized", "已获得声音使用授权"),
-                    subtitle = tr(strings, "Confirm that you may use the selected server voice.", "确认你已获得所选服务器声音的使用授权。"),
+                    title = tr(strings, "Voice use authorized", "已获得语音使用授权"),
+                    subtitle = tr(strings, "Confirm that you may use the selected remote voice", "确认你有权使用所选远程声音"),
                     checked = settings.voiceAuthorizationConfirmed,
                     onCheckedChange = { save(authorized = it, enabled = settings.voiceEnabled && it) },
                 )
                 SettingsToggleRow(
                     title = tr(strings, "Voice reading", "语音朗读"),
-                    subtitle = if (configured) tr(strings, "Send readable reply text to your server", "将回复中的可读文本发送到你的服务器")
-                    else tr(strings, "Configure the server, token, and voice first", "请先配置服务器、Token 与声音"),
+                    subtitle = if (remoteConfigured) {
+                        tr(strings, "Send readable replies to your configured voice server", "将可朗读回复发送到已配置的语音服务器")
+                    } else {
+                        tr(strings, "Configure the server, token, and voice first", "请先配置服务器、Token 和声音")
+                    },
                     checked = settings.voiceEnabled,
-                    enabled = configured && settings.voiceAuthorizationConfirmed,
+                    enabled = remoteConfigured && settings.voiceAuthorizationConfirmed,
                     onCheckedChange = { save(enabled = it) },
                 )
                 SettingsToggleRow(
                     title = tr(strings, "Automatic reading", "自动朗读"),
-                    subtitle = tr(strings, "Read completed foreground replies over Wi-Fi or mobile data", "在前台通过 Wi-Fi 或移动网络朗读已完成的回复"),
+                    subtitle = tr(strings, "Read completed replies in the current foreground conversation", "在当前前台对话中朗读已完成的回复"),
                     checked = settings.voiceAutoRead,
                     enabled = settings.voiceEnabled,
                     onCheckedChange = { save(autoRead = it) },
@@ -1621,7 +1623,7 @@ private fun RemoteVoiceSettingsPage(strings: AetherStrings, onBack: () -> Unit) 
         SettingsCardGroup {
             SelectionDropdownField(
                 label = tr(strings, "Reading speed", "朗读速度"),
-                supportingText = tr(strings, "Applied by the synthesis server", "由语音服务器应用此速度"),
+                supportingText = tr(strings, "Applied by the remote synthesis server", "由远程合成服务器应用"),
                 selectedLabel = "${settings.voiceSpeedPercent}%",
                 options = listOf(75, 100, 125).map { speed ->
                     SelectionOption(
@@ -1640,24 +1642,19 @@ private fun RemoteVoiceSettingsPage(strings: AetherStrings, onBack: () -> Unit) 
         }
 
         Spacer(Modifier.height(16.dp))
-        VoiceSectionTitle(tr(strings, "Server actions", "服务器操作"))
+        VoiceSectionTitle(tr(strings, "Voice test", "声音测试"))
         SettingsCardGroup {
             SettingsNavRow(
                 icon = Icons.Rounded.AutoAwesome,
                 title = if (testing) tr(strings, "Stop voice test", "停止声音测试") else tr(strings, "Test selected voice", "测试所选声音"),
-                subtitle = if (playback.messageId == VoiceSettingsTestMessageId) testStatus
-                else tr(strings, "The test sentence is sent to your server", "测试句子会发送到你配置的服务器"),
+                subtitle = if (playback.messageId == VoiceSettingsTestMessageId) testStatus else tr(strings, "Synthesize a short sentence through the configured server", "通过已配置的服务器合成短句"),
                 showChevron = false,
                 onClick = {
                     if (testing) controller.stop()
-                    else if (configured && settings.voiceAuthorizationConfirmed) scope.launch {
-                        repository.updateVoiceSettings(
-                            url.text, token.text, voiceId, settings.voiceEnabled,
-                            settings.voiceAutoRead, settings.voiceAuthorizationConfirmed, settings.voiceSpeedPercent,
-                        )
+                    else if (remoteConfigured && settings.voiceAuthorizationConfirmed) {
                         controller.speak(
                             VoiceSettingsTestMessageId,
-                            tr(strings, "Hello. This is Aether's server voice test.", "你好，这是 Aether 的服务器语音测试。"),
+                            tr(strings, "Hello. This is Aether's voice test.", "你好，这是 Aether 的声音测试。"),
                             settings.voiceSpeedPercent / 100f,
                             VoicePlaybackConfig(
                                 connection = VoiceServerConnection(url.text, token.text),
@@ -1671,17 +1668,14 @@ private fun RemoteVoiceSettingsPage(strings: AetherStrings, onBack: () -> Unit) 
         }
         Spacer(Modifier.height(12.dp))
         Text(
-            text = tr(
-                strings,
-                "Privacy: readable assistant reply text is sent to the voice server you configure. Aether does not fall back to system TTS.",
-                "隐私提示：助手回复中的可读文本会发送到你配置的语音服务器；Aether 不会回退到系统 TTS。",
-            ),
+            text = tr(strings, "Privacy: readable reply text is sent to your configured voice server for synthesis. Aether does not use system TTS.", "隐私提示：可读回复文本会发送到你配置的语音服务器进行合成。Aether 不会使用系统 TTS。"),
             style = MaterialTheme.typography.bodySmall,
             color = AetherOnSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
         )
     }
 }
+
 
 @Composable
 private fun VoiceSectionTitle(text: String) {
@@ -2001,7 +1995,7 @@ private fun ProviderCard(
             )
             Spacer(Modifier.height(2.dp))
             Text(
-                text = "${config.providerType.displayName} · ${config.providerId}",
+                text = summarizeProviderBaseHost(config.baseUrl).ifBlank { config.providerType.displayName },
                 style = MaterialTheme.typography.bodySmall,
                 color = AetherOnSurfaceVariant,
                 maxLines = 1,
@@ -2159,7 +2153,6 @@ private fun ModelSelectionListRow(
 @Composable
 private fun ProviderEditPage(
     existingConfig: LlmProviderConfig?,
-    existingProviderIds: Set<String>,
     isFetchingModels: Boolean,
     onSave: (LlmProviderConfig) -> Unit,
     onFetchModels: (LlmProviderConfig, (List<String>) -> Unit) -> Unit,
@@ -2173,7 +2166,7 @@ private fun ProviderEditPage(
         title = if (isNew) tr(strings, "Add Provider", "添加 Provider") else tr(strings, "Edit Provider", "编辑 Provider"),
         onBack = onBack,
         trailingIcon = Icons.Rounded.Check,
-        trailingEnabled = formState.isValid(existingProviderIds),
+        trailingEnabled = formState.isValid(),
         onTrailingAction = {
             onSave(formState.buildConfig())
             onBack()
@@ -2181,7 +2174,6 @@ private fun ProviderEditPage(
     ) {
         ProviderConfigurationForm(
             state = formState,
-            existingProviderIds = existingProviderIds,
             isFetchingModels = isFetchingModels,
             onFetchModels = onFetchModels,
         )

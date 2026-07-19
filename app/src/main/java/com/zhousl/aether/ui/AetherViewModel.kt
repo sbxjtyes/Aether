@@ -67,6 +67,7 @@ import com.zhousl.aether.data.resolveDefaultTitleModelKey
 import com.zhousl.aether.data.resolveAutomaticModelKey
 import com.zhousl.aether.data.resolveModelSettings
 import com.zhousl.aether.data.resolveStoredOrAutomaticModelKey
+import com.zhousl.aether.data.summarizeProviderBaseHost
 import com.zhousl.aether.data.withDerivedMessages
 import com.zhousl.aether.termux.TermuxSetupIssue
 import com.zhousl.aether.termux.TermuxSetupState
@@ -226,8 +227,16 @@ internal fun preserveProviderCredentials(
     imported: List<LlmProviderConfig>,
     current: List<LlmProviderConfig>,
 ): List<LlmProviderConfig> = imported.map { importedConfig ->
+    val destinationMatches = current.filter {
+        it.providerType == importedConfig.providerType &&
+            it.baseUrl.normalizedCredentialTarget() == importedConfig.baseUrl.normalizedCredentialTarget()
+    }
+    val legacyIdMatches = destinationMatches.filter {
+        importedConfig.providerId.isNotBlank() && it.providerId == importedConfig.providerId
+    }
     val existing = current.firstOrNull { it.id == importedConfig.id }
-        ?: current.firstOrNull { it.providerId == importedConfig.providerId }
+        ?: destinationMatches.singleOrNull()
+        ?: legacyIdMatches.singleOrNull()
     if (
         existing != null &&
         existing.providerType == importedConfig.providerType &&
@@ -2375,13 +2384,6 @@ class AetherViewModel(
             "config_id" to config.id,
             "provider" to config.providerType.storageValue,
         )
-
-    /**
-     * 提取 Provider Base URL 主机名，避免日志记录完整地址。
-     */
-    private fun summarizeProviderBaseHost(baseUrl: String): String =
-        runCatching { URI(baseUrl.trim()).host.orEmpty() }
-            .getOrDefault("")
 
     /**
      * 通过计数方式维护全局模型加载状态，避免并发刷新时提前关闭 loading。

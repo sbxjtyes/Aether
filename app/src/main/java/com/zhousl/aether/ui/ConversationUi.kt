@@ -1617,15 +1617,6 @@ private fun ConversationModelSelector(
                                             overflow = TextOverflow.Ellipsis,
                                             lineHeight = 20.sp,
                                         )
-                                        if (option.fullLabel != "${option.providerId}/${option.modelId}") {
-                                            Text(
-                                                text = option.fullLabel,
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = AetherOnSurfaceVariant.copy(alpha = 0.72f),
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                            )
-                                        }
                                     }
                                     if (isSelected) {
                                         Icon(

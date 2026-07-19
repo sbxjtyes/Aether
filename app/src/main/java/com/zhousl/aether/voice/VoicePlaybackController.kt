@@ -1,6 +1,7 @@
 package com.zhousl.aether.voice
 
 import android.content.Context
+import com.zhousl.aether.util.AetherLog
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
@@ -63,6 +64,7 @@ class VoicePlaybackController(
     private val engine: SpeechSynthesisEngine,
     private val player: VoiceAudioPlayer,
     private val configProvider: VoicePlaybackConfigProvider,
+    private val maxChunkCharsProvider: () -> Int = { 160 },
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) : Closeable {
     constructor(context: Context, configProvider: VoicePlaybackConfigProvider) : this(
@@ -85,12 +87,18 @@ class VoicePlaybackController(
     ) {
         require(messageId.isNotBlank()) { "messageId must not be blank" }
         val speechText = VoiceTextProcessor.toSpeechText(markdown)
-        val chunks = VoiceTextProcessor.split(speechText)
+        val chunks = VoiceTextProcessor.split(speechText, maxChunkCharsProvider().coerceIn(40, 600))
         val generation = requestGeneration.incrementAndGet()
         activeJob?.cancel()
         engine.cancel()
         player.stop()
         if (chunks.isEmpty()) {
+            AetherLog.event(
+                tag = VoiceLogTag,
+                event = "voice_playback_rejected",
+                fields = mapOf("reason" to VoicePlaybackErrorCode.EMPTY_TEXT.name),
+                level = AetherLog.Level.Warn,
+            )
             _state.value = VoicePlaybackState.Error(
                 messageId,
                 VoicePlaybackError(VoicePlaybackErrorCode.EMPTY_TEXT, "This message has no readable text"),
@@ -100,6 +108,16 @@ class VoicePlaybackController(
 
         activeJob = scope.launch {
             try {
+                AetherLog.event(
+                    tag = VoiceLogTag,
+                    event = "voice_playback_started",
+                    fields = mapOf(
+                        "chunk_count" to chunks.size,
+                        "generation" to generation,
+                        "speed" to speed,
+                        "text_chars" to speechText.length,
+                    ),
+                )
                 _state.value = VoicePlaybackState.Loading(messageId)
                 val config = configOverride ?: configProvider.current()
                     ?: throw VoiceSynthesisException(
@@ -132,7 +150,7 @@ class VoicePlaybackController(
                                 } catch (error: CancellationException) {
                                     throw error
                                 } catch (error: Throwable) {
-                                    drain()
+                                    player.stop()
                                     throw error
                                 }
                             }
@@ -140,14 +158,29 @@ class VoicePlaybackController(
                     }
                 }
                 if (requestGeneration.get() == generation) {
+                    AetherLog.event(
+                        tag = VoiceLogTag,
+                        event = "voice_playback_completed",
+                        fields = mapOf(
+                            "chunk_count" to chunks.size,
+                            "generation" to generation,
+                        ),
+                    )
                     _state.value = VoicePlaybackState.Idle
                 }
             } catch (_: CancellationException) {
                 if (requestGeneration.get() == generation) {
                     _state.value = VoicePlaybackState.Idle
                 }
-            } catch (_: OutOfMemoryError) {
+            } catch (error: OutOfMemoryError) {
                 if (requestGeneration.get() == generation) {
+                    logPlaybackFailure(
+                        event = "voice_playback_out_of_memory",
+                        generation = generation,
+                        chunkCount = chunks.size,
+                        errorCode = VoicePlaybackErrorCode.OUT_OF_MEMORY.name,
+                        throwable = error,
+                    )
                     _state.value = VoicePlaybackState.Error(
                         messageId,
                         VoicePlaybackError(
@@ -158,10 +191,24 @@ class VoicePlaybackController(
                 }
             } catch (error: VoiceSynthesisException) {
                 if (requestGeneration.get() == generation) {
+                    logPlaybackFailure(
+                        event = "voice_synthesis_failed",
+                        generation = generation,
+                        chunkCount = chunks.size,
+                        errorCode = error.code.name,
+                        throwable = error,
+                    )
                     _state.value = VoicePlaybackState.Error(messageId, error.toPlaybackError())
                 }
             } catch (error: VoiceAudioPlaybackException) {
                 if (requestGeneration.get() == generation) {
+                    logPlaybackFailure(
+                        event = "voice_audio_playback_failed",
+                        generation = generation,
+                        chunkCount = chunks.size,
+                        errorCode = VoicePlaybackErrorCode.PLAYBACK_FAILED.name,
+                        throwable = error,
+                    )
                     _state.value = VoicePlaybackState.Error(
                         messageId,
                         VoicePlaybackError(VoicePlaybackErrorCode.PLAYBACK_FAILED, error.message.orEmpty()),
@@ -169,6 +216,13 @@ class VoicePlaybackController(
                 }
             } catch (error: Throwable) {
                 if (requestGeneration.get() == generation) {
+                    logPlaybackFailure(
+                        event = "voice_playback_failed",
+                        generation = generation,
+                        chunkCount = chunks.size,
+                        errorCode = VoicePlaybackErrorCode.SYNTHESIS_FAILED.name,
+                        throwable = error,
+                    )
                     _state.value = VoicePlaybackState.Error(
                         messageId,
                         VoicePlaybackError(
@@ -216,6 +270,35 @@ class VoicePlaybackController(
         ),
     )
 
+    private fun logPlaybackFailure(
+        event: String,
+        generation: Long,
+        chunkCount: Int,
+        errorCode: String,
+        throwable: Throwable,
+    ) {
+        AetherLog.event(
+            tag = VoiceLogTag,
+            event = event,
+            fields = mapOf(
+                "chunk_count" to chunkCount,
+                "error_code" to errorCode,
+                "generation" to generation,
+                "playback_state" to _state.value.diagnosticName(),
+            ),
+            level = AetherLog.Level.Error,
+            throwable = throwable,
+        )
+    }
+
+    private fun VoicePlaybackState.diagnosticName(): String = when (this) {
+        VoicePlaybackState.Idle -> "idle"
+        is VoicePlaybackState.Loading -> "loading"
+        is VoicePlaybackState.Synthesizing -> "synthesizing:${chunkIndex + 1}/$chunkCount"
+        is VoicePlaybackState.Playing -> "playing:${chunkIndex + 1}/$chunkCount"
+        is VoicePlaybackState.Error -> "error:${error.code.name}"
+    }
+
     private fun VoiceSynthesisException.toPlaybackError(): VoicePlaybackError {
         val mapped = when (code) {
             VoiceSynthesisErrorCode.SERVER_NOT_CONFIGURED -> VoicePlaybackErrorCode.SERVER_NOT_CONFIGURED
@@ -236,5 +319,9 @@ class VoicePlaybackController(
             -> VoicePlaybackErrorCode.SYNTHESIS_FAILED
         }
         return VoicePlaybackError(mapped, message ?: "Remote speech synthesis failed")
+    }
+
+    private companion object {
+        const val VoiceLogTag = "AetherVoice"
     }
 }

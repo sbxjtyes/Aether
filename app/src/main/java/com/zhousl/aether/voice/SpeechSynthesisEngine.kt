@@ -12,7 +12,14 @@ data class VoiceAudio(
 data class VoiceServerConnection(
     val baseUrl: String,
     val bearerToken: String,
-)
+) {
+    internal val isConfigured: Boolean
+        get() = baseUrl.isNotBlank() && bearerToken.isNotBlank()
+
+    companion object {
+        internal val Unconfigured = VoiceServerConnection(baseUrl = "", bearerToken = "")
+    }
+}
 
 data class RemoteVoice(
     val id: String,
@@ -32,17 +39,17 @@ data class VoiceServerHealth(
 )
 
 data class VoiceSynthesisRequest(
-    val connection: VoiceServerConnection,
     val voiceId: String,
     val text: String,
     val language: String = "zh",
     val speed: Float = 1f,
+    val connection: VoiceServerConnection = VoiceServerConnection.Unconfigured,
 )
 
 data class VoicePlaybackConfig(
-    val connection: VoiceServerConnection,
     val voiceId: String,
     val language: String = "zh",
+    val connection: VoiceServerConnection = VoiceServerConnection.Unconfigured,
 )
 
 fun interface VoicePlaybackConfigProvider {
@@ -66,7 +73,7 @@ enum class VoiceSynthesisErrorCode {
     SYNTHESIS_FAILED,
 }
 
-class VoiceSynthesisException(
+open class VoiceSynthesisException(
     val code: VoiceSynthesisErrorCode,
     message: String,
     val requestId: String? = null,
@@ -75,9 +82,11 @@ class VoiceSynthesisException(
 ) : Exception(message, cause)
 
 interface SpeechSynthesisEngine {
-    suspend fun checkHealth(connection: VoiceServerConnection): VoiceServerHealth
+    suspend fun checkHealth(connection: VoiceServerConnection): VoiceServerHealth {
+        throw UnsupportedOperationException("This speech engine does not expose server health")
+    }
 
-    suspend fun listVoices(connection: VoiceServerConnection): List<RemoteVoice>
+    suspend fun listVoices(connection: VoiceServerConnection): List<RemoteVoice> = emptyList()
 
     suspend fun synthesize(request: VoiceSynthesisRequest): VoiceAudio
 

@@ -36,9 +36,6 @@ class SettingsRepository(
             voiceServerToken = preferences[VOICE_SERVER_TOKEN].orEmpty(),
             voiceId = preferences[VOICE_ID]?.trim().orEmpty().ifBlank { DefaultVoiceId },
             voiceEnabled = (preferences[VOICE_ENABLED] ?: false) &&
-                preferences[VOICE_SERVER_BASE_URL].orEmpty().isNotBlank() &&
-                preferences[VOICE_SERVER_TOKEN].orEmpty().isNotBlank() &&
-                preferences[VOICE_ID].orEmpty().isNotBlank() &&
                 (preferences[VOICE_AUTHORIZATION_CONFIRMED] ?: false),
             voiceAutoRead = preferences[VOICE_AUTO_READ]
                 ?: preferences[LEGACY_OFFLINE_VOICE_AUTO_READ]
@@ -217,7 +214,8 @@ class SettingsRepository(
             it[VOICE_SERVER_BASE_URL] = settings.voiceServerBaseUrl.trim().trimEnd('/')
             it[VOICE_SERVER_TOKEN] = settings.voiceServerToken
             it[VOICE_ID] = settings.voiceId.trim()
-            it[VOICE_ENABLED] = settings.voiceEnabled && settings.hasConfiguredVoiceServer()
+            it[VOICE_ENABLED] = settings.voiceEnabled && settings.voiceAuthorizationConfirmed &&
+                settings.hasConfiguredVoiceServer()
             it[VOICE_AUTO_READ] = settings.voiceAutoRead
             it[VOICE_AUTHORIZATION_CONFIRMED] = settings.voiceAuthorizationConfirmed
             it[VOICE_SPEED_PERCENT] = normalizeVoiceSpeedPercent(settings.voiceSpeedPercent)
@@ -277,7 +275,7 @@ class SettingsRepository(
             it[VOICE_SERVER_BASE_URL] = normalizedBaseUrl
             it[VOICE_SERVER_TOKEN] = serverToken
             it[VOICE_ID] = normalizedVoiceId
-            it[VOICE_ENABLED] = enabled && configured && authorizationConfirmed
+            it[VOICE_ENABLED] = enabled && authorizationConfirmed && configured
             it[VOICE_AUTO_READ] = autoRead
             it[VOICE_AUTHORIZATION_CONFIRMED] = authorizationConfirmed
             it[VOICE_SPEED_PERCENT] = normalizeVoiceSpeedPercent(speedPercent)
@@ -291,6 +289,7 @@ class SettingsRepository(
         val legacyDirectories = listOf(
             File(context.filesDir, "offline_voice"),
             File(context.cacheDir, "offline_voice"),
+            File(context.filesDir, "voice_models"),
         )
         val cleaned = legacyDirectories.all { directory ->
             !directory.exists() || directory.deleteRecursively()
@@ -299,7 +298,6 @@ class SettingsRepository(
 
         context.dataStore.edit { preferences ->
             preferences[REMOTE_VOICE_MIGRATION_COMPLETE] = true
-            preferences[VOICE_ENABLED] = false
             if (!preferences.contains(VOICE_AUTO_READ)) {
                 preferences[VOICE_AUTO_READ] = preferences[LEGACY_OFFLINE_VOICE_AUTO_READ] ?: false
             }

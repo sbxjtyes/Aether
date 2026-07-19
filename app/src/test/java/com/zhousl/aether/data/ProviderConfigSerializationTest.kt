@@ -51,7 +51,6 @@ class ProviderConfigSerializationTest {
         assertEquals(providerId, restoredConfig.providerId)
         assertEquals("Allowed-Client/1.0", restoredConfig.userAgent)
         val option = listOf(restoredConfig).availableModelOptions().single()
-        assertEquals(providerId, option.providerId)
         assertEquals("Allowed-Client/1.0", option.userAgent)
     }
 
@@ -73,6 +72,59 @@ class ProviderConfigSerializationTest {
     }
 
     @Test
+    fun availableModelOptionsDoesNotRequireLegacyProviderId() {
+        val config = LlmProviderConfig(
+            id = "provider-id",
+            providerId = "",
+            name = "Relay",
+            providerType = LlmProvider.OpenAiCompatible,
+            apiKey = "",
+            baseUrl = "https://relay.example/v1",
+            modelId = "model-a",
+        )
+
+        val option = listOf(config).availableModelOptions().single()
+
+        assertEquals("provider-id::model-a", option.key)
+        assertEquals("Relay/model-a", option.fullLabel)
+    }
+
+    @Test
+    fun duplicateProviderNamesUseHostAndStableIndexLabels() {
+        val configs = listOf(
+            providerConfig("first", "https://relay.example/v1").copy(
+                cachedModels = listOf("model-a", "model-b"),
+                enabledModelIds = listOf("model-a", "model-b"),
+            ),
+            providerConfig("second", "https://relay.example/v1"),
+        )
+
+        val options = configs.availableModelOptions()
+
+        assertEquals(
+            listOf(
+                "Relay · relay.example/v1 · first",
+                "Relay · relay.example/v1 · first",
+                "Relay · relay.example/v1 · second",
+            ),
+            options.map { it.providerName },
+        )
+        assertEquals(listOf("first::model-a", "first::model-b", "second::model-a"), options.map { it.key })
+    }
+
+    @Test
+    fun duplicateConfigIdsAreRepairedDuringImport() {
+        val raw = JSONArray()
+            .put(JSONObject().put("id", "same").put("providerType", "openai_compatible").put("baseUrl", "https://one.example/v1").put("modelId", "one"))
+            .put(JSONObject().put("id", "same").put("providerType", "openai_compatible").put("baseUrl", "https://two.example/v1").put("modelId", "two"))
+
+        val configs = parseProviderConfigs(raw.toString())
+
+        assertEquals(2, configs.map { it.id }.distinct().size)
+        assertEquals("same", configs.first().id)
+    }
+
+    @Test
     fun invalidUserAgentFallsBackToBrowserDefault() {
         val config = LlmProviderConfig(
             id = "provider",
@@ -87,4 +139,14 @@ class ProviderConfigSerializationTest {
 
         assertEquals(DefaultLlmUserAgent, config.resolvedUserAgent())
     }
+
+    private fun providerConfig(id: String, baseUrl: String) = LlmProviderConfig(
+        id = id,
+        providerId = "legacy-$id",
+        name = "Relay",
+        providerType = LlmProvider.OpenAiCompatible,
+        apiKey = "",
+        baseUrl = baseUrl,
+        modelId = "model-a",
+    )
 }

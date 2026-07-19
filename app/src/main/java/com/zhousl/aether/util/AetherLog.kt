@@ -181,7 +181,7 @@ object AetherLog {
         val raw = if (throwable == null) {
             message
         } else {
-            message + "\n" + Log.getStackTraceString(throwable)
+            message + "\n" + throwable.stackTraceToString()
         }
         return sanitizeForExport(raw)
     }

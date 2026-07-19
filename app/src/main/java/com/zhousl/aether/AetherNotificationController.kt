@@ -85,7 +85,7 @@ class AetherNotificationController(
             PendingIntent.FLAG_UPDATE_CURRENT or pendingIntentMutabilityFlags(),
         )
 
-        return NotificationCompat.Builder(context, ForegroundChannelId)
+        val builder = NotificationCompat.Builder(context, ForegroundChannelId)
             .setSmallIcon(R.drawable.ic_notification_small)
             .setContentTitle(title)
             .setContentText(body)
@@ -104,7 +104,7 @@ class AetherNotificationController(
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setContentIntent(contentIntent)
-            .build()
+        return builder.build()
     }
 
     fun notifyCompletion(

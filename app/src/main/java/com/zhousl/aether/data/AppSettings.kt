@@ -1,9 +1,10 @@
 package com.zhousl.aether.data
 
+
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URI
 import java.util.Locale
+import java.net.URI
 import java.util.UUID
 
 enum class LlmProvider(
@@ -342,6 +343,7 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
     return runCatching {
         val array = JSONArray(rawValue)
         buildList {
+            val usedConfigIds = mutableSetOf<String>()
             for (index in 0 until array.length()) {
                 val json = array.optJSONObject(index) ?: continue
                 val providerType = LlmProvider.fromStorage(json.optString("providerType"))
@@ -362,9 +364,13 @@ internal fun parseProviderConfigs(rawValue: String): List<LlmProviderConfig> {
                 val inferredProviderId = providerName
                     .sanitizeProviderId()
                     .ifBlank { "${providerType.storageValue}_${index + 1}" }
+                val requestedConfigId = json.optString("id").trim()
+                val configId = requestedConfigId
+                    .takeIf { it.isNotEmpty() && usedConfigIds.add(it) }
+                    ?: UUID.randomUUID().toString().also(usedConfigIds::add)
                 add(
                     LlmProviderConfig(
-                        id = json.optString("id").trim().ifBlank { UUID.randomUUID().toString() },
+                        id = configId,
                         providerId = json.optString("providerId").trim().ifBlank { inferredProviderId },
                         name = providerName,
                         providerType = providerType,
@@ -428,6 +434,26 @@ fun String.sanitizeProviderId(): String =
         .replace(Regex("[^a-z0-9_]+"), "_")
         .trim('_')
 
+fun summarizeProviderBaseHost(baseUrl: String): String =
+    runCatching {
+        URI(baseUrl.trim()).let { uri ->
+            buildString {
+                append(uri.host.orEmpty())
+                if (uri.port > 0) append(":${uri.port}")
+                uri.path.trim('/').takeIf(String::isNotEmpty)?.let { append("/$it") }
+            }
+        }
+    }
+        .getOrDefault("")
+
+fun providerDisplayLabel(config: LlmProviderConfig, duplicate: Boolean): String {
+    val name = config.name.trim().ifBlank { config.providerType.displayName }
+    if (!duplicate) return name
+    val endpoint = summarizeProviderBaseHost(config.baseUrl).ifBlank { config.providerType.displayName }
+    val stableSuffix = config.id.replace("-", "").take(6).ifBlank { "config" }
+    return "$name · $endpoint · $stableSuffix"
+}
+
 fun buildModelOptionKey(
     providerConfigId: String,
     modelId: String,
@@ -442,7 +468,6 @@ fun LlmProviderConfig.enabledModels(): List<String> = normalizeStringList(
 data class ProviderModelOption(
     val key: String,
     val providerConfigId: String,
-    val providerId: String,
     val providerName: String,
     val providerType: LlmProvider,
     val apiKey: String,
@@ -465,7 +490,18 @@ fun List<LlmProviderConfig>.availableModelOptions(
     includeDisabledModels: Boolean = false,
 ): List<ProviderModelOption> {
     val scopedConfigs = (if (includeDisabledProviders) this else filter { it.isEnabled })
-        .filter { it.baseUrl.trim().isNotEmpty() && it.providerId.trim().isNotEmpty() }
+        .filter { it.baseUrl.trim().isNotEmpty() }
+    val providerNameCounts = scopedConfigs
+        .groupingBy { it.name.trim().ifBlank { it.providerType.displayName } }
+        .eachCount()
+    val displayProviderNames = scopedConfigs.associate { config ->
+        val providerName = config.name.trim().ifBlank { config.providerType.displayName }
+        val providerHost = summarizeProviderBaseHost(config.baseUrl)
+        config.id to providerDisplayLabel(
+            config,
+            duplicate = (providerNameCounts[providerName] ?: 0) > 1,
+        )
+    }
     val modelCounts = scopedConfigs
         .flatMap { config ->
             val models = if (includeDisabledModels) config.availableModels() else config.enabledModels()
@@ -477,15 +513,13 @@ fun List<LlmProviderConfig>.availableModelOptions(
     return scopedConfigs.flatMap { config ->
         val models = if (includeDisabledModels) config.availableModels() else config.enabledModels()
         models.map { modelId ->
-            val providerId = config.providerId.trim()
-            val providerName = config.name.trim().ifBlank { providerId }
+            val displayProviderName = displayProviderNames.getValue(config.id)
             val normalizedModelId = modelId.trim()
-            val fullLabel = "$providerId/$normalizedModelId"
+            val fullLabel = "$displayProviderName/$normalizedModelId"
             ProviderModelOption(
                 key = buildModelOptionKey(config.id, normalizedModelId),
                 providerConfigId = config.id,
-                providerId = providerId,
-                providerName = providerName,
+                providerName = displayProviderName,
                 providerType = config.providerType,
                 apiKey = config.apiKey,
                 baseUrl = config.baseUrl.trim(),
@@ -496,7 +530,7 @@ fun List<LlmProviderConfig>.availableModelOptions(
                 chatLabel = if ((modelCounts[normalizedModelId] ?: 0) > 1) fullLabel else normalizedModelId,
             )
         }
-    }.sortedWith(compareBy(ProviderModelOption::providerId, ProviderModelOption::modelId))
+    }.sortedWith(compareBy(ProviderModelOption::providerName, ProviderModelOption::modelId))
 }
 
 fun AppSettings.withModelOption(option: ProviderModelOption): AppSettings = copy(
@@ -518,7 +552,13 @@ fun List<ProviderModelOption>.resolveAutomaticModelKey(
     val rankedOption = mapNotNull { option ->
         automaticModelPriority(option.modelId, purpose)?.let { priority -> option to priority }
     }
-        .minWithOrNull(compareBy<Pair<ProviderModelOption, Int>> { it.second }.thenBy { it.first.providerId }.thenBy { it.first.modelId })
+        .minWithOrNull(
+            compareBy<Pair<ProviderModelOption, Int>> { it.second }
+                .thenBy { it.first.providerName }
+                .thenBy { it.first.baseUrl }
+                .thenBy { it.first.providerConfigId }
+                .thenBy { it.first.modelId }
+        )
         ?.first
     return rankedOption?.key ?: firstOrNull()?.key.orEmpty()
 }

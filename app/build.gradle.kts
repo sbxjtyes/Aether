@@ -23,6 +23,8 @@ fun localOrEnv(
     defaultValue: String = "",
 ): String = (System.getenv(envName) ?: localProperties.getProperty(localName, defaultValue)).trim()
 
+fun String.asBuildConfigString(): String = "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
 android {
     signingConfigs {
         create("release") {
@@ -42,8 +44,8 @@ android {
         applicationId = "com.baimoqilin.aether"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.5.0"
+        versionCode = 9
+        versionName = "1.6.0"
 
         ndk {
             abiFilters += "arm64-v8a"

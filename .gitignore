@@ -49,6 +49,13 @@ reports/
 *.swp
 *.swo
 *~
+__pycache__/
+*.py[cod]
+tools/voice-converter/work/
+
+# Large local voice model weights
+voicemodel/*.ckpt
+voicemodel/*.pth
 
 # Logs and OS metadata
 *.log

@@ -331,9 +331,9 @@ private fun AetherAppContent(
     val pendingAssistantText = currentSessionExecution?.pendingAssistantText.orEmpty()
     val pendingInputs = currentSessionExecution?.pendingInputs.orEmpty()
     val isCurrentSessionRunning = currentSessionExecution?.isRunning == true
+    val remoteVoiceReady = uiState.settings.hasConfiguredVoiceServer()
     val voicePlaybackEnabled = uiState.settings.voiceEnabled &&
-        uiState.settings.voiceAuthorizationConfirmed &&
-        uiState.settings.hasConfiguredVoiceServer()
+        uiState.settings.voiceAuthorizationConfirmed && remoteVoiceReady
     val voicePlaybackSpeed = uiState.settings.voiceSpeedPercent / 100f
     val currentWorkspaceSessionId = uiState.editingSessionId
         ?: uiState.draftWorkspaceId
@@ -1788,7 +1788,6 @@ private fun buildConversationModelOptions(
         ProviderModelOption(
             key = buildModelOptionKey("legacy", settings.modelId),
             providerConfigId = "legacy",
-            providerId = settings.provider.storageValue,
             providerName = settings.provider.displayName,
             providerType = settings.provider,
             apiKey = settings.apiKey,

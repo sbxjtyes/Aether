@@ -818,7 +818,7 @@ private fun ProviderSetupStep(
                         )
                         PrimaryActionButton(
                             label = if (strings.appLanguage == AppLanguage.SimplifiedChinese) "开始聊天" else "Start chat",
-                            enabled = provider != null && formState.isValid(emptySet()),
+                            enabled = provider != null && formState.isValid(),
                             onClick = { isFinishing = true },
                         )
                     }
