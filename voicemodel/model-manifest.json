@@ -373,14 +373,40 @@
       "7088c2292c0e"
     ],
     "total_seconds": 1733.96,
-    "dataset_file": "C:\\Users\\YS\\Desktop\\A\\running\\GetVoice\\data\\voices\\6c271f7ace20\\training\\20260713-130855-99cc74\\train.list",
+    "dataset_file": null,
     "error": null,
     "stage": "validating",
     "updated_at": "2026-07-13T05:26:50.748867+00:00",
     "completed_at": "2026-07-13T05:26:50.745253+00:00",
-    "profile_file": "C:\\Users\\YS\\Desktop\\A\\running\\GetVoice\\data\\voices\\6c271f7ace20\\models\\20260713-130855-99cc74\\profile.json",
-    "gpt_weights": "C:\\Users\\YS\\Desktop\\A\\running\\GetVoice\\data\\voices\\6c271f7ace20\\models\\20260713-130855-99cc74\\voice-gpt.ckpt",
-    "sovits_weights": "C:\\Users\\YS\\Desktop\\A\\running\\GetVoice\\data\\voices\\6c271f7ace20\\models\\20260713-130855-99cc74\\voice-sovits.pth",
-    "package": "C:\\Users\\YS\\Desktop\\A\\running\\GetVoice\\data\\voices\\6c271f7ace20\\models\\20260713-130855-99cc74\\model.zip"
+    "profile_file": "profile.json",
+    "gpt_weights": "voice-gpt.ckpt",
+    "sovits_weights": "voice-sovits.pth",
+    "package": null,
+    "artifacts": {
+      "profile": {
+        "path": "profile.json",
+        "tracked": true
+      },
+      "reference_audio": {
+        "path": "reference.wav",
+        "tracked": true
+      },
+      "gpt_weights": {
+        "path": "voice-gpt.ckpt",
+        "tracked": false,
+        "required": true,
+        "size_bytes": 155313405,
+        "sha256": null
+      },
+      "sovits_weights": {
+        "path": "voice-sovits.pth",
+        "tracked": false,
+        "required": true,
+        "size_bytes": 85008327,
+        "sha256": null
+      }
+    },
+    "weights_source": "external",
+    "weights_source_note": "Model weights are intentionally excluded from Git because they exceed the hosting size limit. Place them beside this manifest before inference."
   }
 }

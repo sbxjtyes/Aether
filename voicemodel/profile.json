@@ -3,6 +3,8 @@
   "engine": "gpt-sovits",
   "version": "v2",
   "model_version": "20260713-130855-99cc74",
+  "weights_source": "external",
+  "weights_required": true,
   "reference_audio": "reference.wav",
   "reference_text": "花臂男人骂了一声，一撑桌子想要站起身来，却发现自己的双腿瘫软使不上力气，于是只能继续指着山羊头说，“",
   "reference_language": "zh",
